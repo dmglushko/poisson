@@ -6,6 +6,7 @@
 #include "assembled_problem.h"
 #include "importer.h"
 #include "solution.h"
+#include "solver_result.h"
 
 #include <algorithm>
 #include <cstdlib>

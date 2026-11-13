@@ -18,7 +18,7 @@ flowchart LR
     CH([FreeCharges])
     AS([Analytical Solution])
     AP([AssembledProblem])
-    X([x])
+    SR([SolverResult])
     S([Solution])
     OUT([Output])
 
@@ -32,8 +32,8 @@ flowchart LR
     AS --> ASM
     ASM --> AP
     AP --> SOL
-    SOL --> X
-    X --> SB
+    SOL --> SR
+    SR --> SB
     AP --> SB
     AS --> SB
     SB --> S
@@ -142,7 +142,8 @@ The linear system A x = f.
 
 A has one row per unknown, not one per node. `row` gives the row of each node; several
 nodes may share a row. Nodes whose value is known in advance have no row and are listed in
-`known`. The potential at every node follows from the solution `x` of the system:
+`known`. The potential at every node follows from the solution `x` of the system
+(`SolverResult::x`):
 
 - node with a row: `u[i] = x[*row[i]]`
 - every `(node, value)` in `known`: `u[node] = value`
@@ -166,6 +167,24 @@ struct AssembledProblem {
 };
 ```
 
+### SolverResult
+
+What the solver returns: the solution `x` of A x = f.
+
+```cpp
+struct SolverResult {
+    struct Info {
+        double   time = 0;                      // total, in seconds
+        uint32_t iterations = 0;
+        double   residual = 0;                  // final relative residual
+        std::vector<std::string> warnings;      // e.g. no convergence within the iteration limit
+    };
+
+    std::vector<double> x;                      // one value per row of A
+    Info                info;
+};
+```
+
 ### Solution
 
 The potential at every node.
@@ -173,10 +192,8 @@ The potential at every node.
 ```cpp
 struct Solution {
     struct Info {
-        double   time = 0;                      // total, in seconds
-        uint32_t iterations = 0;
-        double   residual = 0;                  // final relative residual
-        std::vector<std::string> warnings;      // e.g. no convergence within the iteration limit
+        double time = 0;                        // total, in seconds
+        std::vector<std::string> warnings;
     };
 
     std::vector<double> u;                      // potential per node [V], same order as nodes
@@ -219,12 +236,11 @@ public:
 
 ### Solver
 
-Solves A x = f. It takes `A` and `f` from `AssembledProblem` and returns `x`, a plain
-vector with one value per row of A.
+Solves A x = f. It takes `A` and `f` from `AssembledProblem` and returns a `SolverResult`.
 
 ### Solution Builder
 
-Builds `Solution` from `x`, using `row` and `known` from `AssembledProblem`.
+Builds `Solution` from `SolverResult::x`, using `row` and `known` from `AssembledProblem`.
 
 ### Not defined yet
 
