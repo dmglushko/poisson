@@ -185,22 +185,6 @@ struct SolverResult {
 };
 ```
 
-### Solution
-
-The potential at every node.
-
-```cpp
-struct Solution {
-    struct Info {
-        double time = 0;                        // total, in seconds
-        std::vector<std::string> warnings;
-    };
-
-    std::vector<double> u;                      // potential per node [V], same order as nodes
-    Info                info;
-};
-```
-
 ## Steps
 
 ### Importer
@@ -250,10 +234,7 @@ Assembly, AnalyticalMaker, Adaptive Mesh Refining and Ray Tracing.
 
 - `Analytical Solution`: contents not decided. Planned as singularity subtraction:
   analytical functions around the trapped charges.
+- `Solution`: contents not decided; it depends on the shape of `Analytical Solution`.
 - `Output`: contents not decided.
 - `SparseMatrix`: storage format not decided; an empty placeholder struct in the code.
 - `neighbours` in `MeshProperties`: proposed, not decided.
-- Conductors: the importer stores `is_metal` and `voltage`, but nothing uses them yet. Planned
-  for Assembly: every node of a metal with a voltage gets a known value, and all nodes of a
-  metal without a voltage share one row.
-- `screening_length`: no input file provides it, so it is always 0 for now.
