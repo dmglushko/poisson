@@ -1,4 +1,4 @@
-# poisson
+# Screened Poisson field solver for Nebula
 
 A finite-element library for the screened Poisson equation on tetrahedral meshes, with ray
 tracing through the resulting field. It is meant to replace deal.II in the Nebula
@@ -9,7 +9,7 @@ classes and the steps. So far the data classes and the Importer are implemented.
 
 ## Build and test
 
-Needs a C++20 compiler, CMake and the HDF5 library (`libhdf5-dev` on Ubuntu).
+Needs a C++23 compiler, CMake and the HDF5 library (`libhdf5-dev` on Ubuntu).
 
 ```
 cmake -S . -B build
