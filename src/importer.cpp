@@ -13,6 +13,8 @@
 #include <string_view>
 #include <unordered_map>
 
+#include <hdf5.h>
+
 namespace {
 
 namespace fs = std::filesystem;
@@ -56,6 +58,7 @@ template <class T>
 bool take(std::string_view& s, T& value) {
     while (!s.empty() && is_blank(s.front())) s.remove_prefix(1);
     if (s.empty()) return false;
+    if (s.size() >= 2 && s[0] == '+' && s[1] != '+' && s[1] != '-') s.remove_prefix(1);   // from_chars rejects "+1"
     const auto [end, error] = std::from_chars(s.data(), s.data() + s.size(), value);
     if (error != std::errc{}) return false;
     s.remove_prefix(static_cast<std::size_t>(end - s.data()));
@@ -65,7 +68,6 @@ bool take(std::string_view& s, T& value) {
 // Parses s as one number with nothing after it.
 bool parse_number(std::string_view s, double& value) {
     s = trim(s);
-    if (!s.empty() && s.front() == '+') s.remove_prefix(1);
     return take(s, value) && trim(s).empty() && std::isfinite(value);
 }
 
@@ -183,7 +185,9 @@ void read_mesh_format(TextReader& reader) {
 }
 
 void read_physical_names(TextReader& reader, MeshProperties& mesh, MeshReadState& state) {
-    static const std::regex voltage(R"((^|\s+)(-?[\d.]+)V\b)");
+    // A signed number followed by V that is not glued to a word: "silicon 5V", "silicon -5V",
+    // "detector+5V". Unlike Nebula's regex, the sign is part of the number.
+    static const std::regex voltage(R"((^|\s+|\b)([+-]?[\d.]+)V\b)");
 
     std::string_view line = reader.require("the number of physical names");
     uint64_t count = 0;
@@ -427,10 +431,22 @@ void read_mesh_file(const fs::path& file, MeshProperties& mesh, MeshReadState& s
             mesh.info.warnings.push_back("surface '" + state.surface_names[b] + "' has no triangles");
     if (mesh.boundary_elements.empty())
         mesh.info.warnings.push_back("the mesh has no boundary conditions");
+
+    // Without a prescribed potential somewhere, the solution is only fixed up to a constant.
+    bool has_potential = false;
+    for (std::size_t b = 0; b < mesh.boundary_conditions.size(); ++b)
+        if (mesh.boundary_conditions[b].type == MeshProperties::BcType::Dirichlet && state.boundary_use[b] > 0)
+            has_potential = true;
+    for (std::size_t m = 0; m < mesh.materials.size(); ++m)
+        if (mesh.materials[m].voltage && state.material_use[m] > 0) has_potential = true;
+    if (!has_potential)
+        mesh.info.warnings.push_back("no potential is prescribed anywhere (no Dirichlet boundary condition and no "
+                                     "volume with a voltage); the solution is only fixed up to a constant");
 }
 
-// Checks that the mesh fits together: every face belongs to at most two tets, every
-// boundary triangle is a face of a tet, and every node is used. Fills mesh.neighbours.
+// Checks that the mesh fits together: every face belongs to at most two tets, which lie on
+// opposite sides of it; every boundary triangle is a face of a tet and is listed once;
+// the mesh is one piece; every node is used. Fills mesh.neighbours.
 void check_geometry(const fs::path& file, MeshProperties& mesh, const MeshReadState& state) {
     using Face = std::array<uint32_t, 3>;
     const auto sorted = [](Face face) {
@@ -465,13 +481,33 @@ void check_geometry(const fs::path& file, MeshProperties& mesh, const MeshReadSt
     mesh.neighbours.assign(mesh.elements.size(), {});
     for (std::size_t i = 1; i < faces.size(); ++i) {
         if (faces[i].face != faces[i - 1].face) continue;
-        if (i >= 2 && faces[i].face == faces[i - 2].face)
-            fail(file, "the face with " + describe(faces[i].face) + " belongs to more than two tetrahedra");
+        const Face& face = faces[i].face;
+        const auto opposite = [&](std::size_t k) { return mesh.elements[faces[k].element].node[faces[k].local]; };
+        const bool third = i + 1 < faces.size() && faces[i + 1].face == face;
+
+        // Two tets with the same face and the same fourth node are the same tet.
+        const uint32_t a = opposite(i - 1), b = opposite(i);
+        if (a == b || (third && (opposite(i + 1) == a || opposite(i + 1) == b)))
+            fail(file, "the tetrahedron with " + describe(face) + " and " +
+                           std::to_string(state.node_ids[a == b || !third || opposite(i + 1) == a ? a : b]) +
+                           " is listed more than once");
+        if (third) fail(file, "the face with " + describe(face) + " belongs to more than two tetrahedra");
+
+        // The two tets must lie on opposite sides of the face they share.
+        const double side_a = signed_volume6(mesh, {face[0], face[1], face[2], a});
+        const double side_b = signed_volume6(mesh, {face[0], face[1], face[2], b});
+        if ((side_a > 0) == (side_b > 0))
+            fail(file, "two tetrahedra overlap: both lie on the same side of the face with " + describe(face));
         mesh.neighbours[faces[i].element][faces[i].local] = faces[i - 1].element;
         mesh.neighbours[faces[i - 1].element][faces[i - 1].local] = faces[i].element;
     }
 
-    std::vector<Face> boundary_faces;
+    // Every boundary triangle must be a face of a tet, and must be listed only once.
+    struct BoundaryFace {
+        Face face;
+        std::size_t index;
+    };
+    std::vector<BoundaryFace> boundary_faces;
     boundary_faces.reserve(mesh.boundary_elements.size());
     for (std::size_t i = 0; i < mesh.boundary_elements.size(); ++i) {
         const Face face = sorted(mesh.boundary_elements[i].node);
@@ -479,14 +515,46 @@ void check_geometry(const fs::path& file, MeshProperties& mesh, const MeshReadSt
                                             [](const TetFace& a, const Face& b) { return a.face < b; });
         if (found == faces.end() || found->face != face)
             fail(file, state.boundary_lines[i], "triangle with " + describe(face) + " is not a face of any tetrahedron");
-        boundary_faces.push_back(face);
+        boundary_faces.push_back({face, i});
     }
-    std::sort(boundary_faces.begin(), boundary_faces.end());
-    uint64_t repeated = 0;
-    for (std::size_t i = 1; i < boundary_faces.size(); ++i)
-        if (boundary_faces[i] == boundary_faces[i - 1]) ++repeated;
-    if (repeated > 0)
-        mesh.info.warnings.push_back(std::to_string(repeated) + " boundary triangles are listed more than once");
+    std::sort(boundary_faces.begin(), boundary_faces.end(), [](const BoundaryFace& a, const BoundaryFace& b) {
+        return a.face != b.face ? a.face < b.face : a.index < b.index;
+    });
+    for (std::size_t i = 1; i < boundary_faces.size(); ++i) {
+        if (boundary_faces[i].face != boundary_faces[i - 1].face) continue;
+        const std::size_t first = boundary_faces[i - 1].index, second = boundary_faces[i].index;
+        const uint16_t bc_first = mesh.boundary_elements[first].boundary_condition;
+        const uint16_t bc_second = mesh.boundary_elements[second].boundary_condition;
+        std::string message = "triangle with " + describe(boundary_faces[i].face) + " is already listed on line " +
+                              std::to_string(state.boundary_lines[first]);
+        if (bc_first != bc_second)
+            message += " with another boundary condition ('" + state.surface_names[bc_first] + "' and '" +
+                       state.surface_names[bc_second] + "')";
+        fail(file, state.boundary_lines[second], message);
+    }
+
+    // The mesh should be one piece: every tet reachable from the first one through shared faces.
+    std::vector<bool> reached(mesh.elements.size(), false);
+    std::vector<uint32_t> todo;
+    std::size_t pieces = 0;
+    for (uint32_t start = 0; start < mesh.elements.size(); ++start) {
+        if (reached[start]) continue;
+        ++pieces;
+        reached[start] = true;
+        todo.push_back(start);
+        while (!todo.empty()) {
+            const uint32_t e = todo.back();
+            todo.pop_back();
+            for (const auto& neighbour : mesh.neighbours[e])
+                if (neighbour && !reached[*neighbour]) {
+                    reached[*neighbour] = true;
+                    todo.push_back(*neighbour);
+                }
+        }
+    }
+    if (pieces > 1)
+        mesh.info.warnings.push_back("the mesh consists of " + std::to_string(pieces) +
+                                     " pieces that do not share a face");
 
     const auto unused = std::count(used.begin(), used.end(), false);
     if (unused > 0)
@@ -498,6 +566,7 @@ void check_geometry(const fs::path& file, MeshProperties& mesh, const MeshReadSt
 struct MaterialFile {
     std::string name;
     std::optional<double> eps_r;
+    std::optional<double> screening_length;   // nm
     bool is_metal = false;
 };
 
@@ -577,12 +646,140 @@ MaterialFile read_material_file(const fs::path& file) {
     return result;
 }
 
+// ---- Nebula .mat files (HDF5)
+
+// Closes an HDF5 handle when it goes out of scope.
+struct H5Handle {
+    hid_t id;
+    herr_t (*close)(hid_t);
+    ~H5Handle() { if (id >= 0) close(id); }
+    H5Handle(hid_t id, herr_t (*close)(hid_t)) : id(id), close(close) {}
+    H5Handle(const H5Handle&) = delete;
+    H5Handle& operator=(const H5Handle&) = delete;
+};
+
+// A property of a .mat file is an attribute of the root group. Nebula writes text as a
+// string and a quantity as a compound {value, unit}; a plain number is accepted as well.
+struct MatProperty {
+    std::optional<std::string> text;
+    std::optional<double> value;
+    std::string unit;
+};
+
+std::optional<MatProperty> read_mat_property(const fs::path& file, hid_t h5, const char* name) {
+    if (H5Aexists(h5, name) <= 0) return std::nullopt;
+    const H5Handle attribute(H5Aopen(h5, name, H5P_DEFAULT), H5Aclose);
+    const H5Handle type(H5Aget_type(attribute.id), H5Tclose);
+    const H5Handle space(H5Aget_space(attribute.id), H5Sclose);
+    const auto bad = [&](const std::string& why) { fail(file, "property '" + std::string(name) + "' " + why); };
+    if (attribute.id < 0 || type.id < 0 || space.id < 0) bad("cannot be read");
+    if (H5Sget_simple_extent_npoints(space.id) != 1) bad("must be a single value");
+
+    // Text is read as a variable-length string in the character set of the file.
+    const H5Handle text_type(H5Tcopy(H5T_C_S1), H5Tclose);
+    H5Tset_size(text_type.id, H5T_VARIABLE);
+    const auto take_text = [](char* p) {
+        std::string result = p ? p : "";
+        if (p) H5free_memory(p);
+        return result;
+    };
+
+    MatProperty result;
+    switch (H5Tget_class(type.id)) {
+    case H5T_STRING: {
+        if (H5Tis_variable_str(type.id) > 0) {
+            char* p = nullptr;
+            H5Tset_cset(text_type.id, H5Tget_cset(type.id));
+            if (H5Aread(attribute.id, text_type.id, &p) < 0) bad("cannot be read");
+            result.text = take_text(p);
+        } else {
+            std::string buffer(H5Tget_size(type.id), '\0');
+            if (H5Aread(attribute.id, type.id, buffer.data()) < 0) bad("cannot be read");
+            buffer.resize(std::strlen(buffer.c_str()));
+            result.text = std::string(trim(buffer));
+        }
+        break;
+    }
+    case H5T_INTEGER:
+    case H5T_FLOAT: {
+        double value = 0;
+        if (H5Aread(attribute.id, H5T_NATIVE_DOUBLE, &value) < 0) bad("cannot be read");
+        result.value = value;
+        break;
+    }
+    case H5T_COMPOUND: {
+        if (H5Tget_member_index(type.id, "value") < 0) bad("has no 'value'");
+        double value = 0;
+        const H5Handle value_type(H5Tcreate(H5T_COMPOUND, sizeof(double)), H5Tclose);
+        H5Tinsert(value_type.id, "value", 0, H5T_NATIVE_DOUBLE);
+        if (H5Aread(attribute.id, value_type.id, &value) < 0) bad("has a 'value' that is not a number");
+        result.value = value;
+
+        if (const int unit = H5Tget_member_index(type.id, "unit"); unit >= 0) {
+            char* p = nullptr;
+            const H5Handle member(H5Tget_member_type(type.id, static_cast<unsigned>(unit)), H5Tclose);
+            if (H5Tget_class(member.id) != H5T_STRING) bad("has a 'unit' that is not text");
+            H5Tset_cset(text_type.id, H5Tget_cset(member.id));
+            const H5Handle unit_type(H5Tcreate(H5T_COMPOUND, sizeof(char*)), H5Tclose);
+            H5Tinsert(unit_type.id, "unit", 0, text_type.id);
+            if (H5Aread(attribute.id, unit_type.id, &p) < 0) bad("has a 'unit' that is not text");
+            result.unit = std::string(trim(take_text(p)));
+        }
+        break;
+    }
+    default:
+        bad("has an unsupported type");
+    }
+    return result;
+}
+
+// Reads the same things from a Nebula .mat file as from a .yaml: "name", "conductor_type"
+// and "epsilon_r", as Nebula does.
+// ASSUMED, the format does not define it yet: a property "screening_length", a length with
+// a unit (nm if no unit is given).
+MaterialFile read_mat_file(const fs::path& file) {
+    if (!fs::is_regular_file(file)) fail(file, "file not found");
+    H5Eset_auto2(H5E_DEFAULT, nullptr, nullptr);   // errors are reported by exceptions here
+    const H5Handle h5(H5Fopen(file.string().c_str(), H5F_ACC_RDONLY, H5P_DEFAULT), H5Fclose);
+    if (h5.id < 0) fail(file, "not a Nebula material file (HDF5)");
+
+    MaterialFile result;
+    const auto name = read_mat_property(file, h5.id, "name");
+    if (!name || !name->text) fail(file, "the material file has no 'name'");
+    if (name->text->empty()) fail(file, "the material name is empty");
+    result.name = *name->text;
+
+    const auto conductor_type = read_mat_property(file, h5.id, "conductor_type");
+    if (!conductor_type || !conductor_type->text) fail(file, "the material file has no 'conductor_type'");
+    result.is_metal = *conductor_type->text == "metal";
+
+    if (const auto eps_r = read_mat_property(file, h5.id, "epsilon_r")) {
+        if (!eps_r->value || !std::isfinite(*eps_r->value)) fail(file, "epsilon_r is not a number");
+        if (*eps_r->value <= 0) fail(file, "epsilon_r must be positive");
+        result.eps_r = *eps_r->value;
+    }
+
+    if (const auto length = read_mat_property(file, h5.id, "screening_length")) {
+        if (!length->value || !std::isfinite(*length->value)) fail(file, "screening_length is not a number");
+        if (*length->value < 0) fail(file, "screening_length must not be negative");
+        double to_nm = 1;
+        if (length->unit == "m") to_nm = 1e9;
+        else if (length->unit == "um" || length->unit == "µm") to_nm = 1e3;
+        else if (length->unit == "Å" || length->unit == "angstrom") to_nm = 0.1;
+        else if (!length->unit.empty() && length->unit != "nm")
+            fail(file, "screening_length has the unknown unit '" + length->unit + "'");
+        result.screening_length = *length->value * to_nm;
+    }
+    return result;
+}
+
 void read_materials(const std::vector<fs::path>& files, MeshProperties& mesh) {
     std::vector<bool> has_file(mesh.materials.size(), false);
     std::vector<std::string> seen;
 
     for (const fs::path& file : files) {
-        const MaterialFile material = read_material_file(file);
+        // A .mat file is Nebula's compiled material (HDF5); anything else is read as .yaml.
+        const MaterialFile material = file.extension() == ".mat" ? read_mat_file(file) : read_material_file(file);
         if (std::find(seen.begin(), seen.end(), material.name) != seen.end())
             fail(file, "material '" + material.name + "' is given by more than one file");
         seen.push_back(material.name);
@@ -593,6 +790,7 @@ void read_materials(const std::vector<fs::path>& files, MeshProperties& mesh) {
             found = true;
             has_file[m] = true;
             if (material.eps_r) mesh.materials[m].eps_r = *material.eps_r;
+            if (material.screening_length) mesh.materials[m].screening_length = *material.screening_length;
             if (material.is_metal) mesh.materials[m].is_metal = true;
         }
         if (!found)

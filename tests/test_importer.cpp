@@ -7,6 +7,8 @@
 #include "importer.h"
 #include "solver_result.h"
 
+#include <hdf5.h>
+
 #include <algorithm>
 #include <cstdlib>
 #include <cstring>
@@ -14,6 +16,7 @@
 #include <functional>
 #include <iostream>
 #include <stdexcept>
+#include <optional>
 #include <string>
 
 namespace fs = std::filesystem;
@@ -48,6 +51,46 @@ bool has_warning(const std::vector<std::string>& warnings, const std::string& te
     for (const auto& warning : warnings)
         if (warning.find(text) != std::string::npos) return true;
     return false;
+}
+
+// Writes a material file the way Nebula's cstool does: text properties as strings and
+// quantities as a compound {value, unit}, all as attributes of the root group.
+struct Quantity { double value; const char* unit; };
+fs::path write_mat(const fs::path& directory, const std::string& file_name, const std::string& name,
+                   const std::string& conductor_type, std::optional<Quantity> eps_r = std::nullopt,
+                   std::optional<Quantity> screening_length = std::nullopt) {
+    const fs::path path = directory / file_name;
+    const hid_t file = H5Fcreate(path.string().c_str(), H5F_ACC_TRUNC, H5P_DEFAULT, H5P_DEFAULT);
+    const hid_t scalar = H5Screate(H5S_SCALAR);
+    const hid_t text = H5Tcopy(H5T_C_S1);
+    H5Tset_size(text, H5T_VARIABLE);
+    const hid_t quantity = H5Tcreate(H5T_COMPOUND, sizeof(Quantity));
+    H5Tinsert(quantity, "value", HOFFSET(Quantity, value), H5T_NATIVE_DOUBLE);
+    H5Tinsert(quantity, "unit", HOFFSET(Quantity, unit), text);
+
+    const auto write_text = [&](const char* key, const std::string& value) {
+        const hid_t fixed = H5Tcopy(H5T_C_S1);
+        H5Tset_size(fixed, value.size() + 1);
+        const hid_t attribute = H5Acreate2(file, key, fixed, scalar, H5P_DEFAULT, H5P_DEFAULT);
+        H5Awrite(attribute, fixed, value.c_str());
+        H5Aclose(attribute);
+        H5Tclose(fixed);
+    };
+    const auto write_quantity = [&](const char* key, const Quantity& value) {
+        const hid_t attribute = H5Acreate2(file, key, quantity, scalar, H5P_DEFAULT, H5P_DEFAULT);
+        H5Awrite(attribute, quantity, &value);
+        H5Aclose(attribute);
+    };
+    if (!name.empty()) write_text("name", name);
+    write_text("conductor_type", conductor_type);
+    if (eps_r) write_quantity("epsilon_r", *eps_r);
+    if (screening_length) write_quantity("screening_length", *screening_length);
+
+    H5Tclose(quantity);
+    H5Tclose(text);
+    H5Sclose(scalar);
+    H5Fclose(file);
+    return path;
 }
 
 fs::path write_file(const fs::path& directory, const std::string& name, const std::string& content) {
@@ -181,11 +224,62 @@ void test_small_files(const fs::path& dir) {
     CHECK(metal.info.warnings.size() == 1);   // only the reoriented tet
     CHECK(!mesh.materials[0].is_metal);       // siliconnitride.yaml has no band_structure
 
+    // Nebula .mat files (HDF5) give the same as the .yaml, plus the screening length.
+    const MeshProperties from_mat = importer.import_mesh(
+        mesh_file, {write_mat(dir, "siliconnitride.mat", "siliconnitride", "semiconductor", Quantity{7.5, ""}, Quantity{2.0, "nm"})});
+    CHECK(from_mat.materials[0].eps_r == 7.5 && !from_mat.materials[0].is_metal);
+    CHECK(from_mat.materials[0].screening_length == 2.0);
+    CHECK(from_mat.info.warnings.size() == 1);   // only the reoriented tet
+    const MeshProperties in_metres = importer.import_mesh(
+        mesh_file, {write_mat(dir, "m.mat", "siliconnitride", "insulator", Quantity{7.5, ""}, Quantity{3e-9, "m"})});
+    CHECK(std::abs(in_metres.materials[0].screening_length - 3.0) < 1e-12);
+    const MeshProperties metal_mat = importer.import_mesh(voltage_mesh, {write_mat(dir, "silicon.mat", "silicon", "metal")});
+    CHECK(metal_mat.materials[0].is_metal && metal_mat.materials[0].voltage == -5.0);
+    CHECK(metal_mat.materials[0].screening_length == 0.0);
+    CHECK_THROWS(importer.import_mesh(mesh_file, {dir / "missing.mat"}), "file not found");
+    CHECK_THROWS(importer.import_mesh(mesh_file, {write_file(dir, "text.mat", small_material)}), "not a Nebula material file");
+    CHECK_THROWS(importer.import_mesh(mesh_file, {write_mat(dir, "noname.mat", "", "metal")}), "has no 'name'");
+    CHECK_THROWS(importer.import_mesh(mesh_file, {write_mat(dir, "neg.mat", "siliconnitride", "insulator", Quantity{-1, ""})}),
+                 "epsilon_r must be positive");
+    CHECK_THROWS(importer.import_mesh(mesh_file, {write_mat(dir, "unit.mat", "siliconnitride", "insulator", Quantity{7.5, ""},
+                                                            Quantity{2.0, "eV"})}),
+                 "unknown unit 'eV'");
+
     // As in Nebula, a detector with a voltage is a metal.
     const fs::path detector_mesh =
         write_file(dir, "detector.msh", replaced(small_mesh, "\"siliconnitride\"", "\"detector 10V\""));
     const MeshProperties detector = importer.import_mesh(detector_mesh);
     CHECK(detector.materials[0].name == "detector" && detector.materials[0].is_metal && detector.materials[0].voltage == 10.0);
+
+    // Signs: "+5V" and "-5V" glued to the name, an explicit "+" on a surface and on a coordinate.
+    const auto voltage_of = [&](const std::string& name) {
+        const fs::path file = write_file(dir, "sign.msh", replaced(small_mesh, "\"siliconnitride\"", "\"" + name + "\""));
+        return importer.import_mesh(file).materials[0];
+    };
+    CHECK(voltage_of("detector+5V").voltage == 5.0 && voltage_of("detector+5V").is_metal);
+    CHECK(voltage_of("detector-5V").voltage == -5.0);
+    CHECK(voltage_of("silicon +2.5V").voltage == 2.5 && voltage_of("silicon +2.5V").name == "silicon");
+    CHECK(voltage_of("silicon-3V").voltage == -3.0 && voltage_of("silicon-3V").name == "silicon");
+    CHECK(!voltage_of("silicon5V").voltage);   // glued to the word: part of the name
+    const fs::path plus_mesh = write_file(
+        dir, "plus.msh", replaced(replaced(small_mesh, "\"0V\"", "\"+3V\""), "20 1 0 0", "20 +1 0 0"));
+    CHECK(importer.import_mesh(plus_mesh).boundary_conditions[0].value == 3.0);
+    CHECK(importer.import_mesh(plus_mesh).nodes[1][0] == 1.0);
+
+    // Only a Neumann condition: nothing fixes the potential. A volume with a voltage does.
+    const std::string neumann_only = replaced(small_mesh, "\"0V\"", "\"D1\"");
+    CHECK(has_warning(importer.import_mesh(write_file(dir, "neumann.msh", neumann_only)).info.warnings,
+                      "no potential is prescribed anywhere"));
+    CHECK(!has_warning(importer.import_mesh(write_file(dir, "neumann.msh", replaced(neumann_only, "\"siliconnitride\"", "\"gold 1V\"")))
+                            .info.warnings, "no potential is prescribed anywhere"));
+    CHECK(!has_warning(mesh.info.warnings, "no potential") && !has_warning(mesh.info.warnings, "pieces"));
+
+    // Two tets that share no face: the mesh is in two pieces.
+    std::string two_pieces = replaced(small_mesh, "$Nodes\n5", "$Nodes\n8\n60 5 0 0\n70 6 0 0\n80 5 1 0");
+    two_pieces = replaced(two_pieces, "50 0 0 -1", "50 5 0 1");
+    two_pieces = replaced(two_pieces, "4 4 2 2 2 10 20 30 50", "4 4 2 2 2 60 70 80 50");
+    two_pieces = replaced(two_pieces, "2 2 2 9 1 10 30 50", "2 2 2 9 1 60 80 50");
+    CHECK(has_warning(importer.import_mesh(write_file(dir, "pieces.msh", two_pieces)).info.warnings, "consists of 2 pieces"));
 
     const fs::path dirichlet_mesh = write_file(dir, "dirichlet.msh", replaced(small_mesh, "\"0V\"", "\"-2.5V\""));
     CHECK(importer.import_mesh(dirichlet_mesh).boundary_conditions[0].value == -2.5);
@@ -223,6 +317,12 @@ void test_small_files(const fs::path& dir) {
     const std::string third_tet = replaced(replaced(small_mesh, "$Nodes\n5", "$Nodes\n6\n60 1 1 2"), "$Elements\n4",
                                            "$Elements\n5\n9 4 2 5 1 10 20 30 60");
     CHECK_THROWS(importer.import_mesh(write_file(dir, "third.msh", third_tet)), "more than two tetrahedra");
+    // The same tet twice, two tets on the same side of a face, the same triangle twice.
+    CHECK_THROWS(importer.import_mesh(broken("$Elements\n4", "$Elements\n5\n9 4 2 2 1 20 10 40 30")), "listed more than once");
+    CHECK_THROWS(importer.import_mesh(broken("50 0 0 -1", "50 0.2 0.2 0.5")), "two tetrahedra overlap");
+    CHECK_THROWS(importer.import_mesh(broken("$Elements\n4", "$Elements\n5\n9 2 2 7 1 40 20 10")), "is already listed on line 21");
+    CHECK_THROWS(importer.import_mesh(broken("$Elements\n4", "$Elements\n5\n9 2 2 9 1 40 20 10")),
+                 "with another boundary condition ('D0' and '0V')");
 
     // A node that no tet uses is only a warning.
     const MeshProperties unused_node = importer.import_mesh(broken("$Nodes\n5", "$Nodes\n6\n60 5 5 5"));

@@ -208,6 +208,7 @@ public:
 | surface names in the mesh file | `boundary_conditions`: `"0V"` is Dirichlet, `"D0"` is Neumann |
 | volume names in the mesh file | `materials`; a voltage in the name (`"silicon 5V"`) gives `voltage` |
 | material `.yaml` | for the material with the same name: `eps_r` (`dielectric: epsilon_r`) and `is_metal` (`band_structure: model: metal`) |
+| material `.mat` (Nebula, HDF5) | the same from the properties `epsilon_r` and `conductor_type`; `screening_length` from a property of that name (assumed, not in Nebula's format) |
 | `.cha` | `MeshProperties::charges` |
 | `.pri` | `FreeCharges::electrons` |
 
