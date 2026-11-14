@@ -233,7 +233,7 @@ Assembly, AnalyticalMaker, Adaptive Mesh Refining and Ray Tracing.
 
 ## Open points
 
-- `Analytical Solution`: contents not decided. Planned as singularity subtraction:
+- `Analytical Solution`: contents not decided. Planned as local singularity subtraction (P3M): a smooth cloud per charge in f, plus an analytical correction within r_c of each charge.
   analytical functions around the trapped charges.
 - `Solution`: contents not decided; it depends on the shape of `Analytical Solution`.
 - `Output`: contents not decided.
