@@ -174,7 +174,8 @@ void test_small_files(const fs::path& dir) {
         write_file(dir, "small.cha", charge_record(0.1f, 0.1f, 0.1f, 1) + charge_record(0.1f, 0.1f, -0.5f, -1));
 
     // ---- a valid mesh
-    const MeshProperties mesh = importer.import_mesh(mesh_file, {material_file}, charge_file);
+    const MeshImportResult imported = importer.import_mesh(mesh_file, {material_file}, charge_file);
+    const MeshProperties& mesh = imported.mesh;
     CHECK(mesh.nodes.size() == 5);
     CHECK((mesh.nodes[3] == std::array<double, 3>{0, 0, 1}));
     CHECK(mesh.elements.size() == 2);
@@ -198,44 +199,44 @@ void test_small_files(const fs::path& dir) {
     CHECK(mesh.charges.size() == 2);
     CHECK(mesh.charges[0].value == 1 && mesh.charges[1].value == -1);
     CHECK(mesh.charges[1].position[2] == -0.5);
-    CHECK(mesh.info.warnings.size() == 1);
-    CHECK(has_warning(mesh.info.warnings, "1 tetrahedra had a negative volume"));
-    CHECK(mesh.info.time > 0 && mesh.info.time_read > 0);
+    CHECK(imported.info.warnings.size() == 1);
+    CHECK(has_warning(imported.info.warnings, "1 tetrahedra had a negative volume"));
+    CHECK(imported.info.time > 0 && imported.info.time_read > 0);
 
     // ---- warnings
-    const MeshProperties no_material = importer.import_mesh(mesh_file);
+    const MeshImportResult no_material = importer.import_mesh(mesh_file);
     CHECK(has_warning(no_material.info.warnings, "no material file for volume 'siliconnitride'"));
     CHECK(!has_warning(no_material.info.warnings, "vacuum"));
-    CHECK(no_material.charges.empty());
+    CHECK(no_material.mesh.charges.empty());
 
     const fs::path voltage_mesh =
         write_file(dir, "voltage.msh", replaced(small_mesh, "\"siliconnitride\"", "\"silicon -5V\""));
-    const MeshProperties with_voltage = importer.import_mesh(voltage_mesh, {material_file});
-    CHECK(with_voltage.materials[0].name == "silicon");
-    CHECK(with_voltage.materials[0].voltage == -5.0 && !with_voltage.materials[0].is_metal);
-    CHECK(!with_voltage.materials[1].voltage);
+    const MeshImportResult with_voltage = importer.import_mesh(voltage_mesh, {material_file});
+    CHECK(with_voltage.mesh.materials[0].name == "silicon");
+    CHECK(with_voltage.mesh.materials[0].voltage == -5.0 && !with_voltage.mesh.materials[0].is_metal);
+    CHECK(!with_voltage.mesh.materials[1].voltage);
     CHECK(has_warning(with_voltage.info.warnings, "'silicon' has a voltage but its material is not a metal"));
     CHECK(has_warning(with_voltage.info.warnings, "'siliconnitride'"));   // material file not used
 
     // A metal: no epsilon_r needed, and a voltage on it is fine.
     const fs::path metal_file = write_file(dir, "silicon.yaml", "name: silicon\nband_structure:\n    model: metal\n    fermi: 7 eV\n");
-    const MeshProperties metal = importer.import_mesh(voltage_mesh, {metal_file});
-    CHECK(metal.materials[0].is_metal && metal.materials[0].voltage == -5.0 && metal.materials[0].eps_r == 1.0);
+    const MeshImportResult metal = importer.import_mesh(voltage_mesh, {metal_file});
+    CHECK(metal.mesh.materials[0].is_metal && metal.mesh.materials[0].voltage == -5.0 && metal.mesh.materials[0].eps_r == 1.0);
     CHECK(metal.info.warnings.size() == 1);   // only the reoriented tet
     CHECK(!mesh.materials[0].is_metal);       // siliconnitride.yaml has no band_structure
 
     // Nebula .mat files (HDF5) give the same as the .yaml, plus the screening length.
-    const MeshProperties from_mat = importer.import_mesh(
+    const MeshImportResult from_mat = importer.import_mesh(
         mesh_file, {write_mat(dir, "siliconnitride.mat", "siliconnitride", "semiconductor", Quantity{7.5, ""}, Quantity{2.0, "nm"})});
-    CHECK(from_mat.materials[0].eps_r == 7.5 && !from_mat.materials[0].is_metal);
-    CHECK(from_mat.materials[0].screening_length == 2.0);
+    CHECK(from_mat.mesh.materials[0].eps_r == 7.5 && !from_mat.mesh.materials[0].is_metal);
+    CHECK(from_mat.mesh.materials[0].screening_length == 2.0);
     CHECK(from_mat.info.warnings.size() == 1);   // only the reoriented tet
-    const MeshProperties in_metres = importer.import_mesh(
+    const MeshImportResult in_metres = importer.import_mesh(
         mesh_file, {write_mat(dir, "m.mat", "siliconnitride", "insulator", Quantity{7.5, ""}, Quantity{3e-9, "m"})});
-    CHECK(std::abs(in_metres.materials[0].screening_length - 3.0) < 1e-12);
-    const MeshProperties metal_mat = importer.import_mesh(voltage_mesh, {write_mat(dir, "silicon.mat", "silicon", "metal")});
-    CHECK(metal_mat.materials[0].is_metal && metal_mat.materials[0].voltage == -5.0);
-    CHECK(metal_mat.materials[0].screening_length == 0.0);
+    CHECK(std::abs(in_metres.mesh.materials[0].screening_length - 3.0) < 1e-12);
+    const MeshImportResult metal_mat = importer.import_mesh(voltage_mesh, {write_mat(dir, "silicon.mat", "silicon", "metal")});
+    CHECK(metal_mat.mesh.materials[0].is_metal && metal_mat.mesh.materials[0].voltage == -5.0);
+    CHECK(metal_mat.mesh.materials[0].screening_length == 0.0);
     CHECK_THROWS(importer.import_mesh(mesh_file, {dir / "missing.mat"}), "file not found");
     CHECK_THROWS(importer.import_mesh(mesh_file, {write_file(dir, "text.mat", small_material)}), "not a Nebula material file");
     CHECK_THROWS(importer.import_mesh(mesh_file, {write_mat(dir, "noname.mat", "", "metal")}), "has no 'name'");
@@ -248,13 +249,13 @@ void test_small_files(const fs::path& dir) {
     // As in Nebula, a detector with a voltage is a metal.
     const fs::path detector_mesh =
         write_file(dir, "detector.msh", replaced(small_mesh, "\"siliconnitride\"", "\"detector 10V\""));
-    const MeshProperties detector = importer.import_mesh(detector_mesh);
-    CHECK(detector.materials[0].name == "detector" && detector.materials[0].is_metal && detector.materials[0].voltage == 10.0);
+    const MeshImportResult detector = importer.import_mesh(detector_mesh);
+    CHECK(detector.mesh.materials[0].name == "detector" && detector.mesh.materials[0].is_metal && detector.mesh.materials[0].voltage == 10.0);
 
     // Signs: "+5V" and "-5V" glued to the name, an explicit "+" on a surface and on a coordinate.
     const auto voltage_of = [&](const std::string& name) {
         const fs::path file = write_file(dir, "sign.msh", replaced(small_mesh, "\"siliconnitride\"", "\"" + name + "\""));
-        return importer.import_mesh(file).materials[0];
+        return importer.import_mesh(file).mesh.materials[0];
     };
     CHECK(voltage_of("detector+5V").voltage == 5.0 && voltage_of("detector+5V").is_metal);
     CHECK(voltage_of("detector-5V").voltage == -5.0);
@@ -263,8 +264,8 @@ void test_small_files(const fs::path& dir) {
     CHECK(!voltage_of("silicon5V").voltage);   // glued to the word: part of the name
     const fs::path plus_mesh = write_file(
         dir, "plus.msh", replaced(replaced(small_mesh, "\"0V\"", "\"+3V\""), "20 1 0 0", "20 +1 0 0"));
-    CHECK(importer.import_mesh(plus_mesh).boundary_conditions[0].value == 3.0);
-    CHECK(importer.import_mesh(plus_mesh).nodes[1][0] == 1.0);
+    CHECK(importer.import_mesh(plus_mesh).mesh.boundary_conditions[0].value == 3.0);
+    CHECK(importer.import_mesh(plus_mesh).mesh.nodes[1][0] == 1.0);
 
     // Only a Neumann condition: nothing fixes the potential. A volume with a voltage does.
     const std::string neumann_only = replaced(small_mesh, "\"0V\"", "\"D1\"");
@@ -272,7 +273,7 @@ void test_small_files(const fs::path& dir) {
                       "no potential is prescribed anywhere"));
     CHECK(!has_warning(importer.import_mesh(write_file(dir, "neumann.msh", replaced(neumann_only, "\"siliconnitride\"", "\"gold 1V\"")))
                             .info.warnings, "no potential is prescribed anywhere"));
-    CHECK(!has_warning(mesh.info.warnings, "no potential") && !has_warning(mesh.info.warnings, "pieces"));
+    CHECK(!has_warning(imported.info.warnings, "no potential") && !has_warning(imported.info.warnings, "pieces"));
 
     // Two tets that share no face: the mesh is in two pieces.
     std::string two_pieces = replaced(small_mesh, "$Nodes\n5", "$Nodes\n8\n60 5 0 0\n70 6 0 0\n80 5 1 0");
@@ -282,7 +283,7 @@ void test_small_files(const fs::path& dir) {
     CHECK(has_warning(importer.import_mesh(write_file(dir, "pieces.msh", two_pieces)).info.warnings, "consists of 2 pieces"));
 
     const fs::path dirichlet_mesh = write_file(dir, "dirichlet.msh", replaced(small_mesh, "\"0V\"", "\"-2.5V\""));
-    CHECK(importer.import_mesh(dirichlet_mesh).boundary_conditions[0].value == -2.5);
+    CHECK(importer.import_mesh(dirichlet_mesh).mesh.boundary_conditions[0].value == -2.5);
 
     const fs::path far_charge = write_file(dir, "far.cha", charge_record(100.0f, 0.0f, 0.0f, 1));
     CHECK(has_warning(importer.import_mesh(mesh_file, {}, far_charge).info.warnings, "outside the bounding box"));
@@ -312,7 +313,7 @@ void test_small_files(const fs::path& dir) {
     CHECK_THROWS(importer.import_mesh(broken("$EndElements\n", "")), "unexpected end of file");
     CHECK_THROWS(importer.import_mesh(broken("$Nodes", "$Knots")), "expected $EndKnots");
     // A section we do not know is skipped.
-    CHECK(importer.import_mesh(broken("$Nodes", "$Comments\nanything\n$EndComments\n$Nodes")).nodes.size() == 5);
+    CHECK(importer.import_mesh(broken("$Nodes", "$Comments\nanything\n$EndComments\n$Nodes")).mesh.nodes.size() == 5);
     // A third tet on the shared face.
     const std::string third_tet = replaced(replaced(small_mesh, "$Nodes\n5", "$Nodes\n6\n60 1 1 2"), "$Elements\n4",
                                            "$Elements\n5\n9 4 2 5 1 10 20 30 60");
@@ -325,7 +326,7 @@ void test_small_files(const fs::path& dir) {
                  "with another boundary condition ('D0' and '0V')");
 
     // A node that no tet uses is only a warning.
-    const MeshProperties unused_node = importer.import_mesh(broken("$Nodes\n5", "$Nodes\n6\n60 5 5 5"));
+    const MeshImportResult unused_node = importer.import_mesh(broken("$Nodes\n5", "$Nodes\n6\n60 5 5 5"));
     CHECK(has_warning(unused_node.info.warnings, "1 nodes do not belong to any tetrahedron"));
 
     // ---- invalid material and charge files
@@ -338,21 +339,22 @@ void test_small_files(const fs::path& dir) {
     CHECK_THROWS(importer.import_mesh(mesh_file, {}, write_file(dir, "short.cha", std::string(15, '\0'))),
                  "not a multiple of 16");
     // Any charge value is accepted; zero is only a warning.
-    const MeshProperties general =
+    const MeshImportResult general =
         importer.import_mesh(mesh_file, {}, write_file(dir, "q.cha", charge_record(0, 0, 0, -300) + charge_record(0, 0, 0, 0)));
-    CHECK(general.charges[0].value == -300 && general.charges[1].value == 0);
+    CHECK(general.mesh.charges[0].value == -300 && general.mesh.charges[1].value == 0);
     CHECK(has_warning(general.info.warnings, "1 trapped charges have a charge of zero"));
 
     // ---- primaries
     const fs::path primaries_file =
         write_file(dir, "small.pri", primary_record(35.0f, -1.0f, 500.0f) + primary_record(36.0f, -2.0f, 300.0f));
-    const FreeCharges free_charges = importer.import_free_charges(primaries_file);
+    const FreeChargesImportResult imported_charges = importer.import_free_charges(primaries_file);
+    const FreeCharges& free_charges = imported_charges.charges;
     CHECK(free_charges.electrons.size() == 2);
     CHECK((free_charges.electrons[0].position == std::array<double, 3>{1, 2, 35}));
     CHECK((free_charges.electrons[1].direction == std::array<double, 3>{0, 0, -2}));
     CHECK(free_charges.electrons[1].energy == 300.0);
     CHECK((free_charges.electrons[0].pixel == std::array<int32_t, 2>{3, 4}));
-    CHECK(free_charges.info.warnings.empty());
+    CHECK(imported_charges.info.warnings.empty());
 
     CHECK_THROWS(importer.import_free_charges(write_file(dir, "short.pri", std::string(35, '\0'))), "not a multiple of 36");
     CHECK_THROWS(importer.import_free_charges(write_file(dir, "e.pri", primary_record(35.0f, -1.0f, 0.0f))),
@@ -363,7 +365,8 @@ void test_small_files(const fs::path& dir) {
 
 void test_sample_files(const fs::path& msh, const fs::path& yaml, const fs::path& cha, const fs::path& pri) {
     const Importer importer;
-    const MeshProperties mesh = importer.import_mesh(msh, {yaml}, cha);
+    const MeshImportResult imported_mesh = importer.import_mesh(msh, {yaml}, cha);
+    const MeshProperties& mesh = imported_mesh.mesh;
     CHECK(mesh.nodes.size() == 7792);
     CHECK(mesh.elements.size() == 40795);
     CHECK(mesh.boundary_elements.size() == 1143);
@@ -388,18 +391,19 @@ void test_sample_files(const fs::path& msh, const fs::path& yaml, const fs::path
     CHECK(mismatched == 0);       // if a is a neighbour of b, b is a neighbour of a
     CHECK((mesh.charges[0].position == std::array<double, 3>{2, 0, -20}) && mesh.charges[0].value == 1);
 
-    const FreeCharges free_charges = importer.import_free_charges(pri);
+    const FreeChargesImportResult imported_charges = importer.import_free_charges(pri);
+    const FreeCharges& free_charges = imported_charges.charges;
     CHECK(free_charges.electrons.size() == 494415);
     CHECK(free_charges.electrons[0].energy == 500.0);
 
     std::cout << "sample mesh: " << mesh.nodes.size() << " nodes, " << mesh.elements.size() << " tets, "
               << mesh.boundary_elements.size() << " boundary triangles, " << mesh.charges.size() << " charges\n"
-              << "  time " << mesh.info.time << " s (read " << mesh.info.time_read << " s, geometry "
-              << mesh.info.time_geometry << " s)\n";
-    for (const auto& warning : mesh.info.warnings) std::cout << "  warning: " << warning << "\n";
+              << "  time " << imported_mesh.info.time << " s (read " << imported_mesh.info.time_read << " s, geometry "
+              << imported_mesh.info.time_geometry << " s)\n";
+    for (const auto& warning : imported_mesh.info.warnings) std::cout << "  warning: " << warning << "\n";
     std::cout << "sample primaries: " << free_charges.electrons.size() << " electrons, time "
-              << free_charges.info.time << " s\n";
-    for (const auto& warning : free_charges.info.warnings) std::cout << "  warning: " << warning << "\n";
+              << imported_charges.info.time << " s\n";
+    for (const auto& warning : imported_charges.info.warnings) std::cout << "  warning: " << warning << "\n";
 }
 
 int main(int argc, char** argv) {

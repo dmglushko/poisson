@@ -1,13 +1,12 @@
 #pragma once
 
+#include <Eigen/SparseCore>
+
 #include <cstdint>
 #include <optional>
 #include <string>
 #include <utility>
 #include <vector>
-
-// PLACEHOLDER: the storage format of the matrix is not decided yet.
-struct SparseMatrix {};
 
 // Holds the matrix A and the right-hand side vector f of A x = f.
 //
@@ -26,7 +25,7 @@ struct AssembledProblem {
         std::vector<std::string> warnings;
     };
 
-    SparseMatrix                             A;       // storage format still open
+    Eigen::SparseMatrix<double>              A;
     std::vector<double>                      f;       // right-hand side, one entry per row of A
     std::vector<std::optional<uint32_t>>     row;     // per node: its row in A, or empty if its value is known
     std::vector<std::pair<uint32_t, double>> known;   // (node, value) for every node whose value is known

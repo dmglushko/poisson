@@ -40,13 +40,6 @@ struct MeshProperties {
         int32_t               value;              // in elementary charges: +1 hole, -1 electron
     };
 
-    struct Info {
-        double time = 0;                          // total, in seconds
-        double time_read = 0;                     // reading the .msh
-        double time_geometry = 0;                 // checking the geometry
-        std::vector<std::string> warnings;        // e.g. a volume without a material file
-    };
-
     std::vector<std::array<double, 3>> nodes;               // nodes[id] = {x, y, z} in nm
     std::vector<Element>               elements;
     std::vector<BoundaryElement>       boundary_elements;
@@ -60,5 +53,4 @@ struct MeshProperties {
     // std::optional doubles the memory here (32 instead of 16 bytes per tet). If that turns
     // out to matter, a plain uint32_t with a reserved "no neighbour" value may be better.
     std::vector<std::array<std::optional<uint32_t>, 4>> neighbours;
-    Info                               info;
 };

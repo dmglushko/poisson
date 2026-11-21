@@ -1,18 +1,40 @@
 # Importer
 
-Reads the input files and builds `MeshProperties` and `FreeCharges` (`include/importer.h`,
-`src/importer.cpp`).
+Reads the input files and returns `MeshImportResult { mesh, info }` and
+`FreeChargesImportResult { charges, info }` (`include/importer.h`, `src/importer.cpp`).
 
 ## Interface
 
 ```cpp
+struct MeshImportResult {
+    struct Info {
+        double                   time = 0;            // total, in seconds
+        double                   time_read = 0;       // reading the .msh
+        double                   time_geometry = 0;   // checking the geometry
+        std::vector<std::string> warnings;            // e.g. a volume without a material file
+    };
+
+    MeshProperties mesh;
+    Info           info;
+};
+
+struct FreeChargesImportResult {
+    struct Info {
+        double                   time = 0;            // total, in seconds
+        std::vector<std::string> warnings;
+    };
+
+    FreeCharges charges;
+    Info        info;
+};
+
 class Importer {
 public:
-    MeshProperties import_mesh(const std::filesystem::path& mesh_file,
-                               const std::vector<std::filesystem::path>& material_files = {},
-                               const std::optional<std::filesystem::path>& charges_file = std::nullopt) const;
+    MeshImportResult import_mesh(const std::filesystem::path& mesh_file,
+                                 const std::vector<std::filesystem::path>& material_files = {},
+                                 const std::optional<std::filesystem::path>& charges_file = std::nullopt) const;
 
-    FreeCharges import_free_charges(const std::filesystem::path& primaries_file) const;
+    FreeChargesImportResult import_free_charges(const std::filesystem::path& primaries_file) const;
 };
 ```
 

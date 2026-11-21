@@ -5,11 +5,13 @@ tracing through the resulting field. It is meant to replace deal.II in the Nebul
 electron-matter simulator.
 
 The design is described in [architecture.md](architecture.md): the data flow, the data
-classes and the steps. So far the data classes and the Importer are implemented.
+classes and the steps. So far the data classes, the Importer and adaptive mesh refinement
+([src/amr/architecture.md](src/amr/architecture.md)) are implemented.
 
 ## Build and test
 
-Needs a C++23 compiler, CMake and the HDF5 library (`libhdf5-dev` on Ubuntu).
+Needs a C++23 compiler, CMake, Eigen3 (`libeigen3-dev` on Ubuntu) and the HDF5 library
+(`libhdf5-dev`).
 
 ```
 cmake -S . -B build

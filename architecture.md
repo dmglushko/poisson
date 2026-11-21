@@ -45,8 +45,10 @@ flowchart LR
 ## Conventions
 
 - Classes are CamelCase, variables are snake_case.
-- Every data class has a nested `Info` describing the run that produced it. Each `Info` has
-  at least `time` and `warnings`; the other fields differ per class.
+- Pure domain data structs (`MeshProperties`, `FreeCharges`) hold only problem data.
+- Every step result (`MeshImportResult`, `FreeChargesImportResult`, `AssembledProblem`,
+  `SolverResult`, `ErrorEstimate`, `RefinementResult`, `AdaptationResult`) has a nested
+  `Info` describing the run that produced it, with at least `time` and `warnings`.
 
 ## Data classes
 
@@ -88,13 +90,6 @@ struct MeshProperties {
         int32_t               value;              // in elementary charges: +1 hole, -1 electron
     };
 
-    struct Info {
-        double time = 0;                          // total, in seconds
-        double time_read = 0;                     // reading the .msh
-        double time_geometry = 0;                 // checking the geometry
-        std::vector<std::string> warnings;        // e.g. a volume without a material file
-    };
-
     std::vector<std::array<double, 3>> nodes;               // nodes[id] = {x, y, z} in nm
     std::vector<Element>               elements;
     std::vector<BoundaryElement>       boundary_elements;
@@ -108,7 +103,6 @@ struct MeshProperties {
     // std::optional doubles the memory here (32 instead of 16 bytes per tet). If that turns
     // out to matter, a plain uint32_t with a reserved "no neighbour" value may be better.
     std::vector<std::array<std::optional<uint32_t>, 4>> neighbours;
-    Info                               info;
 };
 ```
 
@@ -126,13 +120,7 @@ struct FreeCharges {
         std::array<int32_t, 2> pixel;       // image pixel this electron belongs to
     };
 
-    struct Info {
-        double time = 0;                        // total, in seconds
-        std::vector<std::string> warnings;
-    };
-
     std::vector<Electron> electrons;
-    Info                  info;
 };
 ```
 
@@ -159,7 +147,7 @@ struct AssembledProblem {
         std::vector<std::string> warnings;
     };
 
-    SparseMatrix                             A;       // storage format still open
+    Eigen::SparseMatrix<double>              A;
     std::vector<double>                      f;       // right-hand side, one entry per row of A
     std::vector<std::optional<uint32_t>>     row;     // per node: its row in A, or empty if its value is known
     std::vector<std::pair<uint32_t, double>> known;   // (node, value) for every node whose value is known
@@ -189,8 +177,9 @@ struct SolverResult {
 
 ### Importer
 
-Reads the input files (`.msh`/`.msh2`, material `.yaml`/`.mat`, `.cha`, `.pri`) and builds
-`MeshProperties` and `FreeCharges` (`include/importer.h`, `src/importer.cpp`). Described in
+Reads the input files (`.msh`/`.msh2`, material `.yaml`/`.mat`, `.cha`, `.pri`) and returns
+`MeshImportResult { mesh, info }` and `FreeChargesImportResult { charges, info }`
+(`include/importer.h`, `src/importer.cpp`). Described in
 [src/importer/architecture.md](src/importer/architecture.md).
 
 ### Solver
@@ -201,9 +190,24 @@ Solves A x = f. It takes `A` and `f` from `AssembledProblem` and returns a `Solv
 
 Builds `Solution` from `SolverResult::x`, using `row` and `known` from `AssembledProblem`.
 
+### Adaptive Mesh Refining
+
+Top-level virtual `MeshAdapter` (`include/amr/mesh_adapter.h`, session-based) and its
+composite `ErrorBasedAdapter` (`include/amr/error_based_adapter.h`), built from three
+interchangeable step interfaces (`ErrorEstimator`, `MarkingStrategy`, `Refiner`). Its input
+is `MeshProperties` and a `RefinementInput` (u at every node, the source f as a function,
+point sources); its output is an `AdaptationResult`. Described in
+[src/amr/architecture.md](src/amr/architecture.md).
+
+### Driver (placeholder)
+
+`PoissonDriver` (`include/poisson_driver.h`) is a placeholder header sketching the top-level
+solve loop over `AnalyticalMaker`, `Assembly`, `Solver`, `SolutionBuilder`, and an optional
+`MeshAdapter`. To be implemented once those contracts are defined.
+
 ### Not defined yet
 
-Assembly, AnalyticalMaker, Adaptive Mesh Refining and Ray Tracing.
+Assembly, AnalyticalMaker and Ray Tracing.
 
 ## Open points
 
@@ -211,5 +215,4 @@ Assembly, AnalyticalMaker, Adaptive Mesh Refining and Ray Tracing.
   analytical functions around the trapped charges.
 - `Solution`: contents not decided; it depends on the shape of `Analytical Solution`.
 - `Output`: contents not decided.
-- `SparseMatrix`: storage format not decided; an empty placeholder struct in the code.
 - `neighbours` in `MeshProperties`: proposed, not decided.

@@ -296,7 +296,7 @@ double longest_edge(const MeshProperties& mesh, const std::array<uint32_t, 4>& n
     return std::sqrt(longest2);
 }
 
-void read_elements(TextReader& reader, MeshProperties& mesh, MeshReadState& state) {
+void read_elements(TextReader& reader, MeshProperties& mesh, MeshReadState& state, std::vector<std::string>& warnings) {
     std::string_view line = reader.require("the number of elements");
     uint64_t count = 0;
     if (!take(line, count) || !trim(line).empty()) reader.fail("invalid number of elements");
@@ -371,12 +371,12 @@ void read_elements(TextReader& reader, MeshProperties& mesh, MeshReadState& stat
     reader.expect("$EndElements");
 
     if (skipped > 0)
-        mesh.info.warnings.push_back(std::to_string(skipped) + " point and line elements were skipped");
+        warnings.push_back(std::to_string(skipped) + " point and line elements were skipped");
     if (reoriented > 0)
-        mesh.info.warnings.push_back(std::to_string(reoriented) + " tetrahedra had a negative volume; their node order was fixed");
+        warnings.push_back(std::to_string(reoriented) + " tetrahedra had a negative volume; their node order was fixed");
 }
 
-void read_mesh_file(const fs::path& file, MeshProperties& mesh, MeshReadState& state) {
+void read_mesh_file(const fs::path& file, MeshProperties& mesh, MeshReadState& state, std::vector<std::string>& warnings) {
     const std::string text = read_file(file);
     TextReader reader(file, text);
 
@@ -405,7 +405,7 @@ void read_mesh_file(const fs::path& file, MeshProperties& mesh, MeshReadState& s
             if (has_elements) reader.fail("second $Elements section");
             if (!has_names) reader.fail("$Elements found before $PhysicalNames; the mesh needs named physical groups");
             if (!has_nodes) reader.fail("$Elements found before $Nodes");
-            read_elements(reader, mesh, state);
+            read_elements(reader, mesh, state, warnings);
             has_elements = true;
         } else {
             // A section we do not use: skip to its end.
@@ -425,12 +425,12 @@ void read_mesh_file(const fs::path& file, MeshProperties& mesh, MeshReadState& s
 
     for (std::size_t m = 0; m < mesh.materials.size(); ++m)
         if (state.material_use[m] == 0)
-            mesh.info.warnings.push_back("volume '" + mesh.materials[m].name + "' has no tetrahedra");
+            warnings.push_back("volume '" + mesh.materials[m].name + "' has no tetrahedra");
     for (std::size_t b = 0; b < mesh.boundary_conditions.size(); ++b)
         if (state.boundary_use[b] == 0)
-            mesh.info.warnings.push_back("surface '" + state.surface_names[b] + "' has no triangles");
+            warnings.push_back("surface '" + state.surface_names[b] + "' has no triangles");
     if (mesh.boundary_elements.empty())
-        mesh.info.warnings.push_back("the mesh has no boundary conditions");
+        warnings.push_back("the mesh has no boundary conditions");
 
     // Without a prescribed potential somewhere, the solution is only fixed up to a constant.
     bool has_potential = false;
@@ -440,14 +440,14 @@ void read_mesh_file(const fs::path& file, MeshProperties& mesh, MeshReadState& s
     for (std::size_t m = 0; m < mesh.materials.size(); ++m)
         if (mesh.materials[m].voltage && state.material_use[m] > 0) has_potential = true;
     if (!has_potential)
-        mesh.info.warnings.push_back("no potential is prescribed anywhere (no Dirichlet boundary condition and no "
-                                     "volume with a voltage); the solution is only fixed up to a constant");
+        warnings.push_back("no potential is prescribed anywhere (no Dirichlet boundary condition and no "
+                           "volume with a voltage); the solution is only fixed up to a constant");
 }
 
 // Checks that the mesh fits together: every face belongs to at most two tets, which lie on
 // opposite sides of it; every boundary triangle is a face of a tet and is listed once;
 // the mesh is one piece; every node is used. Fills mesh.neighbours.
-void check_geometry(const fs::path& file, MeshProperties& mesh, const MeshReadState& state) {
+void check_geometry(const fs::path& file, MeshProperties& mesh, const MeshReadState& state, std::vector<std::string>& warnings) {
     using Face = std::array<uint32_t, 3>;
     const auto sorted = [](Face face) {
         std::sort(face.begin(), face.end());
@@ -553,12 +553,12 @@ void check_geometry(const fs::path& file, MeshProperties& mesh, const MeshReadSt
         }
     }
     if (pieces > 1)
-        mesh.info.warnings.push_back("the mesh consists of " + std::to_string(pieces) +
-                                     " pieces that do not share a face");
+        warnings.push_back("the mesh consists of " + std::to_string(pieces) +
+                           " pieces that do not share a face");
 
     const auto unused = std::count(used.begin(), used.end(), false);
     if (unused > 0)
-        mesh.info.warnings.push_back(std::to_string(unused) + " nodes do not belong to any tetrahedron");
+        warnings.push_back(std::to_string(unused) + " nodes do not belong to any tetrahedron");
 }
 
 // ---------------------------------------------------------------- materials
@@ -773,7 +773,7 @@ MaterialFile read_mat_file(const fs::path& file) {
     return result;
 }
 
-void read_materials(const std::vector<fs::path>& files, MeshProperties& mesh) {
+void read_materials(const std::vector<fs::path>& files, MeshProperties& mesh, std::vector<std::string>& warnings) {
     std::vector<bool> has_file(mesh.materials.size(), false);
     std::vector<std::string> seen;
 
@@ -794,19 +794,19 @@ void read_materials(const std::vector<fs::path>& files, MeshProperties& mesh) {
             if (material.is_metal) mesh.materials[m].is_metal = true;
         }
         if (!found)
-            mesh.info.warnings.push_back("material '" + material.name + "' (" + file.string() + ") is not used by the mesh");
+            warnings.push_back("material '" + material.name + "' (" + file.string() + ") is not used by the mesh");
         else if (!material.eps_r && !material.is_metal)   // eps_r means nothing for a metal
-            mesh.info.warnings.push_back("material '" + material.name + "' (" + file.string() +
-                                         ") has no dielectric epsilon_r; eps_r is left at 1");
+            warnings.push_back("material '" + material.name + "' (" + file.string() +
+                               ") has no dielectric epsilon_r; eps_r is left at 1");
     }
 
     for (std::size_t m = 0; m < mesh.materials.size(); ++m)
         if (!has_file[m] && mesh.materials[m].name != "vacuum")
-            mesh.info.warnings.push_back("no material file for volume '" + mesh.materials[m].name + "'; eps_r is left at 1");
+            warnings.push_back("no material file for volume '" + mesh.materials[m].name + "'; eps_r is left at 1");
 
     for (const auto& material : mesh.materials)
         if (material.voltage && !material.is_metal)
-            mesh.info.warnings.push_back("volume '" + material.name + "' has a voltage but its material is not a metal");
+            warnings.push_back("volume '" + material.name + "' has a voltage but its material is not a metal");
 }
 
 // ---------------------------------------------------------------- binary files
@@ -825,13 +825,13 @@ int32_t read_int(const char* p) { return static_cast<int32_t>(read_u32(p)); }
 }
 
 // .cha: 16 bytes per charge: x, y, z as float32, q as int32.
-void read_charges(const fs::path& file, MeshProperties& mesh) {
+void read_charges(const fs::path& file, MeshProperties& mesh, std::vector<std::string>& warnings) {
     constexpr std::size_t record_size = 16;
     const std::string data = read_file(file);
     if (data.size() % record_size != 0)
         fail(file, "file size " + std::to_string(data.size()) + " is not a multiple of 16 bytes; is this a .cha file?");
     const std::size_t count = data.size() / record_size;
-    if (count == 0) mesh.info.warnings.push_back("charge file " + file.string() + " contains no charges");
+    if (count == 0) warnings.push_back("charge file " + file.string() + " contains no charges");
 
     std::array<double, 3> low = mesh.nodes.front(), high = mesh.nodes.front();
     for (const auto& node : mesh.nodes)
@@ -858,39 +858,39 @@ void read_charges(const fs::path& file, MeshProperties& mesh) {
             }
         mesh.charges.push_back({position, value});
     }
-    if (zero > 0) mesh.info.warnings.push_back(std::to_string(zero) + " trapped charges have a charge of zero");
+    if (zero > 0) warnings.push_back(std::to_string(zero) + " trapped charges have a charge of zero");
     if (outside > 0)
-        mesh.info.warnings.push_back(std::to_string(outside) + " trapped charges lie outside the bounding box of the mesh");
+        warnings.push_back(std::to_string(outside) + " trapped charges lie outside the bounding box of the mesh");
 }
 
 }   // namespace
 
-MeshProperties Importer::import_mesh(const std::filesystem::path& mesh_file,
-                                     const std::vector<std::filesystem::path>& material_files,
-                                     const std::optional<std::filesystem::path>& charges_file) const {
+MeshImportResult Importer::import_mesh(const std::filesystem::path& mesh_file,
+                                       const std::vector<std::filesystem::path>& material_files,
+                                       const std::optional<std::filesystem::path>& charges_file) const {
     const auto start = Clock::now();
-    MeshProperties mesh;
+    MeshImportResult result;
     MeshReadState state;
 
-    read_mesh_file(mesh_file, mesh, state);
-    mesh.info.time_read = seconds_since(start);
+    read_mesh_file(mesh_file, result.mesh, state, result.info.warnings);
+    result.info.time_read = seconds_since(start);
 
     const auto geometry_start = Clock::now();
-    check_geometry(mesh_file, mesh, state);
-    mesh.info.time_geometry = seconds_since(geometry_start);
+    check_geometry(mesh_file, result.mesh, state, result.info.warnings);
+    result.info.time_geometry = seconds_since(geometry_start);
 
-    read_materials(material_files, mesh);
-    if (charges_file) read_charges(*charges_file, mesh);
+    read_materials(material_files, result.mesh, result.info.warnings);
+    if (charges_file) read_charges(*charges_file, result.mesh, result.info.warnings);
 
-    mesh.info.time = seconds_since(start);
-    return mesh;
+    result.info.time = seconds_since(start);
+    return result;
 }
 
 // .pri: 36 bytes per electron: x, y, z, dx, dy, dz, energy as float32, pixel_x, pixel_y as int32.
-FreeCharges Importer::import_free_charges(const std::filesystem::path& primaries_file) const {
+FreeChargesImportResult Importer::import_free_charges(const std::filesystem::path& primaries_file) const {
     const auto start = Clock::now();
     constexpr std::size_t record_size = 36;
-    FreeCharges result;
+    FreeChargesImportResult result;
 
     const std::string data = read_file(primaries_file);
     if (data.size() % record_size != 0)
@@ -898,7 +898,7 @@ FreeCharges Importer::import_free_charges(const std::filesystem::path& primaries
     const std::size_t count = data.size() / record_size;
     if (count == 0) result.info.warnings.push_back("primaries file " + primaries_file.string() + " contains no electrons");
 
-    result.electrons.reserve(count);
+    result.charges.electrons.reserve(count);
     for (std::size_t i = 0; i < count; ++i) {
         const char* p = data.data() + i * record_size;
         FreeCharges::Electron electron;
@@ -915,7 +915,7 @@ FreeCharges Importer::import_free_charges(const std::filesystem::path& primaries
         if (!std::isfinite(electron.energy) || electron.energy <= 0)
             fail_record(primaries_file, i, "energy must be positive");
 
-        result.electrons.push_back(electron);
+        result.charges.electrons.push_back(electron);
     }
 
     result.info.time = seconds_since(start);
