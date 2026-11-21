@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.20)
-project(poisson CXX)
+project(poisson LANGUAGES C CXX)
 
 set(CMAKE_CXX_STANDARD 23)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -10,10 +10,72 @@ if(NOT CMAKE_BUILD_TYPE)
 endif()
 
 find_package(Eigen3 3.3 REQUIRED NO_MODULE)
-find_package(HDF5 REQUIRED COMPONENTS C)   # Nebula's .mat material files
+find_package(HDF5 REQUIRED COMPONENTS C)   # Nebula's .mat material files & stage cache .h5 I/O
+find_package(Python3 COMPONENTS Interpreter)
 
-add_library(poisson
+# ---------------------------------------------------------------- Vendored BLAKE3 (v1.8.7)
+set(BLAKE3_DIR "${CMAKE_CURRENT_SOURCE_DIR}/third_party/blake3")
+set(BLAKE3_SOURCES
+    "${BLAKE3_DIR}/blake3.c"
+    "${BLAKE3_DIR}/blake3_dispatch.c"
+    "${BLAKE3_DIR}/blake3_portable.c"
+)
+set(BLAKE3_DEFS "")
+
+if(UNIX AND NOT APPLE AND (CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|AMD64)$"))
+    enable_language(ASM)
+    list(APPEND BLAKE3_SOURCES
+        "${BLAKE3_DIR}/blake3_sse2_x86-64_unix.S"
+        "${BLAKE3_DIR}/blake3_sse41_x86-64_unix.S"
+        "${BLAKE3_DIR}/blake3_avx2_x86-64_unix.S"
+        "${BLAKE3_DIR}/blake3_avx512_x86-64_unix.S"
+    )
+elseif((CMAKE_SYSTEM_PROCESSOR MATCHES "^(aarch64|arm64|ARM64)$")
+       AND (NOT DEFINED CMAKE_C_BYTE_ORDER OR CMAKE_C_BYTE_ORDER STREQUAL "LITTLE_ENDIAN"))
+    list(APPEND BLAKE3_SOURCES "${BLAKE3_DIR}/blake3_neon.c")
+    list(APPEND BLAKE3_DEFS BLAKE3_USE_NEON=1)
+else()
+    list(APPEND BLAKE3_DEFS
+        BLAKE3_NO_SSE2
+        BLAKE3_NO_SSE41
+        BLAKE3_NO_AVX2
+        BLAKE3_NO_AVX512
+        BLAKE3_USE_NEON=0
+    )
+endif()
+
+add_library(blake3 STATIC ${BLAKE3_SOURCES})
+set_target_properties(blake3 PROPERTIES POSITION_INDEPENDENT_CODE ON)
+target_include_directories(blake3 PUBLIC "${BLAKE3_DIR}")
+target_compile_definitions(blake3 PRIVATE ${BLAKE3_DEFS})
+
+# Shared library loaded by Python (poisson_runner.hashing) via ctypes for full-speed BLAKE3.
+add_library(poisson_blake3 SHARED src/blake3_ffi.cpp)
+target_include_directories(poisson_blake3 PUBLIC include)
+target_link_libraries(poisson_blake3 PRIVATE blake3)
+target_compile_options(poisson_blake3 PRIVATE -Wall -Wextra -Wpedantic)
+
+# ---------------------------------------------------------------- Shared stage I/O & hashing library
+# Stage CLI binaries link poisson_io + only their own stage implementation so editing an
+# unrelated module (e.g. AMR or a solver) does not change other stage binaries' BLAKE3 hashes.
+add_library(poisson_io STATIC
+    src/serialization.cpp
+    src/blake3_ffi.cpp
+)
+target_include_directories(poisson_io PUBLIC include)
+target_include_directories(poisson_io PRIVATE ${HDF5_INCLUDE_DIRS})
+target_link_libraries(poisson_io PUBLIC Eigen3::Eigen PRIVATE ${HDF5_LIBRARIES} blake3)
+target_compile_options(poisson_io PRIVATE -Wall -Wextra -Wpedantic)
+
+add_library(poisson_importer STATIC
     src/importer.cpp
+)
+target_include_directories(poisson_importer PUBLIC include)
+target_include_directories(poisson_importer PRIVATE ${HDF5_INCLUDE_DIRS})
+target_link_libraries(poisson_importer PUBLIC poisson_io PRIVATE ${HDF5_LIBRARIES})
+target_compile_options(poisson_importer PRIVATE -Wall -Wextra -Wpedantic)
+
+add_library(poisson_amr STATIC
     src/common/quadrature.cpp
     src/common/mesh_locator.cpp
     src/amr/estimator_geometry.cpp
@@ -26,13 +88,31 @@ add_library(poisson
     src/amr/longest_edge_bisection.cpp
     src/amr/red_green_refinement.cpp
     src/amr/mesh_adapter.cpp
-    src/amr/error_based_adapter.cpp)
-target_include_directories(poisson PUBLIC include)
-target_include_directories(poisson PRIVATE ${HDF5_INCLUDE_DIRS})
-target_link_libraries(poisson PUBLIC Eigen3::Eigen PRIVATE ${HDF5_LIBRARIES})
-target_compile_options(poisson PRIVATE -Wall -Wextra -Wpedantic)
+    src/amr/error_based_adapter.cpp
+)
+target_include_directories(poisson_amr PUBLIC include)
+target_link_libraries(poisson_amr PUBLIC poisson_io Eigen3::Eigen)
+target_compile_options(poisson_amr PRIVATE -Wall -Wextra -Wpedantic)
 
+# ---------------------------------------------------------------- Core C++ umbrella library
+add_library(poisson INTERFACE)
+target_link_libraries(poisson INTERFACE poisson_importer poisson_amr)
+
+# ---------------------------------------------------------------- Per-stage CLI binaries
+# Each stage variant lives in its own subfolder under cli/<stage>/<variant>.cpp
+# and builds as an independent executable.
+add_executable(poisson_import cli/importer/poisson_import.cpp)
+target_link_libraries(poisson_import PRIVATE poisson_importer)
+target_compile_options(poisson_import PRIVATE -Wall -Wextra -Wpedantic)
+
+add_executable(poisson_adapt cli/amr/poisson_adapt.cpp)
+target_include_directories(poisson_adapt PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")
+target_link_libraries(poisson_adapt PRIVATE poisson_amr)
+target_compile_options(poisson_adapt PRIVATE -Wall -Wextra -Wpedantic)
+
+# ---------------------------------------------------------------- Tests
 enable_testing()
+
 add_executable(test_importer tests/test_importer.cpp)
 target_link_libraries(test_importer PRIVATE poisson ${HDF5_LIBRARIES})
 target_include_directories(test_importer PRIVATE ${HDF5_INCLUDE_DIRS})
@@ -45,3 +125,19 @@ foreach(name quadrature locator marking estimators refiners adapter)
     target_compile_options(test_${name} PRIVATE -Wall -Wextra -Wpedantic)
     add_test(NAME ${name} COMMAND test_${name})
 endforeach()
+
+add_executable(test_serialization tests/test_serialization.cpp)
+target_link_libraries(test_serialization PRIVATE poisson ${HDF5_LIBRARIES})
+target_include_directories(test_serialization PRIVATE ${HDF5_INCLUDE_DIRS})
+target_compile_options(test_serialization PRIVATE -Wall -Wextra -Wpedantic)
+add_test(NAME serialization COMMAND test_serialization)
+
+if(Python3_FOUND)
+    add_test(
+        NAME runner
+        COMMAND ${Python3_EXECUTABLE} -m unittest discover -s "${CMAKE_CURRENT_SOURCE_DIR}/tests" -p "test_*.py" -v
+    )
+    set_tests_properties(runner PROPERTIES
+        ENVIRONMENT "POISSON_BUILD_DIR=$<TARGET_FILE_DIR:poisson_import>;PYTHONPATH=${CMAKE_CURRENT_SOURCE_DIR}/python"
+    )
+endif()
