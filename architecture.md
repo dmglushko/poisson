@@ -199,6 +199,13 @@ is `MeshProperties` and a `RefinementInput` (u at every node, the source f as a 
 point sources); its output is an `AdaptationResult`. Described in
 [src/amr/architecture.md](src/amr/architecture.md).
 
+### Common primitives
+
+Stage-agnostic numerical and geometric helpers (`include/common/`, `src/common/`):
+quadrature rules on tetrahedra and triangles (`quadrature.h`) and a BVH + neighbour-walk
+spatial lookup index over `MeshProperties` (`mesh_locator.h`). Described in
+[src/common/architecture.md](src/common/architecture.md).
+
 ### Driver (placeholder)
 
 `PoissonDriver` (`include/poisson_driver.h`) is a placeholder header sketching the top-level

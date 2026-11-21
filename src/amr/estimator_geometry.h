@@ -61,9 +61,6 @@ std::vector<Face> faces(const MeshProperties& mesh);
 // The longest edge of a triangle.
 double triangle_diameter(const MeshProperties& mesh, const std::array<uint32_t, 3>& node);
 
-// A tet that contains x (with a small tolerance), or none.
-std::optional<uint32_t> locate(const MeshProperties& mesh, const std::vector<TetGeometry>& geometry, const Vec3& x);
-
 // Throws std::invalid_argument unless 0 <= degree <= max_quadrature_degree, naming the setting.
 void check_degree(int degree, const char* setting);
 

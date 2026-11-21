@@ -5,7 +5,7 @@
 #include "amr/residual_estimator.h"
 
 #include "estimator_geometry.h"
-#include "quadrature.h"
+#include "common/quadrature.h"
 
 #include <algorithm>
 #include <cmath>

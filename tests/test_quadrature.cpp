@@ -1,6 +1,6 @@
 // Tests for the quadrature rules: exact for every monomial up to the degree.
 
-#include "quadrature.h"
+#include "common/quadrature.h"
 #include "test_support.h"
 
 #include <stdexcept>

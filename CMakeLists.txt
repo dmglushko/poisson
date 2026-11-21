@@ -14,7 +14,8 @@ find_package(HDF5 REQUIRED COMPONENTS C)   # Nebula's .mat material files
 
 add_library(poisson
     src/importer.cpp
-    src/quadrature.cpp
+    src/common/quadrature.cpp
+    src/common/mesh_locator.cpp
     src/amr/estimator_geometry.cpp
     src/amr/error_estimator.cpp
     src/amr/residual_estimators.cpp
@@ -38,7 +39,7 @@ target_include_directories(test_importer PRIVATE ${HDF5_INCLUDE_DIRS})
 target_compile_options(test_importer PRIVATE -Wall -Wextra -Wpedantic)
 add_test(NAME importer COMMAND test_importer)
 
-foreach(name quadrature marking estimators refiners adapter)
+foreach(name quadrature locator marking estimators refiners adapter)
     add_executable(test_${name} tests/test_${name}.cpp)
     target_link_libraries(test_${name} PRIVATE poisson ${HDF5_LIBRARIES})
     target_compile_options(test_${name} PRIVATE -Wall -Wextra -Wpedantic)

@@ -1,7 +1,7 @@
 #include "amr/recovery_estimator.h"
 
 #include "estimator_geometry.h"
-#include "quadrature.h"
+#include "common/quadrature.h"
 
 #include <cmath>
 

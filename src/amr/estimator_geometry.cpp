@@ -1,9 +1,8 @@
 #include "estimator_geometry.h"
 
-#include "quadrature.h"
+#include "common/quadrature.h"
 
 #include <algorithm>
-#include <limits>
 #include <stdexcept>
 
 namespace amr_detail {
@@ -115,24 +114,6 @@ std::vector<Face> faces(const MeshProperties& mesh) {
 double triangle_diameter(const MeshProperties& mesh, const std::array<uint32_t, 3>& node) {
     const Vec3 &a = mesh.nodes[node[0]], &b = mesh.nodes[node[1]], &c = mesh.nodes[node[2]];
     return std::max({norm(sub(a, b)), norm(sub(b, c)), norm(sub(c, a))});
-}
-
-std::optional<uint32_t> locate(const MeshProperties& mesh, const std::vector<TetGeometry>& geometry, const Vec3& x) {
-    std::optional<uint32_t> best;
-    double best_min = -std::numeric_limits<double>::infinity();
-    for (uint32_t k = 0; k < mesh.elements.size(); ++k) {
-        const auto& n = mesh.elements[k].node;
-        // lambda_i(x) = grad lambda_i . (x - p_j) for a node j != i, where lambda_i = 0.
-        double smallest = std::numeric_limits<double>::infinity();
-        for (int i = 0; i < 4; ++i)
-            smallest = std::min(smallest, dot(geometry[k].grad_lambda[i], sub(x, mesh.nodes[n[(i + 1) % 4]])));
-        if (smallest > best_min) {
-            best_min = smallest;
-            best = k;
-        }
-    }
-    if (!best || best_min < -1e-9) return std::nullopt;
-    return best;
 }
 
 void check_degree(int degree, const char* setting) {

@@ -90,18 +90,18 @@ Shared rules (in `ErrorEstimator::estimate`):
 
 - **Metal** tets get `eta = 0`; faces that touch a metal are skipped like Dirichlet faces.
 - **Point sources**: `PointSourceRule::exclude_patch` (default) sets `eta = 0` on every tet
-  that shares a node with the tet containing a delta, because near a delta every estimator
-  keeps growing under refinement. `ignore` leaves them out. A source without an element
-  hint is located by a linear search over all tets.
+  that shares a node with the tet containing a non-zero delta, because near a delta every
+  estimator keeps growing under refinement. `ignore` leaves them out. A source without an
+  element hint is located with `MeshLocator` (`include/common/mesh_locator.h`).
 - An outer face without a boundary element is natural (`g = 0`).
 
 Recovery averages per material by default (`per_material = true`): neither `grad u` nor
 `eps grad u` is continuous across an interface, so averaging across it would report error
 on every interface tet forever.
 
-Quadrature comes from `include/quadrature.h` (collapsed Gauss rules on tets and triangles,
-any degree up to 20, positive weights); it is outside this module because Assembly will
-need it too.
+Quadrature comes from `include/common/quadrature.h` (collapsed Gauss rules on tets and
+triangles, any degree up to 20, positive weights); it lives in `common/` because Assembly
+will need it too.
 
 ## Marking
 
@@ -151,5 +151,4 @@ and without `estimate_at_limit`, `StageInfo` collection, and the `PoissonDriver`
   faces.
 - An interior face with a Neumann or Robin boundary element is treated as an ordinary
   interior face, with a warning.
-- Point location for point sources without a hint is a linear search.
 - No coarsening, no maximum refinement level.

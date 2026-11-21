@@ -2,14 +2,13 @@
 
 #include "amr/error_estimator.h"
 
-#include "estimator_geometry.h"
+#include "common/mesh_locator.h"
 
 #include <algorithm>
 #include <chrono>
 #include <cmath>
+#include <optional>
 #include <stdexcept>
-
-using namespace amr_detail;
 
 ErrorEstimate ErrorEstimator::estimate(const MeshProperties& mesh, const RefinementInput& input) const {
     const auto start = std::chrono::steady_clock::now();
@@ -80,15 +79,15 @@ ErrorEstimate ErrorEstimator::estimate(const MeshProperties& mesh, const Refinem
     std::vector<uint8_t> excluded_mask(mesh.elements.size(), 0);
     uint32_t excluded = 0;
     if (point_sources_ == PointSourceRule::exclude_patch && !input.point_sources.empty()) {
-        std::vector<TetGeometry> geometry;
+        std::optional<MeshLocator> locator;
         std::vector<bool> patch_node(mesh.nodes.size(), false);
         uint32_t outside = 0;
         for (const auto& p : input.point_sources) {
             if (p.value == 0.0) continue;
             std::optional<uint32_t> element = p.element;
             if (!element) {
-                if (geometry.empty()) geometry = tet_geometry(mesh, who);
-                element = locate(mesh, geometry, p.position);
+                if (!locator) locator.emplace(mesh);
+                if (const auto found = locator->locate(p.position)) element = found->element;
             }
             if (!element) {
                 ++outside;
