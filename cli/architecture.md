@@ -47,3 +47,69 @@ Every stage executable:
   `name_offsets` for strings.
 - Validates scalar schema attributes, exact on-disk numeric types, boolean flags, and
   cross-array index bounds on read.
+
+## Adding a New Stage CLI (Teammate Recipe)
+
+When a new core C++ stage (e.g. `Assembly` or `Solver`) is ready, wiring it into the cache and
+`compare(...)` runner takes three small files:
+
+### 1. Create `cli/<stage>/<variant>.cpp`
+
+```cpp
+#include "cli/common/cli_utils.h"
+#include "cli/common/simple_json.h"
+#include "serialization.h"
+#include "your_stage.h"
+
+int main(int argc, char** argv) {
+    // 1. Parse --in, --config, --out, --info-out (reject missing flags)
+    // 2. Check path aliasing:
+    //    poisson::cli::reject_output_aliasing(out_path, {in_path}, "--out");
+    //    poisson::cli::reject_same_path(info_out_path, out_path, "--info-out", "--out");
+    // 3. Read input & optional JSON config:
+    //    auto problem = poisson::io::read_assembled_problem_hdf5(in_path);
+    //    auto cfg = poisson::cli::parse_json_file(config_path);
+    // 4. Run your core C++ stage:
+    //    SolverResult result = solve(problem, ...);
+    // 5. Publish atomically via sibling temp files:
+    //    poisson::cli::atomic_write_file(out_path, [&](const auto& tmp) {
+    //        poisson::io::write_solver_result_hdf5(result, tmp);
+    //    });
+    //    if (!info_out_path.empty()) {
+    //        poisson::cli::atomic_write_file(info_out_path, [&](const auto& tmp) {
+    //            poisson::io::write_info_json(result.info, tmp);
+    //        });
+    //    }
+}
+```
+
+### 2. Add an isolated target in `CMakeLists.txt`
+
+```cmake
+add_executable(poisson_solve_cg cli/solver/cg_solve.cpp)
+target_include_directories(poisson_solve_cg PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")
+target_link_libraries(poisson_solve_cg PRIVATE poisson_solver)  # links poisson_io + solver only
+target_compile_options(poisson_solve_cg PRIVATE -Wall -Wextra -Wpedantic)
+```
+
+Linking only `poisson_io` + your own stage library guarantees that editing unrelated stages does
+not change this binary's BLAKE3 hash.
+
+### 3. Register in Python with `Stage.from_cli(...)`
+
+```python
+from poisson_runner import Stage
+
+cg_solve = Stage.from_cli(
+    "solve",
+    binary="poisson_solve_cg",
+    input_flags={"problem": "--in"},
+    config_flag="--config",
+    output_flags={"out": "--out"},
+    output_specs={"out": ".h5"},
+    info_flag="--info-out",
+)
+```
+
+Now any experiment can call `run.run_stage(cg_solve, inputs={"problem": ap}, settings={...})`
+with automatic BLAKE3 caching, `repeats`/`warmup`, `dry_run`, and SLURM sharding.

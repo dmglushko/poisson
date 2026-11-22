@@ -4,12 +4,14 @@ from __future__ import annotations
 
 import contextlib
 import datetime as dt
+import errno
 from enum import Enum
 import fcntl
 import json
 import os
 import re
 import socket
+import threading
 import time
 import uuid
 from dataclasses import dataclass, field
@@ -17,6 +19,37 @@ from pathlib import Path
 from typing import Any, Iterable, Iterator, Mapping
 
 from .hashing import blake3_file, blake3_json
+
+
+class LockMode(str, Enum):
+    """Cross-process cache locking strategy.
+
+    - `FLOCK`: POSIX `fcntl.flock` (default on local Linux/WSL; auto-falls back to `LOCKFILE`
+      if the filesystem reports ENOSYS/EOPNOTSUPP/ENOLCK).
+    - `LOCKFILE`: Atomic `O_CREAT | O_EXCL` lockfile + stale-age recovery (safe across nodes
+      on Lustre/GPFS/NFSv4 shared `/scratch`).
+    - `NONE`: Lock-free reads/writes using unique temp files + atomic `os.replace`. Requires
+      `max_bytes=None` (no mid-run eviction); run `cache clean --max-gb` between sweeps.
+    """
+
+    FLOCK = "flock"
+    LOCKFILE = "lockfile"
+    NONE = "none"
+
+
+def normalize_lock_mode(value: LockMode | str) -> LockMode:
+    if isinstance(value, LockMode):
+        return value
+    if isinstance(value, str):
+        try:
+            return LockMode(value.strip().lower())
+        except ValueError:
+            pass
+    valid = ", ".join(m.value for m in LockMode)
+    raise ValueError(f"Invalid lock mode {value!r}; expected one of: {valid}")
+
+
+_FLOCK_UNSUPPORTED_ERRNOS = frozenset({errno.ENOSYS, errno.EOPNOTSUPP, errno.ENOLCK})
 
 
 class CacheMode(str, Enum):
@@ -112,19 +145,56 @@ class CacheStats:
 
 
 class CacheLease:
-    """Cross-process flock-backed lease protecting active cache objects from eviction."""
+    """Cross-process lease protecting active cache objects from eviction."""
 
     def __init__(self, cache: Cache) -> None:
         self._cache = cache
-        self._path = cache.leases_dir / f"{socket.gethostname()}_{os.getpid()}_{uuid.uuid4().hex}.lease"
+        self._host = socket.gethostname().replace("/", "_")
+        self._path = cache.leases_dir / f"{self._host}_{os.getpid()}_{uuid.uuid4().hex}.lease"
         self._fp: Any = None
+        self._active = False
+        self._uses_flock = False
         self._object_names: set[str] = set()
+        self._stop_heartbeat: threading.Event | None = None
+        self._heartbeat_thread: threading.Thread | None = None
+
+    def _start_heartbeat(self) -> None:
+        interval = max(0.05, self._cache.lock_stale_s / 3.0)
+        stop_ev = threading.Event()
+        self._stop_heartbeat = stop_ev
+
+        def _beat() -> None:
+            while not stop_ev.wait(interval):
+                try:
+                    now = time.time()
+                    os.utime(self._path, (now, now))
+                except OSError:
+                    break
+
+        t = threading.Thread(target=_beat, name="poisson-cache-lease-heartbeat", daemon=True)
+        self._heartbeat_thread = t
+        t.start()
 
     def __enter__(self) -> CacheLease:
+        if self._cache.lock_mode == LockMode.NONE:
+            return self
         self._cache.leases_dir.mkdir(parents=True, exist_ok=True)
         self._fp = open(self._path, "w+", encoding="utf-8")
-        fcntl.flock(self._fp.fileno(), fcntl.LOCK_EX)
+        if self._cache.lock_mode == LockMode.FLOCK:
+            try:
+                fcntl.flock(self._fp.fileno(), fcntl.LOCK_EX)
+                self._uses_flock = True
+            except OSError as exc:
+                if exc.errno not in _FLOCK_UNSUPPORTED_ERRNOS:
+                    self._fp.close()
+                    self._fp = None
+                    self._path.unlink(missing_ok=True)
+                    raise
+                self._uses_flock = False
+        self._active = True
         self._sync()
+        if not self._uses_flock:
+            self._start_heartbeat()
         return self
 
     def __exit__(self, exc_type: Any, exc: Any, tb: Any) -> None:
@@ -136,7 +206,7 @@ class CacheLease:
             if name not in self._object_names:
                 self._object_names.add(name)
                 changed = True
-        if changed and self._fp is not None:
+        if changed and self._active and self._fp is not None:
             self._sync()
 
     @property
@@ -147,19 +217,36 @@ class CacheLease:
         assert self._fp is not None
         self._fp.seek(0)
         self._fp.truncate()
-        json.dump({"pid": os.getpid(), "objects": sorted(self._object_names)}, self._fp)
+        json.dump(
+            {
+                "host": self._host,
+                "pid": os.getpid(),
+                "mode": "flock" if self._uses_flock else "lockfile",
+                "objects": sorted(self._object_names),
+            },
+            self._fp,
+        )
         self._fp.flush()
 
     def close(self) -> None:
+        self._active = False
+        if self._stop_heartbeat is not None:
+            self._stop_heartbeat.set()
+            if self._heartbeat_thread is not None:
+                self._heartbeat_thread.join(timeout=1.0)
+            self._stop_heartbeat = None
+            self._heartbeat_thread = None
         if self._fp is not None:
             try:
                 self._path.unlink(missing_ok=True)
             finally:
                 try:
-                    fcntl.flock(self._fp.fileno(), fcntl.LOCK_UN)
+                    if self._uses_flock:
+                        fcntl.flock(self._fp.fileno(), fcntl.LOCK_UN)
                 finally:
                     self._fp.close()
                     self._fp = None
+                    self._uses_flock = False
 
 
 class Cache:
@@ -170,7 +257,7 @@ class Cache:
       <root>/requests/<request_key>.json -- provenance, output content IDs, stage Info & metrics
       <root>/tmp/<host>_<pid>_<uuid>...  -- in-progress staging files (atomically moved on success)
       <root>/ephemeral/...               -- outputs of `use_cache=False` runs (never pruned as tmp)
-      <root>/leases/...                  -- flock-backed live artifact leases across processes
+      <root>/leases/...                  -- live artifact leases across processes
       <root>/.cache.lock                 -- cross-process lock coordinating lookup/publish/eviction
     """
 
@@ -180,6 +267,9 @@ class Cache:
         max_bytes: int | None = None,
         *,
         verify_hashes: bool = False,
+        lock_mode: LockMode | str | None = None,
+        lock_timeout_s: float = 60.0,
+        lock_stale_s: float = 300.0,
     ) -> None:
         if root is None:
             root = os.environ.get("POISSON_CACHE_DIR", ".poisson_cache")
@@ -194,23 +284,175 @@ class Cache:
         self.max_bytes = max_bytes
         self.verify_hashes = verify_hashes
 
+        self._lock_mode_marker = self.root / ".lock_mode"
+        explicit_lock_mode = lock_mode is not None
+        if lock_mode is None:
+            env_lock = os.environ.get("POISSON_CACHE_LOCK_MODE")
+            if env_lock:
+                self.lock_mode = normalize_lock_mode(env_lock)
+                explicit_lock_mode = True
+            elif self._lock_mode_marker.is_file():
+                try:
+                    self.lock_mode = normalize_lock_mode(self._lock_mode_marker.read_text(encoding="utf-8"))
+                except (OSError, ValueError):
+                    self.lock_mode = LockMode.FLOCK
+            else:
+                self.lock_mode = LockMode.FLOCK
+        else:
+            self.lock_mode = normalize_lock_mode(lock_mode)
+
+        if self.lock_mode == LockMode.NONE and self.max_bytes is not None:
+            raise ValueError(
+                "max_bytes auto-eviction cannot be combined with lock_mode='none'; "
+                "use lock_mode='lockfile' (or 'flock') or run `cache clean --max-gb` between sweeps"
+            )
+        if lock_timeout_s <= 0:
+            raise ValueError("lock_timeout_s must be positive")
+        if lock_stale_s <= 0:
+            raise ValueError("lock_stale_s must be positive")
+        self.lock_timeout_s = float(lock_timeout_s)
+        self.lock_stale_s = float(lock_stale_s)
+
         self.objects_dir = self.root / "objects"
         self.requests_dir = self.root / "requests"
         self.tmp_dir = self.root / "tmp"
         self.ephemeral_dir = self.root / "ephemeral"
         self.leases_dir = self.root / "leases"
         self._lock_path = self.root / ".cache.lock"
+        self._excl_lock_path = self.root / ".cache.lock.excl"
         for d in (self.objects_dir, self.requests_dir, self.tmp_dir, self.ephemeral_dir, self.leases_dir):
             d.mkdir(parents=True, exist_ok=True)
+
+        if explicit_lock_mode or not self._lock_mode_marker.is_file():
+            try:
+                tmp_marker = self.make_temp_path(".lock_mode")
+                tmp_marker.write_text(self.lock_mode.value + "\n", encoding="utf-8")
+                os.replace(tmp_marker, self._lock_mode_marker)
+            except OSError:
+                pass
 
         # In-process memoization keyed by (resolved_path, st_ino, st_size, st_mtime_ns, st_ctime_ns).
         self._stat_hash_memo: dict[tuple[str, int, int, int, int], str] = {}
 
+    def _try_break_stale_lockfile(self) -> bool:
+        """Atomically reclaim an abandoned `.cache.lock.excl` if its owner is dead (same host) or older than `lock_stale_s`."""
+        try:
+            st = self._excl_lock_path.stat()
+        except FileNotFoundError:
+            return True
+        except OSError:
+            return False
+
+        now = time.time()
+        local_host = socket.gethostname().replace("/", "_")
+        stale = (now - st.st_mtime) >= self.lock_stale_s
+        if not stale:
+            try:
+                meta = json.loads(self._excl_lock_path.read_text(encoding="utf-8"))
+                if (
+                    isinstance(meta, dict)
+                    and meta.get("host") == local_host
+                    and isinstance(meta.get("pid"), int)
+                    and not _pid_is_alive(meta["pid"])
+                ):
+                    stale = True
+            except (OSError, json.JSONDecodeError):
+                pass
+        if stale:
+            # Rename to a unique path first so only one waiter reclaims this stale lockfile.
+            reclaim_path = self.root / f".cache.lock.stale.{uuid.uuid4().hex}"
+            try:
+                os.rename(self._excl_lock_path, reclaim_path)
+            except FileNotFoundError:
+                return True
+            except OSError:
+                return False
+            reclaim_path.unlink(missing_ok=True)
+            return True
+        return False
+
+    @contextlib.contextmanager
+    def _locked_lockfile(self) -> Iterator[None]:
+        self.root.mkdir(parents=True, exist_ok=True)
+        token = uuid.uuid4().hex
+        payload = json.dumps(
+            {
+                "host": socket.gethostname().replace("/", "_"),
+                "pid": os.getpid(),
+                "token": token,
+            }
+        ).encode("utf-8")
+
+        deadline = time.monotonic() + self.lock_timeout_s
+        backoff = 0.005
+        acquired = False
+        while True:
+            try:
+                fd = os.open(str(self._excl_lock_path), os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o644)
+            except FileExistsError:
+                if self._try_break_stale_lockfile():
+                    continue
+                if time.monotonic() >= deadline:
+                    raise TimeoutError(
+                        f"Timed out waiting for cache lockfile {self._excl_lock_path} after {self.lock_timeout_s:.1f}s"
+                    )
+                time.sleep(backoff)
+                backoff = min(backoff * 1.5, 0.2)
+            else:
+                try:
+                    os.write(fd, payload)
+                finally:
+                    os.close(fd)
+                acquired = True
+                break
+
+        stop_beat = threading.Event()
+        beat_interval = max(0.05, self.lock_stale_s / 3.0)
+
+        def _beat_lock() -> None:
+            while not stop_beat.wait(beat_interval):
+                try:
+                    now = time.time()
+                    os.utime(self._excl_lock_path, (now, now))
+                except OSError:
+                    break
+
+        beat_thread = threading.Thread(target=_beat_lock, name="poisson-cache-lock-heartbeat", daemon=True)
+        beat_thread.start()
+        try:
+            yield
+        finally:
+            stop_beat.set()
+            beat_thread.join(timeout=1.0)
+            if acquired:
+                try:
+                    meta = json.loads(self._excl_lock_path.read_text(encoding="utf-8"))
+                    if isinstance(meta, dict) and meta.get("token") == token:
+                        self._excl_lock_path.unlink(missing_ok=True)
+                except (OSError, json.JSONDecodeError):
+                    pass
+
     @contextlib.contextmanager
     def _locked(self) -> Iterator[None]:
+        if self.lock_mode == LockMode.NONE:
+            yield
+            return
+        if self.lock_mode == LockMode.LOCKFILE:
+            with self._locked_lockfile():
+                yield
+            return
+
         self.root.mkdir(parents=True, exist_ok=True)
         with open(self._lock_path, "a+", encoding="utf-8") as lock_fp:
-            fcntl.flock(lock_fp.fileno(), fcntl.LOCK_EX)
+            try:
+                fcntl.flock(lock_fp.fileno(), fcntl.LOCK_EX)
+            except OSError as exc:
+                if exc.errno in _FLOCK_UNSUPPORTED_ERRNOS:
+                    # Fallback transparently on filesystems without flock support (e.g. Lustre without -o flock).
+                    with self._locked_lockfile():
+                        yield
+                    return
+                raise
             try:
                 yield
             finally:
@@ -265,9 +507,10 @@ class Cache:
         inputs: dict[str, Any],
         settings: dict[str, Any],
         output_specs: Mapping[str, str] | None = None,
+        env: Mapping[str, str] | None = None,
     ) -> str:
         """Compute the BLAKE3 request key for a stage invocation."""
-        payload = {
+        payload: dict[str, Any] = {
             "v": 2,
             "stage": stage_name,
             "code_hash": code_hash,
@@ -275,6 +518,8 @@ class Cache:
             "settings": settings,
             "output_specs": dict(output_specs) if output_specs is not None else {"out": ".h5"},
         }
+        if env:
+            payload["env"] = dict(env)
         return blake3_json(payload)
 
     def _request_path(self, request_key: str) -> Path:
@@ -295,34 +540,66 @@ class Cache:
             pass
 
     def _active_leased_objects(self) -> set[str]:
-        """Inspect `<root>/leases` and collect object filenames held by live locked leases."""
+        """Inspect `<root>/leases` and collect object filenames held by live leases."""
         leased: set[str] = set()
         if not self.leases_dir.is_dir():
             return leased
+        local_host = socket.gethostname().replace("/", "_")
+        now = time.time()
         for lease_path in list(self.leases_dir.glob("*.lease")):
             try:
                 fp = open(lease_path, "r+", encoding="utf-8")
             except OSError:
                 continue
             try:
+                data: Any = None
                 try:
-                    # If we can acquire LOCK_EX non-blockingly, the owning process is gone -> stale lease.
-                    fcntl.flock(fp.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-                except BlockingIOError:
-                    # Live lease held by an active process: read its pinned object names.
+                    fp.seek(0)
+                    data = json.load(fp)
+                except (OSError, json.JSONDecodeError):
+                    data = None
+
+                lease_mode = data.get("mode", "flock") if isinstance(data, dict) else "flock"
+                if self.lock_mode == LockMode.FLOCK and lease_mode == "flock":
                     try:
-                        fp.seek(0)
-                        data = json.load(fp)
+                        # If we can acquire LOCK_EX non-blockingly, the owning process is gone -> stale lease.
+                        fcntl.flock(fp.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    except BlockingIOError:
+                        # Live flock lease held by an active process.
                         if isinstance(data, dict) and isinstance(data.get("objects"), list):
                             for item in data["objects"]:
                                 if isinstance(item, str):
                                     leased.add(item)
-                    except (OSError, json.JSONDecodeError):
-                        pass
-                else:
-                    # Stale lease from a crashed process -> remove it.
-                    lease_path.unlink(missing_ok=True)
-                    fcntl.flock(fp.fileno(), fcntl.LOCK_UN)
+                    except OSError as exc:
+                        if exc.errno in _FLOCK_UNSUPPORTED_ERRNOS:
+                            lease_mode = "lockfile"
+                        else:
+                            continue
+                    else:
+                        # Stale lease from a crashed process -> remove it.
+                        lease_path.unlink(missing_ok=True)
+                        fcntl.flock(fp.fileno(), fcntl.LOCK_UN)
+                        continue
+
+                if self.lock_mode != LockMode.FLOCK or lease_mode != "flock":
+                    # Lockfile / non-flock lease: live if same-host PID is alive or file is younger than lock_stale_s.
+                    try:
+                        st = lease_path.stat()
+                    except OSError:
+                        continue
+                    is_live = False
+                    if isinstance(data, dict) and data.get("host") == local_host and isinstance(data.get("pid"), int):
+                        is_live = _pid_is_alive(data["pid"])
+                    elif (now - st.st_mtime) < self.lock_stale_s:
+                        is_live = True
+
+                    if is_live:
+                        if isinstance(data, dict) and isinstance(data.get("objects"), list):
+                            for item in data["objects"]:
+                                if isinstance(item, str):
+                                    leased.add(item)
+                    else:
+                        lease_path.unlink(missing_ok=True)
             finally:
                 fp.close()
         return leased

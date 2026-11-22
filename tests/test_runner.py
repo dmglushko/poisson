@@ -866,6 +866,199 @@ pathlib.Path(a.info_out).write_text(json.dumps({{"time": 0.015}}))
         self.assertTrue(final_dict["parents"].path.is_file())
         self.assertTrue(final_dict["history"].path.is_file())
 
+    def test_hpc_lock_modes_slurm_sharding_and_env_metadata(self) -> None:
+        """Verifies Lustre-safe lock modes (lockfile/none), SLURM job-array sharding,
+        per-stage env overrides with content deduplication, and HPC execution metadata."""
+        import csv
+        from poisson_runner import LockMode, resolve_slurm_shard
+
+        # 1. lock_mode="none" rejects max_bytes auto-eviction, works cleanly with max_bytes=None.
+        with self.assertRaises(ValueError):
+            Cache(self.tmp / "bad_none_cache", max_bytes=1024, lock_mode="none")
+
+        none_cache = Cache(self.tmp / "none_cache", lock_mode="none")
+        self.assertEqual(none_cache.lock_mode, LockMode.NONE)
+
+        # 2. lock_mode="lockfile" handles atomic O_CREAT|O_EXCL locking, stale-lock recovery, and leases.
+        lf_cache = Cache(self.tmp / "lf_cache", max_bytes=4096, lock_mode="lockfile", lock_stale_s=0.05)
+        self.assertEqual(lf_cache.lock_mode, LockMode.LOCKFILE)
+        # Plant a dead-PID lockfile and verify automatic stale recovery.
+        lf_cache._excl_lock_path.write_text(
+            json.dumps({"host": "other-node", "pid": 999999, "token": "stale"}),
+            encoding="utf-8",
+        )
+        old_time = time.time() - 10.0
+        os.utime(lf_cache._excl_lock_path, (old_time, old_time))
+
+        # Stage that prints its OMP_NUM_THREADS to info, but writes deterministic bytes!
+        env_log = self.tmp / "env_exec.log"
+        env_bin = write_executable(
+            self.tmp / "env_stage",
+            f"""
+import argparse, json, os, pathlib
+p = argparse.ArgumentParser()
+p.add_argument("--tag", required=True)
+p.add_argument("--out", required=True)
+p.add_argument("--info-out", required=True)
+a = p.parse_args()
+threads = os.environ.get("OMP_NUM_THREADS", "unset")
+with open({str(env_log)!r}, "a") as f:
+    f.write(f"{{a.tag}}:{{threads}}\\n")
+# Deterministic output independent of thread count!
+pathlib.Path(a.out).write_text(f"payload:{{a.tag}}")
+pathlib.Path(a.info_out).write_text(json.dumps({{"time": 0.01, "threads": threads}}))
+""",
+        )
+        env_stage = Stage.from_cli(
+            "compute",
+            binary=env_bin,
+            setting_flags={"tag": "--tag"},
+            output_flags={"out": "--out"},
+            output_specs={"out": ".txt"},
+            info_flag="--info-out",
+        )
+
+        # Verify stale lockfile is recovered and lease pins objects in lockfile mode.
+        with lf_cache.lease() as lease:
+            r_lf = run_experiment(
+                lambda run: run.run_stage(env_stage, settings={"tag": "a"}, env={"OMP_NUM_THREADS": "4"}),
+                cache=lf_cache,
+            )
+            self.assertEqual(r_lf.cache_misses, 1)
+            art_a: Artifact = r_lf.branches[0].result
+            lease.pin([art_a.path.name])
+            self.assertEqual(lf_cache.evict_lru(max_bytes=0), 0)
+            self.assertTrue(art_a.path.is_file())
+        self.assertEqual(lf_cache.evict_lru(max_bytes=0), 1)
+        self.assertFalse(art_a.path.is_file())
+
+        # 3. Thread scaling with env={"OMP_NUM_THREADS": ...}:
+        #    Separate request keys (both run), deduplicated single object in cache/objects/,
+        #    and HPC metadata recorded in execution + long CSV!
+        old_slurm = os.environ.get("SLURM_JOB_ID")
+        os.environ["SLURM_JOB_ID"] = "424242"
+        try:
+            def scaling_pipe(run: RunContext) -> Artifact:
+                t = compare("threads", [1, 4])
+                res = run.run_stage(env_stage, settings={"tag": "same"}, env={"OMP_NUM_THREADS": str(t)})
+                assert isinstance(res, Artifact)
+                return res
+
+            r_scale = run_experiment(scaling_pipe, cache=none_cache)
+            self.assertEqual(r_scale.cache_misses, 2)
+            # Identical output bytes -> only 1 deduplicated object on disk, 2 request receipts!
+            self.assertEqual(none_cache.stats().object_count, 1)
+            self.assertEqual(none_cache.stats().request_count, 2)
+
+            exec_env = r_scale.branches[1].stages[0].execution["environment"]
+            self.assertIsNotNone(exec_env["cpu_count"])
+            self.assertEqual(exec_env["threading"]["OMP_NUM_THREADS"], "4")
+            self.assertEqual(exec_env["slurm"]["SLURM_JOB_ID"], "424242")
+
+            long_csv = self.tmp / "hpc_long.csv"
+            r_scale.save_csv(long_csv, layout="long")
+            with long_csv.open(encoding="utf-8") as fp:
+                rows = list(csv.DictReader(fp))
+            self.assertEqual(rows[0]["omp_num_threads"], "1")
+            self.assertEqual(rows[1]["omp_num_threads"], "4")
+            self.assertEqual(rows[1]["slurm_job_id"], "424242")
+        finally:
+            if old_slurm is None:
+                os.environ.pop("SLURM_JOB_ID", None)
+            else:
+                os.environ["SLURM_JOB_ID"] = old_slurm
+
+        # 4. SLURM job-array sharding across 3 shards + read_only aggregation!
+        self.assertEqual(
+            resolve_slurm_shard({"SLURM_ARRAY_TASK_ID": "2", "SLURM_ARRAY_TASK_COUNT": "4"}),
+            (2, 4),
+        )
+        self.assertEqual(
+            resolve_slurm_shard(
+                {
+                    "SLURM_ARRAY_TASK_ID": "3",
+                    "SLURM_ARRAY_TASK_MIN": "1",
+                    "SLURM_ARRAY_TASK_MAX": "5",
+                    "SLURM_ARRAY_TASK_STEP": "2",
+                }
+            ),
+            (1, 3),
+        )
+        self.assertIsNone(resolve_slurm_shard({}))
+
+        shard_cache = Cache(self.tmp / "shard_cache", lock_mode="none")
+
+        def six_branch_pipe(run: RunContext) -> Artifact:
+            a = compare("a", ["x", "y"])
+            b = compare("b", [1, 2, 3])
+            res = run.run_stage(env_stage, settings={"tag": f"{a}_{b}"})
+            assert isinstance(res, Artifact)
+            return res
+
+        seen_indices: list[int] = []
+        for shard_idx in range(3):
+            r_sh = run_experiment(six_branch_pipe, cache=shard_cache, shard=(shard_idx, 3))
+            self.assertEqual(r_sh.shard, (shard_idx, 3))
+            self.assertEqual(len(r_sh.branches), 2)
+            self.assertEqual(r_sh.cache_misses, 2)
+            seen_indices.extend(b.index for b in r_sh.branches)
+            self.assertIn(f"[shard {shard_idx}/3]", r_sh.format_table())
+
+        self.assertEqual(sorted(seen_indices), [0, 1, 2, 3, 4, 5])
+
+        # Final read_only aggregation pass hits 100% cache across all 6 branches!
+        r_agg = run_experiment(six_branch_pipe, cache=shard_cache, cache_mode="read_only")
+        self.assertEqual(len(r_agg.branches), 6)
+        self.assertEqual(r_agg.cache_hits, 6)
+        self.assertEqual(r_agg.cache_misses, 0)
+
+        # 5. Review regressions:
+        #    a) Cache persists `.lock_mode` so a default Cache(root) / CLI adopts `lockfile` automatically.
+        reopened = Cache(lf_cache.root)
+        self.assertEqual(reopened.lock_mode, LockMode.LOCKFILE)
+
+        #    b) Sparse SLURM arrays (e.g. --array=1,3,8) are rejected clearly instead of silently mis-sharding.
+        with self.assertRaises(ValueError):
+            resolve_slurm_shard(
+                {
+                    "SLURM_ARRAY_TASK_ID": "3",
+                    "SLURM_ARRAY_TASK_MIN": "1",
+                    "SLURM_ARRAY_TASK_MAX": "8",
+                    "SLURM_ARRAY_TASK_STEP": "1",
+                    "SLURM_ARRAY_TASK_COUNT": "3",
+                }
+            )
+
+        #    c) Sharded run fails loudly if replay discovers unplanned compare() choices (e.g. gated on Artifact.info).
+        def info_gated_pipe(run: RunContext) -> Artifact:
+            top = compare("top", ["a", "b"])
+            res = run.run_stage(env_stage, settings={"tag": f"gated_{top}"})
+            assert isinstance(res, Artifact)
+            if res.info.get("threads"):  # Empty in dry-run discovery, populated on real run!
+                _ = compare("late_choice", [1, 2])
+            return res
+
+        with self.assertRaises(RuntimeError):
+            run_experiment(info_gated_pipe, cache=Cache(self.tmp / "gated_cache", lock_mode="none"), shard=(0, 2))
+
+        #    d) Choice named `omp_num_threads` does not collide with or overwrite the long CSV metadata column.
+        def colliding_name_pipe(run: RunContext) -> Artifact:
+            t = compare("omp_num_threads", ["fast", "slow"])
+            res = run.run_stage(env_stage, settings={"tag": f"col_{t}"}, env={"OMP_NUM_THREADS": "2"})
+            assert isinstance(res, Artifact)
+            return res
+
+        r_col = run_experiment(colliding_name_pipe, cache=none_cache)
+        col_csv = self.tmp / "colliding_long.csv"
+        r_col.save_csv(col_csv, layout="long")
+        with col_csv.open(encoding="utf-8") as fp:
+            reader = csv.DictReader(fp)
+            self.assertIn("choice_omp_num_threads", reader.fieldnames or [])
+            self.assertIn("omp_num_threads", reader.fieldnames or [])
+            col_rows = list(reader)
+        self.assertEqual(col_rows[0]["choice_omp_num_threads"], "fast")
+        self.assertEqual(col_rows[0]["omp_num_threads"], "2")
+
 
 if __name__ == "__main__":
     unittest.main()

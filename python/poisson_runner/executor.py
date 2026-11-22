@@ -3,14 +3,76 @@
 from __future__ import annotations
 
 import abc
+import functools
 import os
+import platform
 import socket
 import subprocess
 import tempfile
 import time
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
+
+_THREAD_ENV_KEYS = (
+    "OMP_NUM_THREADS",
+    "OPENBLAS_NUM_THREADS",
+    "MKL_NUM_THREADS",
+    "NUMEXPR_NUM_THREADS",
+    "OMP_PROC_BIND",
+    "OMP_PLACES",
+)
+
+_SLURM_ENV_KEYS = (
+    "SLURM_JOB_ID",
+    "SLURM_ARRAY_JOB_ID",
+    "SLURM_ARRAY_TASK_ID",
+    "SLURM_JOB_PARTITION",
+    "SLURM_CPUS_PER_TASK",
+    "SLURM_NNODES",
+    "SLURM_NODELIST",
+)
+
+
+@functools.lru_cache(maxsize=1)
+def detect_cpu_model() -> str | None:
+    """Detect host CPU model name from `/proc/cpuinfo` (Linux) or `platform.processor()`."""
+    cpuinfo = Path("/proc/cpuinfo")
+    if cpuinfo.is_file():
+        try:
+            for line in cpuinfo.read_text(encoding="utf-8", errors="replace").splitlines():
+                if ":" not in line:
+                    continue
+                key, value = line.split(":", 1)
+                key = key.strip().lower()
+                if key in ("model name", "hardware", "cpu model"):
+                    val = value.strip()
+                    if val:
+                        return val
+        except OSError:
+            pass
+    proc = platform.processor().strip()
+    return proc or None
+
+
+def collect_host_environment(env_override: Mapping[str, str] | None = None) -> dict[str, Any]:
+    """Capture CPU, threading, and SLURM metadata for reproducible HPC benchmarking."""
+    merged = os.environ.copy()
+    if env_override:
+        merged.update(env_override)
+
+    meta: dict[str, Any] = {
+        "cpu_model": detect_cpu_model(),
+        "cpu_count": os.cpu_count(),
+    }
+    threads = {k: merged[k] for k in _THREAD_ENV_KEYS if k in merged and merged[k] != ""}
+    if threads:
+        meta["threading"] = threads
+    slurm = {k: merged[k] for k in _SLURM_ENV_KEYS if k in merged and merged[k] != ""}
+    if slurm:
+        meta["slurm"] = slurm
+    return meta
 
 
 @dataclass(frozen=True)
@@ -41,6 +103,7 @@ class ExecutionResult:
     major_page_faults: int | None = None
     voluntary_ctx_switches: int | None = None
     involuntary_ctx_switches: int | None = None
+    environment: dict[str, Any] = field(default_factory=dict)
 
 
 class Executor(abc.ABC):
@@ -119,4 +182,5 @@ class LocalExecutor(Executor):
             major_page_faults=major_page_faults,
             voluntary_ctx_switches=voluntary_ctx_switches,
             involuntary_ctx_switches=involuntary_ctx_switches,
+            environment=collect_host_environment(request.env),
         )

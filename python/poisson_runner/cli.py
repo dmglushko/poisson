@@ -30,6 +30,12 @@ def build_parser() -> argparse.ArgumentParser:
 
     cache_p = sub.add_parser("cache", help="Inspect or clean the stage cache")
     cache_p.add_argument("--cache-dir", default=None, help="Cache directory (default: POISSON_CACHE_DIR or .poisson_cache)")
+    cache_p.add_argument(
+        "--lock-mode",
+        default=None,
+        choices=["flock", "lockfile", "none"],
+        help="Override cache lock mode (default: cache .lock_mode marker, POISSON_CACHE_LOCK_MODE, or flock)",
+    )
     cache_sub = cache_p.add_subparsers(dest="cache_cmd", required=True)
 
     cache_sub.add_parser("status", help="Show cache disk usage and entry counts")
@@ -58,10 +64,11 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     if args.command == "cache":
-        cache = Cache(root=args.cache_dir)
+        cache = Cache(root=args.cache_dir, lock_mode=args.lock_mode)
         if args.cache_cmd == "status":
             st = cache.stats()
             print(f"Cache root:    {st.root}")
+            print(f"Lock mode:     {cache.lock_mode.value}")
             print(f"BLAKE3:        v{blake3_version()}")
             print(f"Objects:       {st.object_count} ({_format_bytes(st.object_bytes)})")
             print(f"Requests:      {st.request_count} ({_format_bytes(st.metadata_bytes)})")

@@ -29,8 +29,14 @@
   all downstream stages still get cache hits.
 - **Safety:** Validates request JSON schema, `output_specs`, and recorded `size_bytes` on hit
   (with optional full digest verification via `Cache(verify_hashes=True)`), detects mid-run
-  input/binary drift before publishing, and uses OS-reclaimed `fcntl.flock` leases to prevent
-  eviction of live artifacts across processes.
+  input/binary drift before publishing, and supports three cross-process locking modes via
+  `Cache(lock_mode=...)` or `POISSON_CACHE_LOCK_MODE`:
+  - `"flock"` *(default)*: POSIX `fcntl.flock` on `.cache.lock` and `leases/` (auto-falls back
+    to `"lockfile"` if the filesystem returns `ENOSYS`/`EOPNOTSUPP`/`ENOLCK`).
+  - `"lockfile"`: POSIX atomic `O_CREAT | O_EXCL` lockfile with stale-age recovery, safe across
+    multi-node Lustre/GPFS/NFSv4 shared `/scratch`.
+  - `"none"`: Lock-free reads/writes via unique temp files + atomic `os.replace` (requires
+    `max_bytes=None` during sweeps; trim between sweeps with `cache clean --max-gb`).
 
 ## 4-Mode Layered Cache Control
 
@@ -51,8 +57,17 @@ Precedence (most specific wins):
 
 - `Executor` abstracts stage execution (`LocalExecutor` runs isolated subprocesses and collects
   per-child wall time, `ru_maxrss`, `cpu_user_s`, `cpu_sys_s`, `cpu_efficiency`, page faults,
-  and context switches via `os.wait4`; future DelftBlue SLURM support plugs in here without
-  changing pipelines or the cache).
+  context switches via `os.wait4`, plus host HPC metadata: `cpu_model`, `cpu_count`,
+  `OMP_NUM_THREADS`/`OPENBLAS_NUM_THREADS`/`MKL_NUM_THREADS`, and `SLURM_*` variables).
+- **Per-stage environment (`env=`):** `run.run_stage(..., env={"OMP_NUM_THREADS": "8"})` passes
+  environment overrides to the child process and includes non-empty `env` in `request_key` so
+  thread-scaling sweeps cache separate timings while still deduplicating identical output `.h5`
+  bytes in `objects/`.
+- **SLURM Job Array sharding (`shard=`):** `run_experiment(..., shard=(index, total))` or
+  `shard="slurm"` (reads `SLURM_ARRAY_TASK_ID` / `SLURM_ARRAY_TASK_COUNT`, falling back to
+  `(0, 1)` locally) discovers the full `compare(...)` tree and executes only branches where
+  `branch_index % total == index` against a shared `/scratch` cache. A final
+  `cache_mode="read_only"` run collects the complete `ExperimentReport` with zero recomputation.
 - **Stage registration:** `Stage.from_cli(...)` declaratively maps input flags, flat setting
   flags, and/or `--config <settings.json>` (for deeply nested configs like AMR) with minimal
   boilerplate.
@@ -61,5 +76,5 @@ Precedence (most specific wins):
   `info["time"]`, `max_rss_kb`, and CPU metrics inside `requests/<request_key>.json`.
 - **Dry-run & exports:** `run_experiment(..., dry_run=True)` previews all branches and reports
   `HIT` vs `WOULD_RUN` without launching binaries. `ExperimentReport.save_csv(..., layout="long")`
-  writes a loop-friendly tidy CSV (one row per `(branch, step_index, stage)`), while
-  `layout="wide"` disambiguates repeated stage calls (`stage#0`, `stage#1`, ...).
+  writes a loop-friendly tidy CSV (one row per `(branch, step_index, stage)` including HPC
+  metadata), while `layout="wide"` disambiguates repeated stage calls (`stage#0`, `stage#1`, ...).

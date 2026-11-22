@@ -105,6 +105,7 @@ class ExperimentReport:
     branches: list[BranchResult]
     total_wall_time_s: float
     dry_run: bool = False
+    shard: tuple[int, int] | None = None
 
     @property
     def cache_hits(self) -> int:
@@ -115,37 +116,40 @@ class ExperimentReport:
         return sum(1 for b in self.branches for s in b.stages if not s.cached)
 
     def to_dict(self) -> dict[str, Any]:
-        return {
+        payload: dict[str, Any] = {
             "dry_run": self.dry_run,
             "total_wall_time_s": self.total_wall_time_s,
             "branch_count": len(self.branches),
             "cache_hits": self.cache_hits,
             "cache_misses": self.cache_misses,
-            "branches": [
-                {
-                    "index": b.index,
-                    "choices": b.choice_labels,
-                    "wall_time_s": b.wall_time_s,
-                    "error": b.error,
-                    "stages": [
-                        {
-                            "stage": s.stage,
-                            "cached": s.cached,
-                            "dry_run": s.dry_run,
-                            "request_key": s.request_key,
-                            "content_ids": s.content_ids,
-                            "settings": s.settings,
-                            "wall_time_s": s.wall_time_s,
-                            "max_rss_kb": s.max_rss_kb,
-                            "info": s.info,
-                            "execution": s.execution,
-                        }
-                        for s in b.stages
-                    ],
-                }
-                for b in self.branches
-            ],
         }
+        if self.shard is not None:
+            payload["shard"] = {"index": self.shard[0], "total": self.shard[1]}
+        payload["branches"] = [
+            {
+                "index": b.index,
+                "choices": b.choice_labels,
+                "wall_time_s": b.wall_time_s,
+                "error": b.error,
+                "stages": [
+                    {
+                        "stage": s.stage,
+                        "cached": s.cached,
+                        "dry_run": s.dry_run,
+                        "request_key": s.request_key,
+                        "content_ids": s.content_ids,
+                        "settings": s.settings,
+                        "wall_time_s": s.wall_time_s,
+                        "max_rss_kb": s.max_rss_kb,
+                        "info": s.info,
+                        "execution": s.execution,
+                    }
+                    for s in b.stages
+                ],
+            }
+            for b in self.branches
+        ]
+        return payload
 
     def save_json(self, path: str | os.PathLike[str]) -> None:
         Path(path).write_text(json.dumps(self.to_dict(), indent=2) + "\n", encoding="utf-8")
@@ -183,9 +187,7 @@ class ExperimentReport:
                     choice_keys.append(k)
 
         if layout == "long":
-            fieldnames = [
-                "branch",
-                *choice_keys,
+            fixed_tail = [
                 "step_index",
                 "stage",
                 "status",
@@ -208,9 +210,28 @@ class ExperimentReport:
                 "cpu_sys_s",
                 "cpu_efficiency",
                 "major_page_faults",
+                "hostname",
+                "cpu_model",
+                "omp_num_threads",
+                "slurm_job_id",
                 "request_key",
                 "error",
             ]
+            reserved = {"branch", *fixed_tail}
+            choice_col_map: dict[str, str] = {}
+            used_cols = set(reserved)
+            for k in choice_keys:
+                col = k
+                if col in used_cols:
+                    col = f"choice_{k}"
+                    suffix = 2
+                    while col in used_cols:
+                        col = f"choice_{k}_{suffix}"
+                        suffix += 1
+                choice_col_map[k] = col
+                used_cols.add(col)
+
+            fieldnames = ["branch", *(choice_col_map[k] for k in choice_keys), *fixed_tail]
             with Path(path).open("w", newline="", encoding="utf-8") as fp:
                 writer = csv.DictWriter(fp, fieldnames=fieldnames)
                 writer.writeheader()
@@ -220,9 +241,13 @@ class ExperimentReport:
                         bench = bench if isinstance(bench, dict) else {}
                         w_stats = bench.get("wall_time_s") if isinstance(bench.get("wall_time_s"), dict) else {}
                         i_stats = bench.get("info_time_s") if isinstance(bench.get("info_time_s"), dict) else {}
+                        env_meta = st.execution.get("environment") if isinstance(st.execution, dict) else None
+                        env_meta = env_meta if isinstance(env_meta, dict) else {}
+                        threading_meta = env_meta.get("threading") if isinstance(env_meta.get("threading"), dict) else {}
+                        slurm_meta = env_meta.get("slurm") if isinstance(env_meta.get("slurm"), dict) else {}
                         row: dict[str, Any] = {
                             "branch": b.index,
-                            **{k: b.choice_labels.get(k, "") for k in choice_keys},
+                            **{choice_col_map[k]: b.choice_labels.get(k, "") for k in choice_keys},
                             "step_index": step_idx,
                             "stage": st.stage,
                             "status": self._stage_status_label(st),
@@ -245,6 +270,10 @@ class ExperimentReport:
                             "cpu_sys_s": self._fmt_opt_float(st.execution.get("cpu_sys_s")),
                             "cpu_efficiency": self._fmt_opt_float(st.execution.get("cpu_efficiency")),
                             "major_page_faults": self._fmt_opt_int(st.execution.get("major_page_faults")),
+                            "hostname": str(st.execution.get("hostname", "") or ""),
+                            "cpu_model": str(env_meta.get("cpu_model", "") or ""),
+                            "omp_num_threads": str(threading_meta.get("OMP_NUM_THREADS", "") or ""),
+                            "slurm_job_id": str(slurm_meta.get("SLURM_JOB_ID", "") or ""),
                             "request_key": st.request_key or "",
                             "error": b.error or "",
                         }
@@ -338,8 +367,9 @@ class ExperimentReport:
         for r in rows:
             lines.append("| " + " | ".join(r[i].ljust(widths[i]) for i in range(len(headers))) + " |")
         miss_word = "would run" if self.dry_run else "cache misses"
+        shard_suffix = f" [shard {self.shard[0]}/{self.shard[1]}]" if self.shard is not None else ""
         lines.append(
-            f"\nTotal: {len(self.branches)} branches, {self.cache_hits} cache hits, "
+            f"\nTotal: {len(self.branches)} branches{shard_suffix}, {self.cache_hits} cache hits, "
             f"{self.cache_misses} {miss_word}, {self.total_wall_time_s:.3f}s"
         )
         return "\n".join(lines)
@@ -484,6 +514,7 @@ class RunContext:
         use_cache: bool | None = None,
         repeats: int | None = None,
         warmup: int | None = None,
+        env: Mapping[str, str] | None = None,
         resources: Mapping[str, Any] | None = None,
     ) -> Artifact | dict[str, Artifact]:
         """Run a stage with BLAKE3 content-addressed caching, 4-mode control, repeats, and dry-run."""
@@ -540,6 +571,13 @@ class RunContext:
         pre_signatures = {p: file_signature(p) for p in watched_paths}
 
         settings_dict = dict(settings) if settings is not None else {}
+        env_dict: dict[str, str] | None = None
+        if env is not None:
+            env_dict = {}
+            for k, v in env.items():
+                if not isinstance(k, str):
+                    raise TypeError(f"Stage env keys must be str, got {type(k).__name__}")
+                env_dict[k] = str(v)
         code_hash = stage.compute_code_hash(self.cache)
         request_key = Cache.compute_request_key(
             stage.name,
@@ -547,6 +585,7 @@ class RunContext:
             inputs_spec,
             settings_dict,
             output_specs=stage.output_specs,
+            env=env_dict,
         )
 
         if mode.reads and not has_placeholder_input:
@@ -623,6 +662,7 @@ class RunContext:
             req = ExecutionRequest(
                 stage_name=stage.name,
                 command=cmd,
+                env=env_dict,
                 resources=dict(resources) if resources is not None else {},
             )
 
@@ -708,6 +748,7 @@ class RunContext:
                 "involuntary_ctx_switches": last_exec.involuntary_ctx_switches,
                 "exit_code": last_exec.exit_code,
                 "hostname": last_exec.hostname,
+                "environment": last_exec.environment,
                 "command": cmd,
                 "benchmark": benchmark_meta,
             }
@@ -778,6 +819,7 @@ class RunContext:
         use_cache: bool | None = None,
         repeats: int | None = None,
         warmup: int | None = None,
+        env: Mapping[str, str] | None = None,
     ) -> Artifact:
         """Run the cached `poisson_import --mesh` stage and return the `MeshProperties` Artifact."""
         if self._import_mesh_stage is None:
@@ -809,6 +851,7 @@ class RunContext:
             use_cache=use_cache,
             repeats=repeats,
             warmup=warmup,
+            env=env,
         )
         assert isinstance(result, Artifact)
         return result
@@ -821,6 +864,7 @@ class RunContext:
         use_cache: bool | None = None,
         repeats: int | None = None,
         warmup: int | None = None,
+        env: Mapping[str, str] | None = None,
     ) -> Artifact:
         """Run the cached `poisson_import --primaries` stage and return the `FreeCharges` Artifact."""
         if self._import_free_charges_stage is None:
@@ -832,6 +876,7 @@ class RunContext:
             use_cache=use_cache,
             repeats=repeats,
             warmup=warmup,
+            env=env,
         )
         assert isinstance(result, Artifact)
         return result
@@ -849,6 +894,7 @@ class RunContext:
         use_cache: bool | None = None,
         repeats: int | None = None,
         warmup: int | None = None,
+        env: Mapping[str, str] | None = None,
     ) -> Artifact | dict[str, Artifact]:
         """Run the cached `poisson_adapt` AMR stage and return the refined mesh (or dict if parents/history requested)."""
         key = (with_parents, with_history)
@@ -867,6 +913,7 @@ class RunContext:
             use_cache=use_cache,
             repeats=repeats,
             warmup=warmup,
+            env=env,
         )
 
 
@@ -881,6 +928,112 @@ def compare(
     return ctx.compare(name_or_options, options)
 
 
+def resolve_slurm_shard(env: Mapping[str, str] | None = None) -> tuple[int, int] | None:
+    """Return `(shard_index, shard_total)` from SLURM job-array environment variables, or `None`."""
+    src = os.environ if env is None else env
+    raw_id = src.get("SLURM_ARRAY_TASK_ID")
+    if raw_id is None or raw_id == "":
+        return None
+    task_id = int(raw_id)
+    task_min = int(src.get("SLURM_ARRAY_TASK_MIN", "0"))
+    task_step = int(src.get("SLURM_ARRAY_TASK_STEP", "1"))
+    if task_step <= 0:
+        raise ValueError(f"SLURM_ARRAY_TASK_STEP must be positive, got {task_step}")
+    if (task_id - task_min) < 0 or (task_id - task_min) % task_step != 0:
+        raise ValueError(
+            f"SLURM_ARRAY_TASK_ID={task_id} does not align with min={task_min}, step={task_step}"
+        )
+    index = (task_id - task_min) // task_step
+
+    raw_count = src.get("SLURM_ARRAY_TASK_COUNT")
+    raw_max = src.get("SLURM_ARRAY_TASK_MAX")
+    expected_from_range: int | None = None
+    if raw_max is not None and raw_max != "":
+        expected_from_range = ((int(raw_max) - task_min) // task_step) + 1
+
+    if raw_count is not None and raw_count != "":
+        total = int(raw_count)
+        if expected_from_range is not None and total != expected_from_range:
+            raise ValueError(
+                f"Sparse SLURM job array detected (min={task_min}, max={raw_max}, step={task_step}, "
+                f"count={total} != {expected_from_range}); pass an explicit shard=(index, total) mapping instead"
+            )
+    elif expected_from_range is not None:
+        total = expected_from_range
+    else:
+        raise ValueError(
+            "SLURM_ARRAY_TASK_ID is set but neither SLURM_ARRAY_TASK_COUNT nor SLURM_ARRAY_TASK_MAX is set"
+        )
+
+    if total < 1 or not (0 <= index < total):
+        raise ValueError(f"Invalid SLURM shard ({index}, {total})")
+    return (index, total)
+
+
+def _normalize_shard(shard: tuple[int, int] | Literal["slurm"] | None) -> tuple[int, int] | None:
+    if shard is None:
+        return None
+    if shard == "slurm":
+        return resolve_slurm_shard()
+    if not isinstance(shard, tuple) or len(shard) != 2:
+        raise ValueError(f"shard must be (index, total), 'slurm', or None; got {shard!r}")
+    index, total = shard
+    if (
+        isinstance(index, bool)
+        or isinstance(total, bool)
+        or not isinstance(index, int)
+        or not isinstance(total, int)
+        or total < 1
+        or not (0 <= index < total)
+    ):
+        raise ValueError(f"Invalid shard ({index!r}, {total!r}); expected 0 <= index < total and total >= 1")
+    return (index, total)
+
+
+def _discover_branch_paths(
+    pipeline_fn: Callable[..., Any],
+    *,
+    takes_ctx: bool,
+    cache: Cache,
+    executor: Executor,
+    build_dir: Path | str | None,
+    stage_cache_modes: Mapping[str, CacheMode],
+    repeats: int,
+    warmup: int,
+) -> list[tuple[_ChoiceStep, ...]]:
+    """Discover all branch choice paths via a zero-execution dry-run pass."""
+    todo_stack: list[tuple[_ChoiceStep, ...]] = [()]
+    discovered: list[tuple[_ChoiceStep, ...]] = []
+    while todo_stack:
+        path = todo_stack.pop()
+        with cache.lease() as branch_lease:
+            ctx = RunContext(
+                cache=cache,
+                executor=executor,
+                build_dir=build_dir,
+                path=path,
+                todo_stack=todo_stack,
+                lease=branch_lease,
+                cache_mode=CacheMode.READ_ONLY,
+                stage_cache_modes=stage_cache_modes,
+                default_repeats=repeats,
+                default_warmup=warmup,
+                dry_run=True,
+            )
+            token = _ACTIVE_RUN.set(ctx)
+            try:
+                pipeline_fn(ctx) if takes_ctx else pipeline_fn()
+                if ctx._step < len(path):
+                    raise RuntimeError(
+                        f"Non-deterministic compare() replay: branch returned early at step {ctx._step} "
+                        f"without reaching queued choice '{path[ctx._step].name}'"
+                    )
+            finally:
+                _ACTIVE_RUN.reset(token)
+        discovered.append(tuple(ctx._prefix))
+    return discovered
+
+
 def run_experiment(
     pipeline_fn: Callable[..., Any],
     *,
@@ -892,15 +1045,22 @@ def run_experiment(
     repeats: int = 1,
     warmup: int = 0,
     dry_run: bool = False,
+    shard: tuple[int, int] | Literal["slurm"] | None = None,
     continue_on_error: bool = False,
     max_branches: int | None = None,
 ) -> ExperimentReport:
-    """Execute `pipeline_fn` across every combination of `compare(...)` choices without loops."""
+    """Execute `pipeline_fn` across every combination of `compare(...)` choices without loops.
+
+    Pass `shard=(index, total)` or `shard="slurm"` (reads `SLURM_ARRAY_TASK_ID` /
+    `SLURM_ARRAY_TASK_COUNT`) to execute only branches where `branch_index % total == index`
+    for multi-node SLURM job-array sweeps against a shared cache.
+    """
     if repeats < 1:
         raise ValueError(f"repeats must be >= 1, got {repeats}")
     if warmup < 0:
         raise ValueError(f"warmup must be >= 0, got {warmup}")
 
+    resolved_shard = _normalize_shard(shard)
     cache = cache if cache is not None else Cache()
     executor = executor if executor is not None else LocalExecutor()
     resolved_cache_mode = normalize_cache_mode(cache_mode) if cache_mode is not None else None
@@ -913,10 +1073,84 @@ def run_experiment(
     sig = inspect.signature(pipeline_fn)
     takes_ctx = len(sig.parameters) > 0
 
-    todo_stack: list[tuple[_ChoiceStep, ...]] = [()]
     branches: list[BranchResult] = []
     overall_start = time.perf_counter()
 
+    if resolved_shard is not None and resolved_shard[1] > 1:
+        shard_idx, shard_total = resolved_shard
+        all_paths = _discover_branch_paths(
+            pipeline_fn,
+            takes_ctx=takes_ctx,
+            cache=cache,
+            executor=executor,
+            build_dir=build_dir,
+            stage_cache_modes=resolved_stage_modes,
+            repeats=repeats,
+            warmup=warmup,
+        )
+        selected = [(idx, path) for idx, path in enumerate(all_paths) if idx % shard_total == shard_idx]
+        if max_branches is not None:
+            selected = selected[:max_branches]
+
+        for global_idx, path in selected:
+            dummy_stack: list[tuple[_ChoiceStep, ...]] = []
+            with cache.lease() as branch_lease:
+                ctx = RunContext(
+                    cache=cache,
+                    executor=executor,
+                    build_dir=build_dir,
+                    path=path,
+                    todo_stack=dummy_stack,
+                    lease=branch_lease,
+                    cache_mode=resolved_cache_mode,
+                    stage_cache_modes=resolved_stage_modes,
+                    default_repeats=repeats,
+                    default_warmup=warmup,
+                    dry_run=dry_run,
+                )
+                token = _ACTIVE_RUN.set(ctx)
+                branch_start = time.perf_counter()
+                result: Any = None
+                error: str | None = None
+                try:
+                    result = pipeline_fn(ctx) if takes_ctx else pipeline_fn()
+                    if ctx._step < len(path):
+                        raise RuntimeError(
+                            f"Non-deterministic compare() replay: branch returned early at step {ctx._step} "
+                            f"without reaching queued choice '{path[ctx._step].name}'"
+                        )
+                    if dummy_stack:
+                        raise RuntimeError(
+                            "Sharded run discovered unplanned compare() choices not seen during dry-run discovery; "
+                            "compare() branching in sharded runs must not depend on uncached stage outputs"
+                        )
+                except Exception as exc:
+                    if not continue_on_error:
+                        raise
+                    error = f"{type(exc).__name__}: {exc}"
+                finally:
+                    _ACTIVE_RUN.reset(token)
+
+            branches.append(
+                BranchResult(
+                    index=global_idx,
+                    choices=dict(ctx.choices),
+                    choice_labels=dict(ctx.choice_labels),
+                    stages=list(ctx.trace),
+                    result=result,
+                    error=error,
+                    wall_time_s=time.perf_counter() - branch_start,
+                )
+            )
+
+        return ExperimentReport(
+            branches=branches,
+            total_wall_time_s=time.perf_counter() - overall_start,
+            dry_run=dry_run,
+            shard=resolved_shard,
+        )
+
+    todo_stack: list[tuple[_ChoiceStep, ...]] = [()]
     while todo_stack:
         if max_branches is not None and len(branches) >= max_branches:
             break
@@ -937,8 +1171,8 @@ def run_experiment(
             )
             token = _ACTIVE_RUN.set(ctx)
             branch_start = time.perf_counter()
-            result: Any = None
-            error: str | None = None
+            result = None
+            error = None
             try:
                 result = pipeline_fn(ctx) if takes_ctx else pipeline_fn()
                 if ctx._step < len(path):
@@ -969,4 +1203,5 @@ def run_experiment(
         branches=branches,
         total_wall_time_s=time.perf_counter() - overall_start,
         dry_run=dry_run,
+        shard=resolved_shard,
     )

@@ -1,8 +1,33 @@
 """Content-addressed caching and loop-free Compare() runner for Poisson stages."""
 
-from .cache import Artifact, Cache, CacheLease, CacheMode, CacheStats, normalize_cache_mode
-from .driver import BranchResult, Compare, ExperimentReport, RunContext, StageTrace, compare, run_experiment
-from .executor import ExecutionRequest, ExecutionResult, Executor, LocalExecutor
+from .cache import (
+    Artifact,
+    Cache,
+    CacheLease,
+    CacheMode,
+    CacheStats,
+    LockMode,
+    normalize_cache_mode,
+    normalize_lock_mode,
+)
+from .driver import (
+    BranchResult,
+    Compare,
+    ExperimentReport,
+    RunContext,
+    StageTrace,
+    compare,
+    resolve_slurm_shard,
+    run_experiment,
+)
+from .executor import (
+    ExecutionRequest,
+    ExecutionResult,
+    Executor,
+    LocalExecutor,
+    collect_host_environment,
+    detect_cpu_model,
+)
 from .hashing import blake3_bytes, blake3_file, blake3_json, blake3_version
 from .stages import (
     Stage,
@@ -26,6 +51,7 @@ __all__ = [
     "Executor",
     "ExperimentReport",
     "LocalExecutor",
+    "LockMode",
     "RunContext",
     "Stage",
     "StageCall",
@@ -34,11 +60,15 @@ __all__ = [
     "blake3_file",
     "blake3_json",
     "blake3_version",
+    "collect_host_environment",
     "compare",
+    "detect_cpu_model",
     "make_adapt_stage",
     "make_import_free_charges_stage",
     "make_import_mesh_stage",
     "normalize_cache_mode",
+    "normalize_lock_mode",
     "resolve_binary",
+    "resolve_slurm_shard",
     "run_experiment",
 ]
