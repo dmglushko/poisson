@@ -73,6 +73,24 @@ void test_multi_cycle_and_session_history() {
     const std::size_t n1 = run_once();
     const std::size_t n2 = run_once();
     CHECK(n1 == n2);
+
+    // adapt_once() with explicit RefinementHistory + initial_error matches Session::adapt() identically.
+    MeshProperties mesh = cube_mesh(2);
+    RefinementHistory history;
+    std::optional<double> baseline;
+    uint32_t step_cycles = 0;
+    AdaptationStatus final_status = AdaptationStatus::unchanged;
+    for (; step_cycles < 10; ++step_cycles) {
+        const auto u = smooth_u(mesh);
+        auto step = adapter.adapt_once(mesh, smooth_input(u), std::move(history), baseline);
+        if (!baseline && step.adaptation.info.error_estimate) baseline = *step.adaptation.info.error_estimate;
+        history = std::move(step.history);
+        final_status = step.adaptation.status;
+        if (final_status != AdaptationStatus::adapted) break;
+        mesh = std::move(*step.adaptation.mesh);
+    }
+    CHECK(final_status == AdaptationStatus::converged);
+    CHECK(mesh.elements.size() == n1);
 }
 
 void test_absolute_and_combined_tolerance() {

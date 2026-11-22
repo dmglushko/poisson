@@ -579,29 +579,39 @@ MaterialFile read_material_file(const fs::path& file) {
     bool has_name = false;
     std::string section;
 
+    const auto find_yaml_value = [](std::string_view s, std::string_view key) -> std::optional<std::string_view> {
+        std::size_t offset = 0;
+        while (offset < s.size()) {
+            const std::size_t pos = s.find(key, offset);
+            if (pos == std::string_view::npos) return std::nullopt;
+            offset = pos + 1;
+            const bool left_ok = pos == 0 || is_blank(s[pos - 1]) || s[pos - 1] == '{' || s[pos - 1] == ',';
+            if (!left_ok) continue;
+            std::string_view rest = trim(s.substr(pos + key.size()));
+            if (rest.empty() || rest.front() != ':') continue;
+            rest.remove_prefix(1);
+            rest = trim(rest.substr(0, rest.find_first_of(",}")));
+            if (rest.size() >= 2 && (rest.front() == '"' || rest.front() == '\'') && rest.back() == rest.front())
+                rest = rest.substr(1, rest.size() - 2);
+            return rest;
+        }
+        return std::nullopt;
+    };
+
     const auto read_eps_r = [&](std::string_view s) {
-        const std::size_t key = s.find("epsilon_r");
-        if (key == std::string_view::npos) return;
-        s.remove_prefix(key + std::strlen("epsilon_r"));
-        s = trim(s);
-        if (s.empty() || s.front() != ':') reader.fail("expected 'epsilon_r: <number>'");
-        s.remove_prefix(1);
-        s = trim(s.substr(0, s.find_first_of(",}")));
+        const auto val = find_yaml_value(s, "epsilon_r");
+        if (!val) return;
         double value = 0;
-        if (!parse_number(s, value)) reader.fail("epsilon_r is not a number");
+        if (!parse_number(*val, value)) reader.fail("epsilon_r is not a number");
         if (value <= 0) reader.fail("epsilon_r must be positive");
         if (result.eps_r) reader.fail("epsilon_r is given twice");
         result.eps_r = value;
     };
 
     const auto read_model = [&](std::string_view s) {
-        const std::size_t key = s.find("model");
-        if (key == std::string_view::npos) return;
-        s.remove_prefix(key + std::strlen("model"));
-        s = trim(s);
-        if (s.empty() || s.front() != ':') return;   // another key that contains "model"
-        s.remove_prefix(1);
-        result.is_metal = trim(s.substr(0, s.find_first_of(",}"))) == "metal";
+        const auto val = find_yaml_value(s, "model");
+        if (!val) return;
+        result.is_metal = *val == "metal";
     };
 
     std::size_t pos = 0;
@@ -716,14 +726,27 @@ std::optional<MatProperty> read_mat_property(const fs::path& file, hid_t h5, con
         result.value = value;
 
         if (const int unit = H5Tget_member_index(type.id, "unit"); unit >= 0) {
-            char* p = nullptr;
             const H5Handle member(H5Tget_member_type(type.id, static_cast<unsigned>(unit)), H5Tclose);
             if (H5Tget_class(member.id) != H5T_STRING) bad("has a 'unit' that is not text");
-            H5Tset_cset(text_type.id, H5Tget_cset(member.id));
-            const H5Handle unit_type(H5Tcreate(H5T_COMPOUND, sizeof(char*)), H5Tclose);
-            H5Tinsert(unit_type.id, "unit", 0, text_type.id);
-            if (H5Aread(attribute.id, unit_type.id, &p) < 0) bad("has a 'unit' that is not text");
-            result.unit = std::string(trim(take_text(p)));
+            if (H5Tis_variable_str(member.id) > 0) {
+                char* p = nullptr;
+                H5Tset_cset(text_type.id, H5Tget_cset(member.id));
+                const H5Handle unit_type(H5Tcreate(H5T_COMPOUND, sizeof(char*)), H5Tclose);
+                H5Tinsert(unit_type.id, "unit", 0, text_type.id);
+                if (H5Aread(attribute.id, unit_type.id, &p) < 0) bad("has a 'unit' that is not text");
+                result.unit = std::string(trim(take_text(p)));
+            } else {
+                const std::size_t size = H5Tget_size(member.id);
+                std::string buffer(size, '\0');
+                if (size > 0) {
+                    const H5Handle fixed_str(H5Tcopy(member.id), H5Tclose);
+                    const H5Handle unit_type(H5Tcreate(H5T_COMPOUND, size), H5Tclose);
+                    H5Tinsert(unit_type.id, "unit", 0, fixed_str.id);
+                    if (H5Aread(attribute.id, unit_type.id, buffer.data()) < 0) bad("has a 'unit' that is not text");
+                    buffer.resize(std::strlen(buffer.c_str()));
+                }
+                result.unit = std::string(trim(buffer));
+            }
         }
         break;
     }

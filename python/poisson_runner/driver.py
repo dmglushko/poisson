@@ -1092,16 +1092,16 @@ def run_experiment(
         if max_branches is not None:
             selected = selected[:max_branches]
 
-        for global_idx, path in selected:
-            dummy_stack: list[tuple[_ChoiceStep, ...]] = []
-            with cache.lease() as branch_lease:
+        with cache.lease() as experiment_lease:
+            for global_idx, path in selected:
+                dummy_stack: list[tuple[_ChoiceStep, ...]] = []
                 ctx = RunContext(
                     cache=cache,
                     executor=executor,
                     build_dir=build_dir,
                     path=path,
                     todo_stack=dummy_stack,
-                    lease=branch_lease,
+                    lease=experiment_lease,
                     cache_mode=resolved_cache_mode,
                     stage_cache_modes=resolved_stage_modes,
                     default_repeats=repeats,
@@ -1131,17 +1131,17 @@ def run_experiment(
                 finally:
                     _ACTIVE_RUN.reset(token)
 
-            branches.append(
-                BranchResult(
-                    index=global_idx,
-                    choices=dict(ctx.choices),
-                    choice_labels=dict(ctx.choice_labels),
-                    stages=list(ctx.trace),
-                    result=result,
-                    error=error,
-                    wall_time_s=time.perf_counter() - branch_start,
+                branches.append(
+                    BranchResult(
+                        index=global_idx,
+                        choices=dict(ctx.choices),
+                        choice_labels=dict(ctx.choice_labels),
+                        stages=list(ctx.trace),
+                        result=result,
+                        error=error,
+                        wall_time_s=time.perf_counter() - branch_start,
+                    )
                 )
-            )
 
         return ExperimentReport(
             branches=branches,
@@ -1151,18 +1151,18 @@ def run_experiment(
         )
 
     todo_stack: list[tuple[_ChoiceStep, ...]] = [()]
-    while todo_stack:
-        if max_branches is not None and len(branches) >= max_branches:
-            break
-        path = todo_stack.pop()
-        with cache.lease() as branch_lease:
+    with cache.lease() as experiment_lease:
+        while todo_stack:
+            if max_branches is not None and len(branches) >= max_branches:
+                break
+            path = todo_stack.pop()
             ctx = RunContext(
                 cache=cache,
                 executor=executor,
                 build_dir=build_dir,
                 path=path,
                 todo_stack=todo_stack,
-                lease=branch_lease,
+                lease=experiment_lease,
                 cache_mode=resolved_cache_mode,
                 stage_cache_modes=resolved_stage_modes,
                 default_repeats=repeats,
@@ -1187,17 +1187,17 @@ def run_experiment(
             finally:
                 _ACTIVE_RUN.reset(token)
 
-        branches.append(
-            BranchResult(
-                index=len(branches),
-                choices=dict(ctx.choices),
-                choice_labels=dict(ctx.choice_labels),
-                stages=list(ctx.trace),
-                result=result,
-                error=error,
-                wall_time_s=time.perf_counter() - branch_start,
+            branches.append(
+                BranchResult(
+                    index=len(branches),
+                    choices=dict(ctx.choices),
+                    choice_labels=dict(ctx.choice_labels),
+                    stages=list(ctx.trace),
+                    result=result,
+                    error=error,
+                    wall_time_s=time.perf_counter() - branch_start,
+                )
             )
-        )
 
     return ExperimentReport(
         branches=branches,

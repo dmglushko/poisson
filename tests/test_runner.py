@@ -513,12 +513,23 @@ if a.b:
         self.assertIsInstance(r_two.branches[0].result, dict)
         self.assertEqual(set(r_two.branches[0].result.keys()), {"first", "second"})
 
-        # 4. Truncated cached object is rejected on lookup and recomputed cleanly.
+        # 4. Published cached objects are read-only; truncated cached object is rejected on lookup and recomputed.
         art_one: Artifact = r_one.branches[0].result
+        self.assertEqual(stat.S_IMODE(art_one.path.stat().st_mode), 0o444)
+        art_one.path.chmod(0o644)
         art_one.path.write_bytes(b"A")   # corrupt/truncate from 3 bytes to 1 byte
         r_rebuilt = run_experiment(lambda run: run.run_stage(s_one), cache=cache)
         self.assertEqual(r_rebuilt.cache_misses, 1)
         self.assertEqual(r_rebuilt.branches[0].result.path.read_bytes(), b"AAA")
+        self.assertEqual(stat.S_IMODE(r_rebuilt.branches[0].result.path.stat().st_mode), 0o444)
+
+        # 4b. Same-size corruption is healed by cache="refresh" (store always os.replaces).
+        healed_path = r_rebuilt.branches[0].result.path
+        healed_path.chmod(0o644)
+        healed_path.write_bytes(b"ZZZ")
+        r_refreshed = run_experiment(lambda run: run.run_stage(s_one, cache="refresh"), cache=cache)
+        self.assertEqual(r_refreshed.branches[0].result.path.read_bytes(), b"AAA")
+        self.assertEqual(stat.S_IMODE(r_refreshed.branches[0].result.path.stat().st_mode), 0o444)
 
         # 5. Live CacheLease protects active artifacts from LRU eviction, and releasing allows eviction.
         lease_cache = Cache(self.tmp / "lease_cache", max_bytes=1024)
@@ -865,6 +876,168 @@ pathlib.Path(a.info_out).write_text(json.dumps({{"time": 0.015}}))
         self.assertGreater(final_dict["out"].info["elements_after"], 2)
         self.assertTrue(final_dict["parents"].path.is_file())
         self.assertTrue(final_dict["history"].path.is_file())
+        # History path uses the exact same ErrorBasedAdapter metrics as non-history path.
+        est_metrics = final_dict["out"].info["stages"][0]["metrics"]
+        self.assertIn("elements", est_metrics)
+        self.assertIn("point_sources", est_metrics)
+        ref_metrics = final_dict["out"].info["stages"][2]["metrics"]
+        self.assertIn("elements_before", ref_metrics)
+        self.assertIn("elements_after", ref_metrics)
+
+        # 3. CLI validation checks: relative_tolerance requires --initial-error, invalid settings rejected
+        #    even with --history-out, simple_json rejects out-of-range ints, and converged emits identity parents.
+        from poisson_runner.stages import resolve_binary
+
+        adapt_bin = resolve_binary("poisson_adapt")
+        mesh_art = run_experiment(lambda run: run.import_mesh(self.mesh_file, materials=[self.mat_file]), cache=cache).branches[0].result
+        with h5py.File(mesh_art.path, "r") as h5:
+            nodes = h5["nodes"][:]
+        sol_path = write_nodal_field_h5(self.tmp / "u_cli_checks.h5", nodes)
+
+        def run_adapt_raw(cfg: dict, extra: list[str] | None = None) -> subprocess.CompletedProcess[str]:
+            cfg_p = self.tmp / "check_cfg.json"
+            cfg_p.write_text(json.dumps(cfg), encoding="utf-8")
+            cmd = [
+                str(adapt_bin),
+                "--mesh", str(mesh_art.path),
+                "--solution", str(sol_path),
+                "--config", str(cfg_p),
+                "--out", str(self.tmp / "check_out.h5"),
+                *(extra or []),
+            ]
+            return subprocess.run(cmd, capture_output=True, text=True)
+
+        # Invalid max_elements=0 must be rejected even when --history-out is passed.
+        bad_max = run_adapt_raw(
+            {
+                "estimator": {"type": "kelly"},
+                "marker": {"type": "dorfler"},
+                "refiner": {"type": "red_green"},
+                "adapter": {"max_elements": 0},
+            },
+            ["--history-out", str(self.tmp / "bad_hist.h5")],
+        )
+        self.assertNotEqual(bad_max.returncode, 0)
+        self.assertIn("max_elements", bad_max.stderr)
+
+        # Out-of-range integer in JSON must fail cleanly (no UB).
+        bad_int = run_adapt_raw(
+            {
+                "estimator": {"type": "kelly", "face_degree": 1e10},
+                "marker": {"type": "dorfler"},
+                "refiner": {"type": "red_green"},
+            }
+        )
+        self.assertNotEqual(bad_int.returncode, 0)
+        self.assertIn("32-bit integer", bad_int.stderr)
+
+        # relative_tolerance without --initial-error must be rejected.
+        bad_rel = run_adapt_raw(
+            {
+                "estimator": {"type": "kelly"},
+                "marker": {"type": "dorfler"},
+                "refiner": {"type": "red_green"},
+                "adapter": {"relative_tolerance": 0.5},
+            }
+        )
+        self.assertNotEqual(bad_rel.returncode, 0)
+        self.assertIn("--initial-error", bad_rel.stderr)
+
+        # relative_tolerance WITH huge --initial-error converges and writes valid identity parents.
+        par_out = self.tmp / "conv_parents.h5"
+        info_out = self.tmp / "conv_info.json"
+        ok_rel = run_adapt_raw(
+            {
+                "estimator": {"type": "kelly"},
+                "marker": {"type": "dorfler"},
+                "refiner": {"type": "red_green"},
+                "adapter": {"relative_tolerance": 0.5},
+            },
+            ["--initial-error", "1e9", "--parents-out", str(par_out), "--info-out", str(info_out)],
+        )
+        self.assertEqual(ok_rel.returncode, 0, ok_rel.stderr)
+        self.assertEqual(json.loads(info_out.read_text())["status"], "converged")
+        with h5py.File(par_out, "r") as h5:
+            self.assertEqual(list(h5["elements"][:]), [0, 1])
+            self.assertEqual(h5["nodes"].shape, (5, 2))
+
+    def test_consensus_runner_fixes(self) -> None:
+        """Verifies experiment-wide lease, negative max_bytes rejection, ephemeral cleanup, and spec_hash+version."""
+        blob_bin = write_executable(
+            self.tmp / "blob_stage",
+            """
+import argparse, pathlib
+p = argparse.ArgumentParser()
+p.add_argument("--tag", required=True)
+p.add_argument("--extra", default="a")
+p.add_argument("--out", required=True)
+a = p.parse_args()
+pathlib.Path(a.out).write_bytes((f"{a.tag}:{a.extra}:".encode() * 200)[:1024])
+""",
+        )
+
+        # 1. Experiment-wide lease prevents later branches from evicting earlier branches' outputs.
+        tight_cache = Cache(self.tmp / "exp_lease_cache", max_bytes=1500)
+        stage_blob = Stage.from_cli(
+            "blob",
+            binary=blob_bin,
+            setting_flags={"tag": "--tag"},
+            output_specs={"out": ".bin"},
+            info_flag=None,
+            version="blob_v1",
+        )
+        rep = run_experiment(
+            lambda run: run.run_stage(stage_blob, settings={"tag": compare("tag", ["t1", "t2", "t3"])}),
+            cache=tight_cache,
+        )
+        for br in rep.branches:
+            self.assertTrue(br.result.path.is_file(), f"branch {br.index} artifact was evicted mid-experiment")
+
+        # 2. Negative max_bytes is rejected in API and CLI.
+        with self.assertRaises(ValueError):
+            tight_cache.evict_lru(max_bytes=-1)
+        with self.assertRaises(ValueError):
+            tight_cache.clean(max_bytes=-1)
+        self.assertNotEqual(cli_main(["cache", "--cache-dir", str(tight_cache.root), "clean", "--max-gb", "-1"]), 0)
+
+        # 3. Ephemeral outputs are tracked in stats() and removed by clean(all_entries=True).
+        run_experiment(
+            lambda run: run.run_stage(stage_blob, settings={"tag": "eph"}, cache="off"),
+            cache=tight_cache,
+        )
+        st = tight_cache.stats()
+        self.assertEqual(st.ephemeral_count, 1)
+        self.assertGreater(st.ephemeral_bytes, 0)
+        cleaned = tight_cache.clean(all_entries=True)
+        self.assertEqual(cleaned["removed_ephemeral"], 1)
+        self.assertEqual(tight_cache.stats().ephemeral_count, 0)
+
+        # 4. Stage.from_cli combines manual `version` with the flag/extra_args spec hash.
+        s_a = Stage.from_cli(
+            "blob_spec",
+            binary=blob_bin,
+            setting_flags={"tag": "--tag"},
+            extra_args=["--extra", "A"],
+            output_specs={"out": ".bin"},
+            info_flag=None,
+            version="same_v1",
+        )
+        s_b = Stage.from_cli(
+            "blob_spec",
+            binary=blob_bin,
+            setting_flags={"tag": "--tag"},
+            extra_args=["--extra", "B"],
+            output_specs={"out": ".bin"},
+            info_flag=None,
+            version="same_v1",
+        )
+        self.assertNotEqual(s_a.version, s_b.version)
+        spec_cache = Cache(self.tmp / "spec_cache")
+        r_a = run_experiment(lambda run: run.run_stage(s_a, settings={"tag": "x"}), cache=spec_cache)
+        r_b = run_experiment(lambda run: run.run_stage(s_b, settings={"tag": "x"}), cache=spec_cache)
+        self.assertEqual(r_a.cache_misses, 1)
+        self.assertEqual(r_b.cache_misses, 1)
+        self.assertNotEqual(r_a.branches[0].result.content_id, r_b.branches[0].result.content_id)
 
     def test_hpc_lock_modes_slurm_sharding_and_env_metadata(self) -> None:
         """Verifies Lustre-safe lock modes (lockfile/none), SLURM job-array sharding,

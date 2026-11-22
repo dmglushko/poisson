@@ -72,17 +72,22 @@ def main(argv: list[str] | None = None) -> int:
             print(f"BLAKE3:        v{blake3_version()}")
             print(f"Objects:       {st.object_count} ({_format_bytes(st.object_bytes)})")
             print(f"Requests:      {st.request_count} ({_format_bytes(st.metadata_bytes)})")
+            print(f"Ephemeral:     {st.ephemeral_count} ({_format_bytes(st.ephemeral_bytes)})")
             print(f"Temp files:    {st.temp_count}")
             limit = _format_bytes(st.max_bytes) if st.max_bytes is not None else "unlimited"
             print(f"Max size cap:  {limit}")
             return 0
 
         if args.cache_cmd == "clean":
+            if args.max_gb is not None and args.max_gb < 0:
+                print(f"error: --max-gb must be non-negative, got {args.max_gb}", file=sys.stderr)
+                return 2
             max_bytes = int(args.max_gb * (1024**3)) if args.max_gb is not None else None
             res = cache.clean(max_bytes=max_bytes, all_entries=args.all)
             print(
                 f"Removed {res['removed_objects']} objects, "
-                f"{res['removed_requests']} requests, {res['removed_tmp']} temp files."
+                f"{res['removed_requests']} requests, {res['removed_tmp']} temp files, "
+                f"{res['removed_ephemeral']} ephemeral files."
             )
             return 0
 

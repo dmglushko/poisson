@@ -38,6 +38,11 @@ public:
         bool                    estimate_at_limit = true;
     };
 
+    struct StepResult {
+        AdaptationResult  adaptation;
+        RefinementHistory history;
+    };
+
     // Throws std::invalid_argument for any null component or invalid setting.
     ErrorBasedAdapter(std::shared_ptr<const ErrorEstimator> estimator,
                       std::shared_ptr<const MarkingStrategy> marking,
@@ -54,6 +59,13 @@ public:
 
     std::string              name() const override { return "error_based"; }
     std::unique_ptr<Session> start() const override;
+
+    // Runs one adaptation step with explicit RefinementHistory and optional first-cycle
+    // baseline error (for relative_tolerance across stateless invocations such as the CLI).
+    // Uses the exact same session logic and checks as Session::adapt().
+    StepResult adapt_once(const MeshProperties& mesh, const RefinementInput& input,
+                          RefinementHistory history = {},
+                          std::optional<double> initial_error = std::nullopt) const;
 
 private:
     std::shared_ptr<const ErrorEstimator>  estimator_;

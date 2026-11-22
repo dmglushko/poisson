@@ -142,6 +142,8 @@ class CacheStats:
     metadata_bytes: int
     temp_count: int
     max_bytes: int | None
+    ephemeral_count: int = 0
+    ephemeral_bytes: int = 0
 
 
 class CacheLease:
@@ -178,21 +180,22 @@ class CacheLease:
     def __enter__(self) -> CacheLease:
         if self._cache.lock_mode == LockMode.NONE:
             return self
-        self._cache.leases_dir.mkdir(parents=True, exist_ok=True)
-        self._fp = open(self._path, "w+", encoding="utf-8")
-        if self._cache.lock_mode == LockMode.FLOCK:
-            try:
-                fcntl.flock(self._fp.fileno(), fcntl.LOCK_EX)
-                self._uses_flock = True
-            except OSError as exc:
-                if exc.errno not in _FLOCK_UNSUPPORTED_ERRNOS:
-                    self._fp.close()
-                    self._fp = None
-                    self._path.unlink(missing_ok=True)
-                    raise
-                self._uses_flock = False
-        self._active = True
-        self._sync()
+        with self._cache._locked():
+            self._cache.leases_dir.mkdir(parents=True, exist_ok=True)
+            self._fp = open(self._path, "w+", encoding="utf-8")
+            if self._cache.lock_mode == LockMode.FLOCK:
+                try:
+                    fcntl.flock(self._fp.fileno(), fcntl.LOCK_EX)
+                    self._uses_flock = True
+                except OSError as exc:
+                    if exc.errno not in _FLOCK_UNSUPPORTED_ERRNOS:
+                        self._fp.close()
+                        self._fp = None
+                        self._path.unlink(missing_ok=True)
+                        raise
+                    self._uses_flock = False
+            self._active = True
+            self._sync()
         if not self._uses_flock:
             self._start_heartbeat()
         return self
@@ -200,14 +203,18 @@ class CacheLease:
     def __exit__(self, exc_type: Any, exc: Any, tb: Any) -> None:
         self.close()
 
-    def pin(self, object_names: Iterable[str]) -> None:
+    def pin(self, object_names: Iterable[str], *, _locked: bool = False) -> None:
         changed = False
         for name in object_names:
             if name not in self._object_names:
                 self._object_names.add(name)
                 changed = True
         if changed and self._active and self._fp is not None:
-            self._sync()
+            if _locked:
+                self._sync()
+            else:
+                with self._cache._locked():
+                    self._sync()
 
     @property
     def object_names(self) -> frozenset[str]:
@@ -539,11 +546,16 @@ class Cache:
         except OSError:
             pass
 
-    def _active_leased_objects(self) -> set[str]:
-        """Inspect `<root>/leases` and collect object filenames held by live leases."""
+    def _active_leased_objects(self) -> tuple[set[str], bool]:
+        """Inspect `<root>/leases` and collect object filenames held by live leases.
+
+        Returns `(leased_names, all_readable)`. If any live lease cannot be parsed,
+        `all_readable` is False so callers can conservatively skip eviction.
+        """
         leased: set[str] = set()
+        all_readable = True
         if not self.leases_dir.is_dir():
-            return leased
+            return leased, all_readable
         local_host = socket.gethostname().replace("/", "_")
         now = time.time()
         for lease_path in list(self.leases_dir.glob("*.lease")):
@@ -570,10 +582,14 @@ class Cache:
                             for item in data["objects"]:
                                 if isinstance(item, str):
                                     leased.add(item)
+                        else:
+                            all_readable = False
+                        continue
                     except OSError as exc:
                         if exc.errno in _FLOCK_UNSUPPORTED_ERRNOS:
                             lease_mode = "lockfile"
                         else:
+                            all_readable = False
                             continue
                     else:
                         # Stale lease from a crashed process -> remove it.
@@ -598,11 +614,13 @@ class Cache:
                             for item in data["objects"]:
                                 if isinstance(item, str):
                                     leased.add(item)
+                        else:
+                            all_readable = False
                     else:
                         lease_path.unlink(missing_ok=True)
             finally:
                 fp.close()
-        return leased
+        return leased, all_readable
 
     def lookup(
         self,
@@ -699,7 +717,7 @@ class Cache:
                 )
 
             if lease is not None:
-                lease.pin(leased_names)
+                lease.pin(leased_names, _locked=True)
 
             self._touch(req_path)
             for art in artifacts.values():
@@ -738,13 +756,12 @@ class Cache:
             for out_name, (tmp_path, ext, content_id) in hashed_outputs.items():
                 obj_path = self._object_path(content_id, ext)
                 newly_stored_names.add(obj_path.name)
-                tmp_size = tmp_path.stat().st_size
-                if obj_path.is_file() and obj_path.stat().st_size == tmp_size:
-                    tmp_path.unlink(missing_ok=True)
-                    self._touch(obj_path)
-                else:
-                    os.replace(tmp_path, obj_path)
-                    self._touch(obj_path)
+                os.replace(tmp_path, obj_path)
+                try:
+                    os.chmod(obj_path, 0o444)
+                except OSError:
+                    pass
+                self._touch(obj_path)
                 size_bytes = obj_path.stat().st_size
                 outputs_meta[out_name] = {
                     "content_id": content_id,
@@ -764,7 +781,7 @@ class Cache:
                 )
 
             if lease is not None:
-                lease.pin(newly_stored_names)
+                lease.pin(newly_stored_names, _locked=True)
 
             record = {
                 "v": 2,
@@ -795,7 +812,12 @@ class Cache:
         max_bytes: int,
         extra_protected_names: Iterable[str] = (),
     ) -> int:
-        protected = set(extra_protected_names) | self._active_leased_objects()
+        if max_bytes < 0:
+            raise ValueError(f"max_bytes must be non-negative, got {max_bytes}")
+        active_leased, all_readable = self._active_leased_objects()
+        if not all_readable:
+            return 0
+        protected = set(extra_protected_names) | active_leased
         entries: list[tuple[float, int, str, Path]] = []
         total_bytes = 0
         for p in self.objects_dir.iterdir():
@@ -837,6 +859,8 @@ class Cache:
         protected_object_names: Iterable[str] = (),
     ) -> int:
         """Evict least-recently-used unleased objects until total bytes <= max_bytes."""
+        if max_bytes < 0:
+            raise ValueError(f"max_bytes must be non-negative, got {max_bytes}")
         with self._locked():
             return self._evict_lru_unlocked(max_bytes=max_bytes, extra_protected_names=protected_object_names)
 
@@ -913,22 +937,67 @@ class Cache:
             removed += 1
         return removed
 
+    def _clean_ephemeral_unlocked(self, *, force: bool = False) -> int:
+        removed = 0
+        now = time.time()
+        if not self.ephemeral_dir.is_dir():
+            return 0
+        for p in self.ephemeral_dir.iterdir():
+            if not p.is_file():
+                continue
+            if not force:
+                parts = p.name.split("_", 1)
+                if parts and parts[0].isdigit():
+                    if _pid_is_alive(int(parts[0])):
+                        continue
+                else:
+                    try:
+                        if now - p.stat().st_mtime < 3600:
+                            continue
+                    except OSError:
+                        continue
+            p.unlink(missing_ok=True)
+            removed += 1
+        return removed
+
     def stats(self) -> CacheStats:
         object_count = 0
         object_bytes = 0
         for p in self.objects_dir.iterdir():
-            if p.is_file():
-                object_count += 1
-                object_bytes += p.stat().st_size
+            if not p.is_file():
+                continue
+            try:
+                sz = p.stat().st_size
+            except OSError:
+                continue
+            object_count += 1
+            object_bytes += sz
 
         request_count = 0
         metadata_bytes = 0
         for p in self.requests_dir.glob("*.json"):
-            if p.is_file():
-                request_count += 1
-                metadata_bytes += p.stat().st_size
+            if not p.is_file():
+                continue
+            try:
+                sz = p.stat().st_size
+            except OSError:
+                continue
+            request_count += 1
+            metadata_bytes += sz
 
         temp_count = sum(1 for p in self.tmp_dir.iterdir() if p.is_file())
+        ephemeral_count = 0
+        ephemeral_bytes = 0
+        if self.ephemeral_dir.is_dir():
+            for p in self.ephemeral_dir.iterdir():
+                if not p.is_file():
+                    continue
+                try:
+                    sz = p.stat().st_size
+                except OSError:
+                    continue
+                ephemeral_count += 1
+                ephemeral_bytes += sz
         return CacheStats(
             root=self.root,
             object_count=object_count,
@@ -937,22 +1006,28 @@ class Cache:
             metadata_bytes=metadata_bytes,
             temp_count=temp_count,
             max_bytes=self.max_bytes,
+            ephemeral_count=ephemeral_count,
+            ephemeral_bytes=ephemeral_bytes,
         )
 
     def clean(self, *, max_bytes: int | None = None, all_entries: bool = False) -> dict[str, int]:
-        """Clean abandoned temporary files and either wipe unleased entries or trim via LRU."""
+        """Clean abandoned temp/ephemeral files and either wipe unleased entries or trim via LRU."""
+        if max_bytes is not None and max_bytes < 0:
+            raise ValueError(f"max_bytes must be non-negative, got {max_bytes}")
         with self._locked():
             removed_tmp = self._clean_abandoned_tmp_unlocked(force=all_entries)
+            removed_ephemeral = self._clean_ephemeral_unlocked(force=all_entries)
 
             if all_entries:
-                protected = self._active_leased_objects()
+                protected, all_readable = self._active_leased_objects()
                 removed_objects = 0
-                for p in self.objects_dir.iterdir():
-                    if p.is_file() and p.name not in protected:
-                        p.unlink(missing_ok=True)
-                        removed_objects += 1
+                if all_readable:
+                    for p in self.objects_dir.iterdir():
+                        if p.is_file() and p.name not in protected:
+                            p.unlink(missing_ok=True)
+                            removed_objects += 1
                 removed_requests = self._prune_stale_requests_unlocked()
-                if not protected:
+                if all_readable and not protected:
                     for p in self.requests_dir.glob("*.json"):
                         p.unlink(missing_ok=True)
                         removed_requests += 1
@@ -961,6 +1036,7 @@ class Cache:
                     "removed_objects": removed_objects,
                     "removed_requests": removed_requests,
                     "removed_tmp": removed_tmp,
+                    "removed_ephemeral": removed_ephemeral,
                 }
 
             removed_objects = 0
@@ -971,6 +1047,7 @@ class Cache:
                 "removed_objects": removed_objects,
                 "removed_requests": removed_requests,
                 "removed_tmp": removed_tmp,
+                "removed_ephemeral": removed_ephemeral,
             }
 
     def inspect(self, prefix: str = "") -> list[dict[str, Any]]:

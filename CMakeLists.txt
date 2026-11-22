@@ -55,29 +55,30 @@ target_include_directories(poisson_blake3 PUBLIC include)
 target_link_libraries(poisson_blake3 PRIVATE blake3)
 target_compile_options(poisson_blake3 PRIVATE -Wall -Wextra -Wpedantic)
 
-# ---------------------------------------------------------------- Shared stage I/O & hashing library
-# Stage CLI binaries link poisson_io + only their own stage implementation so editing an
-# unrelated module (e.g. AMR or a solver) does not change other stage binaries' BLAKE3 hashes.
-add_library(poisson_io STATIC
-    src/serialization.cpp
-    src/blake3_ffi.cpp
+# Static BLAKE3 wrapper for C++ tests/tools that need hashing without coupling core libraries.
+add_library(poisson_blake3_static STATIC src/blake3_ffi.cpp)
+target_include_directories(poisson_blake3_static PUBLIC include)
+target_link_libraries(poisson_blake3_static PRIVATE blake3)
+target_compile_options(poisson_blake3_static PRIVATE -Wall -Wextra -Wpedantic)
+
+# ---------------------------------------------------------------- Core C++ stage libraries
+# Core libraries stay free of caching, BLAKE3, and stage-I/O concerns.
+add_library(poisson_common STATIC
+    src/common/quadrature.cpp
+    src/common/mesh_locator.cpp
 )
-target_include_directories(poisson_io PUBLIC include)
-target_include_directories(poisson_io PRIVATE ${HDF5_INCLUDE_DIRS})
-target_link_libraries(poisson_io PUBLIC Eigen3::Eigen PRIVATE ${HDF5_LIBRARIES} blake3)
-target_compile_options(poisson_io PRIVATE -Wall -Wextra -Wpedantic)
+target_include_directories(poisson_common PUBLIC include)
+target_compile_options(poisson_common PRIVATE -Wall -Wextra -Wpedantic)
 
 add_library(poisson_importer STATIC
     src/importer.cpp
 )
 target_include_directories(poisson_importer PUBLIC include)
 target_include_directories(poisson_importer PRIVATE ${HDF5_INCLUDE_DIRS})
-target_link_libraries(poisson_importer PUBLIC poisson_io PRIVATE ${HDF5_LIBRARIES})
+target_link_libraries(poisson_importer PRIVATE ${HDF5_LIBRARIES})
 target_compile_options(poisson_importer PRIVATE -Wall -Wextra -Wpedantic)
 
 add_library(poisson_amr STATIC
-    src/common/quadrature.cpp
-    src/common/mesh_locator.cpp
     src/amr/estimator_geometry.cpp
     src/amr/error_estimator.cpp
     src/amr/residual_estimators.cpp
@@ -91,23 +92,41 @@ add_library(poisson_amr STATIC
     src/amr/error_based_adapter.cpp
 )
 target_include_directories(poisson_amr PUBLIC include)
-target_link_libraries(poisson_amr PUBLIC poisson_io Eigen3::Eigen)
+target_link_libraries(poisson_amr PUBLIC poisson_common)
 target_compile_options(poisson_amr PRIVATE -Wall -Wextra -Wpedantic)
 
 # ---------------------------------------------------------------- Core C++ umbrella library
 add_library(poisson INTERFACE)
-target_link_libraries(poisson INTERFACE poisson_importer poisson_amr)
+target_link_libraries(poisson INTERFACE poisson_common poisson_importer poisson_amr Eigen3::Eigen)
+
+# ---------------------------------------------------------------- Stage HDF5/JSON serialization library
+# Split into one translation unit per data type so each stage CLI binary only pulls in the
+# serializers it actually calls (editing SolverResult/AssembledProblem I/O does not change
+# poisson_import or poisson_adapt's compiled binary hash).
+add_library(poisson_io STATIC
+    src/io/h5_common.cpp
+    src/io/mesh_io.cpp
+    src/io/free_charges_io.cpp
+    src/io/assembled_problem_io.cpp
+    src/io/solver_result_io.cpp
+    src/io/amr_io.cpp
+)
+target_include_directories(poisson_io PUBLIC include)
+target_include_directories(poisson_io PRIVATE ${HDF5_INCLUDE_DIRS})
+target_link_libraries(poisson_io PUBLIC Eigen3::Eigen PRIVATE ${HDF5_LIBRARIES})
+target_compile_options(poisson_io PRIVATE -Wall -Wextra -Wpedantic)
 
 # ---------------------------------------------------------------- Per-stage CLI binaries
 # Each stage variant lives in its own subfolder under cli/<stage>/<variant>.cpp
 # and builds as an independent executable.
 add_executable(poisson_import cli/importer/poisson_import.cpp)
-target_link_libraries(poisson_import PRIVATE poisson_importer)
+target_include_directories(poisson_import PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")
+target_link_libraries(poisson_import PRIVATE poisson_importer poisson_io)
 target_compile_options(poisson_import PRIVATE -Wall -Wextra -Wpedantic)
 
 add_executable(poisson_adapt cli/amr/poisson_adapt.cpp)
 target_include_directories(poisson_adapt PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")
-target_link_libraries(poisson_adapt PRIVATE poisson_amr)
+target_link_libraries(poisson_adapt PRIVATE poisson_amr poisson_io)
 target_compile_options(poisson_adapt PRIVATE -Wall -Wextra -Wpedantic)
 
 # ---------------------------------------------------------------- Tests
@@ -121,13 +140,13 @@ add_test(NAME importer COMMAND test_importer)
 
 foreach(name constants quadrature locator marking estimators refiners adapter)
     add_executable(test_${name} tests/test_${name}.cpp)
-    target_link_libraries(test_${name} PRIVATE poisson ${HDF5_LIBRARIES})
+    target_link_libraries(test_${name} PRIVATE poisson)
     target_compile_options(test_${name} PRIVATE -Wall -Wextra -Wpedantic)
     add_test(NAME ${name} COMMAND test_${name})
 endforeach()
 
 add_executable(test_serialization tests/test_serialization.cpp)
-target_link_libraries(test_serialization PRIVATE poisson ${HDF5_LIBRARIES})
+target_link_libraries(test_serialization PRIVATE poisson poisson_io poisson_blake3_static ${HDF5_LIBRARIES})
 target_include_directories(test_serialization PRIVATE ${HDF5_INCLUDE_DIRS})
 target_compile_options(test_serialization PRIVATE -Wall -Wextra -Wpedantic)
 add_test(NAME serialization COMMAND test_serialization)

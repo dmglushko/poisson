@@ -136,7 +136,7 @@ class Stage:
                 cmd.extend([info_flag, str(call.info_path)])
             return cmd
 
-        spec_version = version or blake3_json(
+        spec_hash = blake3_json(
             {
                 "in": in_map,
                 "set": set_map,
@@ -146,6 +146,7 @@ class Stage:
                 "extra": static_args,
             }
         )[:16]
+        spec_version = f"{version}:{spec_hash}" if version else spec_hash
 
         return cls(
             name=name,

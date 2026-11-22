@@ -144,11 +144,12 @@ and without `estimate_at_limit`, `StageInfo` collection, and the `PoissonDriver`
 ## Open points
 
 - `RefinementHistory` is now hidden from outer callers inside `ErrorBasedAdapter`'s session,
-  but it still appears in the lower-level `Refiner::refine()` signature.
-- The weights `1/eps` and `eps_F = max(eps_K, eps_L)` in the residual and Kelly
-  estimators, and `eps = eps_r` without `eps_0`: they must match Assembly's units.
+  but it still appears in the lower-level `Refiner::refine()` signature (and in
+  `ErrorBasedAdapter::adapt_once()` for stateless CLI invocations).
 - Faces between a dielectric and a floating metal (no voltage) are skipped like Dirichlet
   faces.
 - An interior face with a Neumann or Robin boundary element is treated as an ordinary
   interior face, with a warning.
+- On a face shared between an excluded point-source tet and a non-excluded neighbour, the
+  non-excluded neighbour still receives half of that face's flux jump.
 - No coarsening, no maximum refinement level.

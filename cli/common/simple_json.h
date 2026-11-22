@@ -6,6 +6,7 @@
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
+#include <limits>
 #include <map>
 #include <stdexcept>
 #include <string>
@@ -38,13 +39,17 @@ struct JsonValue {
     }
     int as_int(const std::string& ctx) const {
         const double v = as_double(ctx);
-        if (!std::isfinite(v) || std::floor(v) != v) throw std::runtime_error(ctx + ": expected integer");
+        if (!std::isfinite(v) || std::floor(v) != v ||
+            v < static_cast<double>(std::numeric_limits<int>::min()) ||
+            v > static_cast<double>(std::numeric_limits<int>::max()))
+            throw std::runtime_error(ctx + ": expected 32-bit integer");
         return static_cast<int>(v);
     }
     uint64_t as_u64(const std::string& ctx) const {
+        constexpr double kMaxExactDoubleInt = 9007199254740992.0;   // 2^53
         const double v = as_double(ctx);
-        if (!std::isfinite(v) || v < 0 || std::floor(v) != v)
-            throw std::runtime_error(ctx + ": expected non-negative integer");
+        if (!std::isfinite(v) || v < 0.0 || std::floor(v) != v || v > kMaxExactDoubleInt)
+            throw std::runtime_error(ctx + ": expected exact non-negative integer (<= 2^53)");
         return static_cast<uint64_t>(v);
     }
     const std::string& as_string(const std::string& ctx) const {

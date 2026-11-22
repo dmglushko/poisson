@@ -78,8 +78,8 @@ struct MeshProperties {
     enum class BcType { Dirichlet, Neumann, Robin };
     struct BoundaryCondition {
         BcType type;
-        double value;                             // Dirichlet: u [V]; Neumann and Robin: g
-        std::optional<double> alpha;              // Robin only: eps * du/dn + alpha * u = g
+        double value;                             // Dirichlet: u [V]; Neumann and Robin: g [V/nm]
+        std::optional<double> alpha;              // Robin only [1/nm]: eps_r * du/dn + alpha * u = g
     };
 
     struct Material {
@@ -110,6 +110,18 @@ struct MeshProperties {
     std::vector<std::array<std::optional<uint32_t>, 4>> neighbours;
 };
 ```
+
+#### Units and PDE convention
+
+All stages (`Importer`, `AnalyticalMaker`, `Assembly`, `Solver`, `AMR`, `Ray Tracing`) share one unit system (matching Nebula):
+
+- **Length:** nanometers (`nm`). Coordinates in `.msh`, `.cha`, and `.pri` are read as-is in `nm`; `.mat` `screening_length` values are converted to `nm`.
+- **Potential:** volts (`V`).
+- **Permittivity:** dimensionless relative permittivity $\varepsilon_r$ (without $\varepsilon_0$ on the left-hand side).
+- **Equation:** inside each non-metal tet, with $c = \varepsilon_r / \lambda^2$ ($0$ when `screening_length == 0`):
+  $$-\nabla \cdot (\varepsilon_r \nabla u) + c u = f = \frac{\rho}{\varepsilon_0}$$
+  so $f$ has units $\text{V}/\text{nm}^2$, and a point charge of $q$ elementary charges contributes $q \cdot \frac{e}{\varepsilon_0\,\mathrm{nm}} \approx 18.0951\,q\;\text{V}\cdot\text{nm}$ to the integrated right-hand side.
+- **Boundary conditions:** Dirichlet prescribes $u\;\text{[V]}$; Neumann and Robin satisfy $\varepsilon_r \frac{\partial u}{\partial n} + \alpha u = g$ with $g$ in $\text{V}/\text{nm}$ and $\alpha$ in $\text{nm}^{-1}$ ($\alpha = 0$ for Neumann).
 
 ### FreeCharges
 

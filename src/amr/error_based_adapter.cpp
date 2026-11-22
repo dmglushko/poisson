@@ -42,9 +42,13 @@ class ErrorBasedSession final : public MeshAdapter::Session {
 public:
     ErrorBasedSession(std::string adapter_name, std::shared_ptr<const ErrorEstimator> estimator,
                       std::shared_ptr<const MarkingStrategy> marking, std::shared_ptr<const Refiner> refiner,
-                      ErrorBasedAdapter::Settings settings)
+                      ErrorBasedAdapter::Settings settings, RefinementHistory history = {},
+                      std::optional<double> initial_error = std::nullopt)
         : Session(std::move(adapter_name)), estimator_(std::move(estimator)), marking_(std::move(marking)),
-          refiner_(std::move(refiner)), settings_(settings) {}
+          refiner_(std::move(refiner)), settings_(settings), history_(std::move(history)),
+          initial_error_(initial_error) {}
+
+    RefinementHistory take_history() { return std::move(history_); }
 
 private:
     AdaptationResult adapt_step(const MeshProperties& mesh, const RefinementInput& input) override {
@@ -147,4 +151,15 @@ ErrorBasedAdapter::ErrorBasedAdapter(std::shared_ptr<const ErrorEstimator> estim
 
 std::unique_ptr<MeshAdapter::Session> ErrorBasedAdapter::start() const {
     return std::make_unique<ErrorBasedSession>(name(), estimator_, marking_, refiner_, settings_);
+}
+
+ErrorBasedAdapter::StepResult ErrorBasedAdapter::adapt_once(const MeshProperties& mesh, const RefinementInput& input,
+                                                            RefinementHistory history,
+                                                            std::optional<double> initial_error) const {
+    if (initial_error && !(std::isfinite(*initial_error) && *initial_error >= 0.0))
+        throw std::invalid_argument("ErrorBasedAdapter::adapt_once: initial_error must be finite and non-negative, got " +
+                                    std::to_string(*initial_error));
+    ErrorBasedSession session(name(), estimator_, marking_, refiner_, settings_, std::move(history), initial_error);
+    AdaptationResult adaptation = session.adapt(mesh, input);
+    return StepResult{std::move(adaptation), session.take_history()};
 }

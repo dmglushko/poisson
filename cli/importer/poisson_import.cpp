@@ -1,7 +1,7 @@
+#include "cli/common/cli_utils.h"
 #include "importer.h"
 #include "serialization.h"
 
-#include <chrono>
 #include <cstdlib>
 #include <filesystem>
 #include <iostream>
@@ -9,10 +9,6 @@
 #include <string>
 #include <string_view>
 #include <vector>
-
-#ifdef __unix__
-#include <unistd.h>
-#endif
 
 namespace {
 
@@ -24,45 +20,6 @@ void print_usage(std::ostream& out) {
         << "                 --out <mesh.h5> [--info-out <info.json>]\n"
         << "  poisson_import --primaries <file.pri> --out <free_charges.h5> [--info-out <info.json>]\n";
 }
-
-bool paths_alias(const fs::path& a, const fs::path& b) {
-    std::error_code ec;
-    if (fs::exists(a, ec) && !ec && fs::exists(b, ec) && !ec) {
-        const bool eq = fs::equivalent(a, b, ec);
-        if (!ec && eq) return true;
-    }
-    const fs::path ca = fs::weakly_canonical(fs::absolute(a), ec);
-    if (ec) return false;
-    const fs::path cb = fs::weakly_canonical(fs::absolute(b), ec);
-    if (ec) return false;
-    return ca == cb;
-}
-
-fs::path make_staging_path(const fs::path& target, std::string_view tag) {
-    const auto now = std::chrono::steady_clock::now().time_since_epoch().count();
-#ifdef __unix__
-    const long pid = static_cast<long>(::getpid());
-#else
-    const long pid = 0;
-#endif
-    const fs::path parent = target.has_parent_path() ? target.parent_path() : fs::path(".");
-    const std::string name =
-        "." + target.filename().string() + "." + std::string(tag) + "." + std::to_string(pid) + "." +
-        std::to_string(now) + ".tmp";
-    return parent / name;
-}
-
-struct TempFileCleanup {
-    fs::path path;
-    bool active = true;
-    ~TempFileCleanup() {
-        if (active && !path.empty()) {
-            std::error_code ec;
-            fs::remove(path, ec);
-        }
-    }
-    void release() { active = false; }
-};
 
 }   // namespace
 
@@ -129,32 +86,32 @@ int main(int argc, char** argv) {
     if (primaries_file) all_inputs.push_back(*primaries_file);
 
     for (const auto& inp : all_inputs) {
-        if (paths_alias(*out_file, inp)) {
+        if (poisson::cli::paths_alias(*out_file, inp)) {
             std::cerr << "error: --out aliases input file '" << inp.string() << "'\n";
             return EXIT_FAILURE;
         }
-        if (info_out_file && paths_alias(*info_out_file, inp)) {
+        if (info_out_file && poisson::cli::paths_alias(*info_out_file, inp)) {
             std::cerr << "error: --info-out aliases input file '" << inp.string() << "'\n";
             return EXIT_FAILURE;
         }
     }
-    if (info_out_file && paths_alias(*out_file, *info_out_file)) {
+    if (info_out_file && poisson::cli::paths_alias(*out_file, *info_out_file)) {
         std::cerr << "error: --info-out must not alias --out\n";
         return EXIT_FAILURE;
     }
 
     try {
         const Importer importer;
-        const fs::path staged_out = make_staging_path(*out_file, "out");
-        TempFileCleanup out_guard{staged_out};
+        const fs::path staged_out = poisson::cli::make_staging_path(*out_file, "out");
+        poisson::cli::TempFileCleanup out_guard{staged_out};
         fs::path staged_info;
-        TempFileCleanup info_guard{{}};
+        poisson::cli::TempFileCleanup info_guard{{}};
 
         if (mesh_file) {
             const MeshImportResult imported = importer.import_mesh(*mesh_file, material_files, charges_file);
             poisson::io::write_mesh_properties(staged_out, imported.mesh);
             if (info_out_file) {
-                staged_info = make_staging_path(*info_out_file, "info");
+                staged_info = poisson::cli::make_staging_path(*info_out_file, "info");
                 info_guard.path = staged_info;
                 poisson::io::write_info_json(staged_info, imported.info);
             }
@@ -162,7 +119,7 @@ int main(int argc, char** argv) {
             const FreeChargesImportResult imported = importer.import_free_charges(*primaries_file);
             poisson::io::write_free_charges(staged_out, imported.charges);
             if (info_out_file) {
-                staged_info = make_staging_path(*info_out_file, "info");
+                staged_info = poisson::cli::make_staging_path(*info_out_file, "info");
                 info_guard.path = staged_info;
                 poisson::io::write_info_json(staged_info, imported.info);
             }

@@ -23,8 +23,8 @@ struct MeshProperties {
     enum class BcType { Dirichlet, Neumann, Robin };
     struct BoundaryCondition {
         BcType type;
-        double value;                             // Dirichlet: u [V]; Neumann and Robin: g
-        std::optional<double> alpha;              // Robin only: eps * du/dn + alpha * u = g
+        double value;                             // Dirichlet: u [V]; Neumann and Robin: g [V/nm]
+        std::optional<double> alpha;              // Robin only [1/nm]: eps_r * du/dn + alpha * u = g
     };
 
     struct Material {

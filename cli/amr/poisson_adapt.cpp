@@ -9,7 +9,7 @@
 #include "cli/common/simple_json.h"
 #include "serialization.h"
 
-#include <chrono>
+#include <cmath>
 #include <cstdlib>
 #include <filesystem>
 #include <iostream>
@@ -28,9 +28,18 @@ using poisson::cli::JsonValue;
 void print_usage(std::ostream& out) {
     out << "Usage:\n"
         << "  poisson_adapt --mesh <mesh.h5> --solution <nodal_field.h5> --config <config.json>\n"
-        << "                [--history <history.h5>] --out <mesh_out.h5>\n"
+        << "                [--history <history.h5>] [--initial-error <value>] --out <mesh_out.h5>\n"
         << "                [--parents-out <parents.h5>] [--history-out <history.h5>]\n"
         << "                [--info-out <info.json>]\n";
+}
+
+Parents identity_parents(const MeshProperties& mesh) {
+    Parents parents;
+    parents.elements.resize(mesh.elements.size());
+    for (uint32_t k = 0; k < mesh.elements.size(); ++k) parents.elements[k] = k;
+    parents.nodes.resize(mesh.nodes.size());
+    for (uint32_t i = 0; i < mesh.nodes.size(); ++i) parents.nodes[i] = {i, i};
+    return parents;
 }
 
 void reject_unknown_keys(const JsonValue::Object& obj, const std::set<std::string>& allowed,
@@ -198,6 +207,7 @@ int main(int argc, char** argv) {
     std::optional<fs::path> solution_file;
     std::optional<fs::path> config_file;
     std::optional<fs::path> history_in_file;
+    std::optional<double> initial_error;
     std::optional<fs::path> out_file;
     std::optional<fs::path> parents_out_file;
     std::optional<fs::path> history_out_file;
@@ -224,6 +234,15 @@ int main(int argc, char** argv) {
             config_file = require_value(i, arg);
         } else if (arg == "--history") {
             history_in_file = require_value(i, arg);
+        } else if (arg == "--initial-error") {
+            const std::string raw = require_value(i, arg).string();
+            char* end = nullptr;
+            const double val = std::strtod(raw.c_str(), &end);
+            if (end != raw.c_str() + raw.size() || !std::isfinite(val) || val < 0.0) {
+                std::cerr << "error: --initial-error must be a finite non-negative number, got '" << raw << "'\n";
+                return EXIT_FAILURE;
+            }
+            initial_error = val;
         } else if (arg == "--out") {
             out_file = require_value(i, arg);
         } else if (arg == "--parents-out") {
@@ -280,83 +299,23 @@ int main(int argc, char** argv) {
             ref_input.source = [f_val](const std::array<double, 3>&, uint32_t) { return f_val; };
         }
 
-        MeshProperties out_mesh;
-        Parents out_parents;
-        RefinementHistory out_history;
-        AdaptationStatus status = AdaptationStatus::unchanged;
-        AdaptationResult::Info info;
-
-        if (!history_in_file && !history_out_file) {
-            // Standard composite ErrorBasedAdapter execution.
-            const ErrorBasedAdapter adapter(cfg.estimator, cfg.marking, cfg.refiner, cfg.adapter_settings);
-            auto session = adapter.start();
-            AdaptationResult adapted = session->adapt(mesh, ref_input);
-            status = adapted.status;
-            info = std::move(adapted.info);
-            out_mesh = adapted.mesh ? std::move(*adapted.mesh) : mesh;
-            if (adapted.parents) out_parents = std::move(*adapted.parents);
-        } else {
-            // Explicit-history single step (supports chaining RedGreenRefinement across CLI cycles).
-            const auto t0 = std::chrono::steady_clock::now();
-            RefinementHistory in_history;
-            if (history_in_file) in_history = poisson::io::read_refinement_history(*history_in_file);
-
-            info.adapter = "error_based";
-            info.elements_before = static_cast<uint32_t>(mesh.elements.size());
-
-            const bool over_limit =
-                cfg.adapter_settings.max_elements && mesh.elements.size() > *cfg.adapter_settings.max_elements;
-            if (over_limit && !cfg.adapter_settings.estimate_at_limit) {
-                status = AdaptationStatus::limit_reached;
-                out_mesh = mesh;
-                out_history = std::move(in_history);
-                info.elements_after = info.elements_before;
-            } else {
-                const ErrorEstimate est = cfg.estimator->estimate(mesh, ref_input);
-                info.error_estimate = est.total;
-                StageInfo est_stage{"estimate", est.info.estimator, est.info.time, est.info.details, est.info.warnings};
-                est_stage.metrics["total"] = est.total;
-                est_stage.metrics["max_indicator"] = est.info.max_indicator;
-                info.stages.push_back(std::move(est_stage));
-
-                if (cfg.adapter_settings.absolute_tolerance && est.total <= *cfg.adapter_settings.absolute_tolerance) {
-                    status = AdaptationStatus::converged;
-                    out_mesh = mesh;
-                    out_history = std::move(in_history);
-                    info.elements_after = info.elements_before;
-                } else if (over_limit) {
-                    status = AdaptationStatus::limit_reached;
-                    out_mesh = mesh;
-                    out_history = std::move(in_history);
-                    info.elements_after = info.elements_before;
-                } else {
-                    const auto tm0 = std::chrono::steady_clock::now();
-                    const std::vector<uint32_t> marked = cfg.marking->mark(mesh, est.eta);
-                    const double mark_time = std::chrono::duration<double>(std::chrono::steady_clock::now() - tm0).count();
-                    StageInfo mark_stage{"mark", cfg.marking->name(), mark_time, {{"marked", static_cast<double>(marked.size())}}, {}};
-                    info.stages.push_back(std::move(mark_stage));
-
-                    if (marked.empty()) {
-                        status = AdaptationStatus::unchanged;
-                        out_mesh = mesh;
-                        out_history = std::move(in_history);
-                        info.elements_after = info.elements_before;
-                    } else {
-                        RefinementResult ref_res = cfg.refiner->refine(mesh, marked, in_history);
-                        StageInfo ref_stage{"refine", ref_res.info.refiner, ref_res.info.time, ref_res.info.details, ref_res.info.warnings};
-                        ref_stage.metrics["marked"] = static_cast<double>(ref_res.info.marked);
-                        ref_stage.metrics["refined_elements"] = static_cast<double>(ref_res.info.refined_elements);
-                        info.stages.push_back(std::move(ref_stage));
-                        status = AdaptationStatus::adapted;
-                        out_mesh = std::move(ref_res.mesh);
-                        out_parents = std::move(ref_res.parents);
-                        out_history = std::move(ref_res.history);
-                        info.elements_after = static_cast<uint32_t>(out_mesh.elements.size());
-                    }
-                }
-            }
-            info.time = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+        if (cfg.adapter_settings.relative_tolerance && !initial_error) {
+            throw std::runtime_error(
+                "config.adapter.relative_tolerance requires --initial-error in single-step CLI mode");
         }
+
+        const ErrorBasedAdapter adapter(cfg.estimator, cfg.marking, cfg.refiner, cfg.adapter_settings);
+        RefinementHistory in_history;
+        if (history_in_file) in_history = poisson::io::read_refinement_history(*history_in_file);
+
+        ErrorBasedAdapter::StepResult step =
+            adapter.adapt_once(mesh, ref_input, std::move(in_history), initial_error);
+        const AdaptationStatus status = step.adaptation.status;
+        const AdaptationResult::Info info = std::move(step.adaptation.info);
+        const MeshProperties out_mesh = step.adaptation.mesh ? std::move(*step.adaptation.mesh) : mesh;
+        const Parents out_parents =
+            step.adaptation.parents ? std::move(*step.adaptation.parents) : identity_parents(out_mesh);
+        const RefinementHistory out_history = std::move(step.history);
 
         const fs::path staged_out = poisson::cli::make_staging_path(*out_file, "out");
         poisson::cli::TempFileCleanup out_guard{staged_out};

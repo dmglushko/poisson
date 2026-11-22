@@ -225,6 +225,55 @@ void test_small_files(const fs::path& dir) {
     CHECK(metal.info.warnings.size() == 1);   // only the reoriented tet
     CHECK(!mesh.materials[0].is_metal);       // siliconnitride.yaml has no band_structure
 
+    // YAML edge cases: quoted model, and sibling keys containing "model" or "epsilon_r" as substrings.
+    const fs::path quoted_metal = write_file(
+        dir, "quoted_metal.yaml",
+        "name: silicon\nband_structure:\n    model: \"metal\"\n    dos_model: parabolic\n");
+    CHECK(importer.import_mesh(voltage_mesh, {quoted_metal}).mesh.materials[0].is_metal);
+    const fs::path sibling_eps = write_file(
+        dir, "sibling_eps.yaml",
+        "name: siliconnitride\ndielectric:\n    static_epsilon_r: 99.0\n    epsilon_r_inf: 2.0\n    epsilon_r: 7.5\n");
+    CHECK(importer.import_mesh(mesh_file, {sibling_eps}).mesh.materials[0].eps_r == 7.5);
+
+    // Nebula .mat file with fixed-length (non-VLEN) string `unit` inside compound attributes.
+    {
+        struct FixedQuantity { double value; char unit[8]; };
+        const fs::path fixed_mat = dir / "fixed_unit.mat";
+        const hid_t file = H5Fcreate(fixed_mat.string().c_str(), H5F_ACC_TRUNC, H5P_DEFAULT, H5P_DEFAULT);
+        const hid_t scalar = H5Screate(H5S_SCALAR);
+        const auto write_str = [&](const char* key, const std::string& val) {
+            const hid_t t = H5Tcopy(H5T_C_S1);
+            H5Tset_size(t, val.size() + 1);
+            const hid_t a = H5Acreate2(file, key, t, scalar, H5P_DEFAULT, H5P_DEFAULT);
+            H5Awrite(a, t, val.c_str());
+            H5Aclose(a);
+            H5Tclose(t);
+        };
+        write_str("name", "siliconnitride");
+        write_str("conductor_type", "insulator");
+        const hid_t ustr = H5Tcopy(H5T_C_S1);
+        H5Tset_size(ustr, sizeof(FixedQuantity::unit));
+        const hid_t fq = H5Tcreate(H5T_COMPOUND, sizeof(FixedQuantity));
+        H5Tinsert(fq, "value", HOFFSET(FixedQuantity, value), H5T_NATIVE_DOUBLE);
+        H5Tinsert(fq, "unit", HOFFSET(FixedQuantity, unit), ustr);
+        const FixedQuantity eps_val{8.25, ""};
+        const FixedQuantity sl_val{4.0, "um"};
+        const hid_t a1 = H5Acreate2(file, "epsilon_r", fq, scalar, H5P_DEFAULT, H5P_DEFAULT);
+        H5Awrite(a1, fq, &eps_val);
+        H5Aclose(a1);
+        const hid_t a2 = H5Acreate2(file, "screening_length", fq, scalar, H5P_DEFAULT, H5P_DEFAULT);
+        H5Awrite(a2, fq, &sl_val);
+        H5Aclose(a2);
+        H5Tclose(fq);
+        H5Tclose(ustr);
+        H5Sclose(scalar);
+        H5Fclose(file);
+
+        const MeshImportResult fixed_res = importer.import_mesh(mesh_file, {fixed_mat});
+        CHECK(fixed_res.mesh.materials[0].eps_r == 8.25);
+        CHECK(std::abs(fixed_res.mesh.materials[0].screening_length - 4000.0) < 1e-12);
+    }
+
     // Nebula .mat files (HDF5) give the same as the .yaml, plus the screening length.
     const MeshImportResult from_mat = importer.import_mesh(
         mesh_file, {write_mat(dir, "siliconnitride.mat", "siliconnitride", "semiconductor", Quantity{7.5, ""}, Quantity{2.0, "nm"})});

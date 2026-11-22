@@ -158,6 +158,14 @@ void test_mesh_roundtrip_and_determinism(const fs::path& dir) {
     CHECK(loaded.charges[1].position == mesh.charges[1].position && loaded.charges[1].value == -3);
     CHECK(loaded.neighbours == mesh.neighbours);
 
+    // Negative zero (-0.0) normalizes to +0.0 so hashes match byte-for-byte.
+    MeshProperties neg_zero = mesh;
+    neg_zero.nodes[0] = {-0.0, -0.0, -0.0};
+    neg_zero.boundary_conditions[0].value = -0.0;
+    const fs::path file_nz = dir / "mesh_nz.h5";
+    poisson::io::write_mesh_properties(file_nz, neg_zero);
+    CHECK(poisson::blake3_file_hex(file_a) == poisson::blake3_file_hex(file_nz));
+
     // Empty vectors edge case.
     MeshProperties empty;
     const fs::path empty_file = dir / "mesh_empty.h5";
@@ -340,11 +348,21 @@ void test_malformed_h5_rejected(const fs::path& dir) {
     // 5. Out-of-range row index in AssembledProblem must be rejected.
     {
         AssembledProblem broken;
+        broken.A.resize(1, 1);
         broken.f = {1.0};
         broken.row = {5u};
         const fs::path bad = dir / "dangling_row.h5";
         poisson::io::write_assembled_problem(bad, broken);
         CHECK_THROWS(poisson::io::read_assembled_problem(bad), "out-of-range row index");
+    }
+
+    // 6. Empty A with non-empty f must be rejected.
+    {
+        AssembledProblem broken;
+        broken.f = {1.0};
+        const fs::path bad = dir / "zero_rows_nonempty_f.h5";
+        poisson::io::write_assembled_problem(bad, broken);
+        CHECK_THROWS(poisson::io::read_assembled_problem(bad), "A.rows() does not match f.size()");
     }
 }
 

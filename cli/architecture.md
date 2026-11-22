@@ -19,10 +19,13 @@ cli/
   driver/                   (future: poisson_drive.cpp once PoissonDriver is complete)
 ```
 
-In `CMakeLists.txt`, shared stage I/O and hashing live in `poisson_io` (`src/serialization.cpp`,
-`src/blake3_ffi.cpp`). Each stage CLI links only its own module library (`poisson_importer`,
-`poisson_amr`, ...) plus `poisson_io` so editing one stage does not change the compiled binary
-hash of unrelated stages.
+In `CMakeLists.txt`, core stage libraries (`poisson_common`, `poisson_importer`, `poisson_amr`)
+stay free of HDF5 stage serialization and BLAKE3 hashing. Stage I/O lives in `poisson_io`,
+split into one translation unit per data type (`src/io/h5_common.cpp`, `mesh_io.cpp`,
+`free_charges_io.cpp`, `assembled_problem_io.cpp`, `solver_result_io.cpp`, `amr_io.cpp`). Each
+stage CLI links only its own module library plus `poisson_io`, so the linker only pulls in the
+serializers that stage calls and editing an unrelated stage's code or serializer does not change
+other stage binaries' BLAKE3 hashes.
 
 ## Stage CLI Contract
 
@@ -36,7 +39,7 @@ Every stage executable:
    outputs via sibling temp files + checked flush/close + atomic `std::filesystem::rename`.
 5. Returns exit code `0` on success and non-zero with a clear `stderr` message on failure.
 
-## Deterministic HDF5 Serialization (`include/serialization.h`, `src/serialization.cpp`)
+## Deterministic HDF5 Serialization (`include/serialization.h`, `src/io/`)
 
 - Supports `MeshProperties`, `FreeCharges`, `AssembledProblem` (including compressed
   `Eigen::SparseMatrix<double>` `A`), and `SolverResult`.
