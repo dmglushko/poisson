@@ -49,6 +49,11 @@ flowchart LR
 - Every step result (`MeshImportResult`, `FreeChargesImportResult`, `AssembledProblem`,
   `SolverResult`, `ErrorEstimate`, `RefinementResult`, `AdaptationResult`) has a nested
   `Info` describing the run that produced it, with at least `time` and `warnings`.
+- Drivers and composite stages are preferably built by composing smaller interchangeable
+  module interfaces.
+- When a module or driver needs configuration, the preferred convention is a nested
+  `Settings` struct passed to its constructor (with driver-level settings kept separate
+  from sub-module settings).
 
 ## Data classes
 
