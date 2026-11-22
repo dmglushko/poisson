@@ -119,7 +119,7 @@ target_include_directories(test_importer PRIVATE ${HDF5_INCLUDE_DIRS})
 target_compile_options(test_importer PRIVATE -Wall -Wextra -Wpedantic)
 add_test(NAME importer COMMAND test_importer)
 
-foreach(name quadrature locator marking estimators refiners adapter)
+foreach(name constants quadrature locator marking estimators refiners adapter)
     add_executable(test_${name} tests/test_${name}.cpp)
     target_link_libraries(test_${name} PRIVATE poisson ${HDF5_LIBRARIES})
     target_compile_options(test_${name} PRIVATE -Wall -Wextra -Wpedantic)
