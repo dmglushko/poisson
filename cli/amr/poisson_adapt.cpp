@@ -7,7 +7,8 @@
 #include "amr/residual_estimator.h"
 #include "cli/common/cli_utils.h"
 #include "cli/common/simple_json.h"
-#include "serialization.h"
+#include "io/amr_io.h"
+#include "io/mesh_io.h"
 
 #include <cmath>
 #include <cstdlib>

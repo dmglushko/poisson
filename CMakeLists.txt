@@ -50,13 +50,13 @@ target_include_directories(blake3 PUBLIC "${BLAKE3_DIR}")
 target_compile_definitions(blake3 PRIVATE ${BLAKE3_DEFS})
 
 # Shared library loaded by Python (poisson_runner.hashing) via ctypes for full-speed BLAKE3.
-add_library(poisson_blake3 SHARED src/blake3_ffi.cpp)
+add_library(poisson_blake3 SHARED src/blake3/blake3_hash.cpp)
 target_include_directories(poisson_blake3 PUBLIC include)
 target_link_libraries(poisson_blake3 PRIVATE blake3)
 target_compile_options(poisson_blake3 PRIVATE -Wall -Wextra -Wpedantic)
 
 # Static BLAKE3 wrapper for C++ tests/tools that need hashing without coupling core libraries.
-add_library(poisson_blake3_static STATIC src/blake3_ffi.cpp)
+add_library(poisson_blake3_static STATIC src/blake3/blake3_hash.cpp)
 target_include_directories(poisson_blake3_static PUBLIC include)
 target_link_libraries(poisson_blake3_static PRIVATE blake3)
 target_compile_options(poisson_blake3_static PRIVATE -Wall -Wextra -Wpedantic)
@@ -71,7 +71,7 @@ target_include_directories(poisson_common PUBLIC include)
 target_compile_options(poisson_common PRIVATE -Wall -Wextra -Wpedantic)
 
 add_library(poisson_importer STATIC
-    src/importer.cpp
+    src/importer/importer.cpp
 )
 target_include_directories(poisson_importer PUBLIC include)
 target_include_directories(poisson_importer PRIVATE ${HDF5_INCLUDE_DIRS})

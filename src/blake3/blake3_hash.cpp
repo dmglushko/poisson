@@ -1,4 +1,4 @@
-#include "blake3_hash.h"
+#include "blake3/blake3_hash.h"
 
 #include "blake3.h"
 

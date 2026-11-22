@@ -1,5 +1,5 @@
 #include "h5_common.h"
-#include "serialization.h"
+#include "io/assembled_problem_io.h"
 
 #include <limits>
 #include <optional>

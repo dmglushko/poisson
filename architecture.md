@@ -196,7 +196,7 @@ struct SolverResult {
 
 Reads the input files (`.msh`/`.msh2`, material `.yaml`/`.mat`, `.cha`, `.pri`) and returns
 `MeshImportResult { mesh, info }` and `FreeChargesImportResult { charges, info }`
-(`include/importer.h`, `src/importer.cpp`). Described in
+(`include/importer/importer.h`, `src/importer/importer.cpp`). Described in
 [src/importer/architecture.md](src/importer/architecture.md).
 
 ### Solver

@@ -1,7 +1,8 @@
 # Importer
 
 Reads the input files and returns `MeshImportResult { mesh, info }` and
-`FreeChargesImportResult { charges, info }` (`include/importer.h`, `src/importer.cpp`).
+`FreeChargesImportResult { charges, info }` (`include/importer/importer.h`,
+`src/importer/importer.cpp`).
 
 ## Interface
 

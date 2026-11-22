@@ -39,10 +39,13 @@ Every stage executable:
    outputs via sibling temp files + checked flush/close + atomic `std::filesystem::rename`.
 5. Returns exit code `0` on success and non-zero with a clear `stderr` message on failure.
 
-## Deterministic HDF5 Serialization (`include/serialization.h`, `src/io/`)
+## Deterministic HDF5 Serialization (`include/io/`, `src/io/`)
 
 - Supports `MeshProperties`, `FreeCharges`, `AssembledProblem` (including compressed
-  `Eigen::SparseMatrix<double>` `A`), and `SolverResult`.
+  `Eigen::SparseMatrix<double>` `A`), `SolverResult`, and AMR stage artifacts (`NodalField`,
+  `Parents`, `RefinementHistory`), split into matching per-type headers/sources (`mesh_io.h/.cpp`,
+  `free_charges_io.h/.cpp`, `assembled_problem_io.h/.cpp`, `solver_result_io.h/.cpp`,
+  `amr_io.h/.cpp`).
 - Disables HDF5 object timestamp tracking (`H5Pset_obj_track_times(..., false)`) on the root
   group, all subgroups, and all datasets, and pins HDF5 format bounds (`H5F_LIBVER_V18`).
 - Uses explicit little-endian numeric file types (`H5T_IEEE_F64LE`, `H5T_STD_U32LE`, etc.),
@@ -61,8 +64,9 @@ When a new core C++ stage (e.g. `Assembly` or `Solver`) is ready, wiring it into
 ```cpp
 #include "cli/common/cli_utils.h"
 #include "cli/common/simple_json.h"
-#include "serialization.h"
-#include "your_stage.h"
+#include "io/assembled_problem_io.h"
+#include "io/solver_result_io.h"
+#include "your_stage/your_stage.h"
 
 int main(int argc, char** argv) {
     // 1. Parse --in, --config, --out, --info-out (reject missing flags)
@@ -70,17 +74,17 @@ int main(int argc, char** argv) {
     //    poisson::cli::reject_output_aliasing(out_path, {in_path}, "--out");
     //    poisson::cli::reject_same_path(info_out_path, out_path, "--info-out", "--out");
     // 3. Read input & optional JSON config:
-    //    auto problem = poisson::io::read_assembled_problem_hdf5(in_path);
+    //    auto problem = poisson::io::read_assembled_problem(in_path);
     //    auto cfg = poisson::cli::parse_json_file(config_path);
     // 4. Run your core C++ stage:
     //    SolverResult result = solve(problem, ...);
     // 5. Publish atomically via sibling temp files:
     //    poisson::cli::atomic_write_file(out_path, [&](const auto& tmp) {
-    //        poisson::io::write_solver_result_hdf5(result, tmp);
+    //        poisson::io::write_solver_result(tmp, result);
     //    });
     //    if (!info_out_path.empty()) {
     //        poisson::cli::atomic_write_file(info_out_path, [&](const auto& tmp) {
-    //            poisson::io::write_info_json(result.info, tmp);
+    //            poisson::io::write_info_json(tmp, result.info);
     //        });
     //    }
 }
@@ -91,7 +95,7 @@ int main(int argc, char** argv) {
 ```cmake
 add_executable(poisson_solve_cg cli/solver/cg_solve.cpp)
 target_include_directories(poisson_solve_cg PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")
-target_link_libraries(poisson_solve_cg PRIVATE poisson_solver)  # links poisson_io + solver only
+target_link_libraries(poisson_solve_cg PRIVATE poisson_solver poisson_io)
 target_compile_options(poisson_solve_cg PRIVATE -Wall -Wextra -Wpedantic)
 ```
 

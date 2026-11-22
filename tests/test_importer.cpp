@@ -4,7 +4,7 @@
 //   test_importer <msh> <yaml> <cha> <pri>     also import the holes_3x2 sample files
 
 #include "assembled_problem.h"
-#include "importer.h"
+#include "importer/importer.h"
 #include "solver_result.h"
 
 #include <hdf5.h>

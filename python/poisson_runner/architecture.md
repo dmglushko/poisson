@@ -3,7 +3,7 @@
 `poisson_runner` is the Python orchestration, content-addressed caching, and loop-free
 `compare(...)` benchmarking layer built on top of the per-stage C++ CLI binaries.
 
-## Hashing Engine (`hashing.py`, `third_party/blake3/`, `src/blake3_ffi.cpp`)
+## Hashing Engine (`hashing.py`, `third_party/blake3/`, `src/blake3/blake3_hash.cpp`)
 
 - Uses vendored official BLAKE3 v1.8.7 with runtime CPUID SIMD dispatch on x86-64 Linux
   (`SSE2`/`SSE4.1`/`AVX2`/`AVX-512`), little-endian ARM64 NEON, and portable C fallback.

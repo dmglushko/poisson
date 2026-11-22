@@ -1,6 +1,7 @@
 #include "cli/common/cli_utils.h"
-#include "importer.h"
-#include "serialization.h"
+#include "importer/importer.h"
+#include "io/free_charges_io.h"
+#include "io/mesh_io.h"
 
 #include <cstdlib>
 #include <filesystem>

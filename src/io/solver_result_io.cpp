@@ -1,5 +1,5 @@
 #include "h5_common.h"
-#include "serialization.h"
+#include "io/solver_result_io.h"
 
 #include <sstream>
 

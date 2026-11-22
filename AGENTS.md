@@ -19,6 +19,15 @@
 - New pipeline stages should also provide a thin CLI under `cli/<stage>/` following
   [cli/architecture.md](cli/architecture.md).
 
+## Directory Layout
+- Keep the root of `include/` strictly for shared, header-only pipeline data contracts
+  (`mesh_properties.h`, `free_charges.h`, `assembled_problem.h`, `solver_result.h`, and the
+  top-level `poisson_driver.h`).
+- Mirror every compiled module or subsystem 1-to-1 between `include/<module>/` and
+  `src/<module>/` (e.g., `importer/`, `amr/`, `common/`, `io/`, `blake3/`). Keep each
+  module's `architecture.md` alongside its `.cpp` files inside `src/<module>/`, and keep
+  private implementation headers inside `src/<module>/`.
+
 ## Core C++ Design Conventions
 These are the preferred patterns across the codebase (follow them by default unless a stage has a clear reason to diverge):
 - **Composition & drivers:** Prefer composing drivers and composite stages out of small, interchangeable module interfaces (typically injected via `std::shared_ptr<const T>`).
