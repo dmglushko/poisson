@@ -123,18 +123,18 @@ void check_refined(const MeshProperties& before, const RefinementResult& r, std:
                 if (a != f) k[b++] = mesh.elements[e].node[a];
             const Key sk = sorted_key(k);
             const bool shared = faces[sk] == 2;
-            const auto nb = mesh.neighbours[e][f];
-            neighbours_right = neighbours_right && nb.has_value() == shared;
-            if (!nb) continue;
-            neighbours_right = neighbours_right && *nb < mesh.elements.size() && *nb != e;
-            if (*nb >= mesh.elements.size()) continue;
+            const uint32_t nb = mesh.neighbours[e][f];
+            neighbours_right = neighbours_right && (nb != MeshProperties::no_neighbour) == shared;
+            if (nb == MeshProperties::no_neighbour) continue;
+            neighbours_right = neighbours_right && nb < mesh.elements.size() && nb != e;
+            if (nb >= mesh.elements.size()) continue;
             bool back_match = false;
             for (int nf = 0; nf < 4; ++nf) {
                 Key nk{};
                 for (int a = 0, b = 0; a < 4; ++a)
-                    if (a != nf) nk[b++] = mesh.elements[*nb].node[a];
+                    if (a != nf) nk[b++] = mesh.elements[nb].node[a];
                 if (sorted_key(nk) == sk) {
-                    back_match = mesh.neighbours[*nb][nf].has_value() && *mesh.neighbours[*nb][nf] == e;
+                    back_match = mesh.neighbours[nb][nf] == e;
                     break;
                 }
             }
@@ -222,7 +222,7 @@ void cycles(const Refiner& refiner, int count, bool jitter) {
                                     {Bc{MeshProperties::BcType::Dirichlet, 0, {}}, Bc{MeshProperties::BcType::Dirichlet, 1, {}},
                                      Bc{MeshProperties::BcType::Neumann, 0, {}}},
                                     materials, 0.5);
-    mesh.screened = true;
+    mesh.screened = false;   // the non-default value, so the "copied" check means something
     mesh.charges = {{{0.3, 0.3, 0.3}, -1}};
     if (jitter) {
         // Move the interior nodes by up to 0.15 h, the same way every run: an irregular mesh.

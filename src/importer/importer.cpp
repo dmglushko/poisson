@@ -478,7 +478,7 @@ void check_geometry(const fs::path& file, MeshProperties& mesh, const MeshReadSt
     std::sort(faces.begin(), faces.end(), [](const TetFace& a, const TetFace& b) { return a.face < b.face; });
 
     // After sorting, the two tets that share a face are next to each other.
-    mesh.neighbours.assign(mesh.elements.size(), {});
+    mesh.neighbours.assign(mesh.elements.size(), MeshProperties::no_neighbours);
     for (std::size_t i = 1; i < faces.size(); ++i) {
         if (faces[i].face != faces[i - 1].face) continue;
         const Face& face = faces[i].face;
@@ -545,10 +545,10 @@ void check_geometry(const fs::path& file, MeshProperties& mesh, const MeshReadSt
         while (!todo.empty()) {
             const uint32_t e = todo.back();
             todo.pop_back();
-            for (const auto& neighbour : mesh.neighbours[e])
-                if (neighbour && !reached[*neighbour]) {
-                    reached[*neighbour] = true;
-                    todo.push_back(*neighbour);
+            for (const uint32_t neighbour : mesh.neighbours[e])
+                if (neighbour != MeshProperties::no_neighbour && !reached[neighbour]) {
+                    reached[neighbour] = true;
+                    todo.push_back(neighbour);
                 }
         }
     }

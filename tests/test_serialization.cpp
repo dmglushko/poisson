@@ -117,10 +117,10 @@ MeshProperties make_sample_mesh() {
         {{0.1, 0.2, 0.3}, 1},
         {{0.1, 0.2, -0.5}, -3},
     };
-    mesh.screened = true;
+    mesh.screened = false;   // the non-default value, so the roundtrip check means something
     mesh.neighbours = {
-        {std::nullopt, std::nullopt, std::nullopt, 1u},
-        {std::nullopt, std::nullopt, std::nullopt, 0u},
+        {MeshProperties::no_neighbour, MeshProperties::no_neighbour, MeshProperties::no_neighbour, 1u},
+        {MeshProperties::no_neighbour, MeshProperties::no_neighbour, MeshProperties::no_neighbour, 0u},
     };
     return mesh;
 }
@@ -178,7 +178,7 @@ void test_mesh_roundtrip_and_determinism(const fs::path& dir) {
     poisson::io::write_mesh_properties(empty_file, empty);
     const MeshProperties empty_loaded = poisson::io::read_mesh_properties(empty_file);
     CHECK(empty_loaded.nodes.empty() && empty_loaded.elements.empty() && empty_loaded.materials.empty() &&
-          empty_loaded.charges.empty() && !empty_loaded.screened && empty_loaded.neighbours.empty());
+          empty_loaded.charges.empty() && empty_loaded.screened && empty_loaded.neighbours.empty());
 }
 
 void test_other_data_classes(const fs::path& dir) {

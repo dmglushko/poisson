@@ -52,7 +52,7 @@ void populate_neighbours(MeshProperties& mesh) {
         }
     }
     std::sort(all.begin(), all.end(), [](const TetFace& a, const TetFace& b) { return a.key < b.key; });
-    mesh.neighbours.assign(mesh.elements.size(), {});
+    mesh.neighbours.assign(mesh.elements.size(), MeshProperties::no_neighbours);
     for (std::size_t i = 1; i < all.size(); ++i)
         if (all[i].key == all[i - 1].key) {
             mesh.neighbours[all[i].element][all[i].local] = all[i - 1].element;
@@ -95,9 +95,9 @@ void test_locate_interior_boundary_and_outside() {
     CHECK_NEAR(warm->barycentric[0], 0.1, 1e-12);
     CHECK_NEAR(warm->barycentric[3], 0.4, 1e-12);
 
-    // Without mesh.neighbours populated, locate_near still succeeds via BVH fallback.
+    // With every face marked no_neighbour, locate_near still succeeds via BVH fallback.
     MeshProperties no_nb = mesh;
-    no_nb.neighbours.clear();
+    no_nb.neighbours.assign(mesh.elements.size(), MeshProperties::no_neighbours);
     const MeshLocator no_nb_locator(no_nb);
     const auto fallback = no_nb_locator.locate_near(target, 0);
     CHECK(fallback.has_value() && fallback->element == mesh.elements.size() - 1);
@@ -135,6 +135,7 @@ void test_sphere_and_box_queries() {
     single.nodes = {{0, 0, 0}, {1, 0, 0}, {0, 1, 0}, {0, 0, 1}};
     single.elements = {{{0, 1, 2, 3}, 0}};
     single.materials = {{"one", 1.0, 0.0, false, {}}};
+    single.neighbours = {MeshProperties::no_neighbours};
     const MeshLocator single_loc(single);
 
     const double exact_dist = 2.0 / std::sqrt(3.0);
@@ -214,9 +215,12 @@ void test_empty_and_bad_inputs() {
     std::swap(bad_vol.elements[0].node[0], bad_vol.elements[0].node[1]);
     CHECK_THROWS(std::invalid_argument, MeshLocator{bad_vol}, "tet 0 has volume");
     MeshProperties bad_nb = mesh;
-    bad_nb.neighbours.assign(mesh.elements.size(), {});
+    bad_nb.neighbours.assign(mesh.elements.size(), MeshProperties::no_neighbours);
     bad_nb.neighbours[0][0] = 99;
     CHECK_THROWS(std::invalid_argument, MeshLocator{bad_nb}, "names neighbour 99");
+    MeshProperties missing_nb = mesh;
+    missing_nb.neighbours.clear();
+    CHECK_THROWS(std::invalid_argument, MeshLocator{missing_nb}, "neighbours has 0 entries");
 }
 
 } // namespace

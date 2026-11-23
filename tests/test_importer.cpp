@@ -182,10 +182,10 @@ void test_small_files(const fs::path& dir) {
     CHECK((mesh.elements[0].node == std::array<uint32_t, 4>{0, 1, 2, 3}));
     CHECK((mesh.elements[1].node == std::array<uint32_t, 4>{1, 0, 2, 4}));   // reoriented
     CHECK(mesh.elements[0].material == 0 && mesh.elements[1].material == 1);
-    const std::optional<uint32_t> none;
+    constexpr uint32_t none = MeshProperties::no_neighbour;
     CHECK(mesh.neighbours.size() == 2);
-    CHECK((mesh.neighbours[0] == std::array<std::optional<uint32_t>, 4>{none, none, none, 1}));   // shared face is opposite node 3
-    CHECK((mesh.neighbours[1] == std::array<std::optional<uint32_t>, 4>{none, none, none, 0}));
+    CHECK((mesh.neighbours[0] == std::array<uint32_t, 4>{none, none, none, 1}));   // shared face is opposite node 3
+    CHECK((mesh.neighbours[1] == std::array<uint32_t, 4>{none, none, none, 0}));
     CHECK(mesh.materials.size() == 2);
     CHECK(mesh.materials[0].name == "siliconnitride" && mesh.materials[0].eps_r == 7.5);
     CHECK(mesh.materials[1].name == "vacuum" && mesh.materials[1].eps_r == 1.0);
@@ -428,13 +428,13 @@ void test_sample_files(const fs::path& msh, const fs::path& yaml, const fs::path
     CHECK(mesh.charges.size() == 40);
     std::size_t outer_faces = 0, mismatched = 0;
     for (uint32_t e = 0; e < mesh.elements.size(); ++e)
-        for (const auto& other : mesh.neighbours[e]) {
-            if (!other) {
+        for (const uint32_t other : mesh.neighbours[e]) {
+            if (other == MeshProperties::no_neighbour) {
                 ++outer_faces;
                 continue;
             }
-            const auto& back = mesh.neighbours[*other];
-            if (std::find(back.begin(), back.end(), std::optional<uint32_t>(e)) == back.end()) ++mismatched;
+            const auto& back = mesh.neighbours[other];
+            if (std::find(back.begin(), back.end(), e) == back.end()) ++mismatched;
         }
     CHECK(outer_faces == 4962);   // faces on the outside of the sample mesh
     CHECK(mismatched == 0);       // if a is a neighbour of b, b is a neighbour of a

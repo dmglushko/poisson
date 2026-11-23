@@ -20,5 +20,5 @@ Dependency rule: every pipeline stage (`importer`, `amr`, `assembly`, `solver`,
 - `tests/test_constants.cpp`: checks `poisson::constants` identities and solver-unit magnitudes.
 - `tests/test_quadrature.cpp`: monomial exactness up to degree 20 on tets and triangles.
 - `tests/test_locator.cpp`: cold and warm point location (interior, vertices, edges, faces,
-  outside, non-convex cavity/hole fallback, empty neighbours), exact sphere queries, box
+  outside, non-convex cavity/hole fallback, missing neighbours), exact sphere queries, box
   queries, and malformed mesh/query validation.

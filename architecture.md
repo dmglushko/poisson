@@ -108,25 +108,27 @@ struct MeshProperties {
         std::optional<double> voltage;            // prescribed potential [V]; empty if not prescribed
     };
 
-    struct Charge {                               // trapped charge
+    struct TrappedCharge {
         std::array<double, 3> position;           // x, y, z in nm
         int32_t               value;              // in elementary charges: +1 hole, -1 electron
     };
+
+    // neighbours entry for a face on the outside of the mesh.
+    static constexpr uint32_t no_neighbour = std::numeric_limits<uint32_t>::max();
+    static constexpr std::array<uint32_t, 4> no_neighbours{no_neighbour, no_neighbour, no_neighbour, no_neighbour};
 
     std::vector<std::array<double, 3>> nodes;               // nodes[id] = {x, y, z} in nm
     std::vector<Element>               elements;
     std::vector<BoundaryElement>       boundary_elements;
     std::vector<BoundaryCondition>     boundary_conditions;
     std::vector<Material>              materials;
-    std::vector<Charge>                charges;             // all trapped charges; grows after every batch
-    bool                               screened = false;    // true: solve screened Poisson (-div(eps_r grad u) + c u = f); false: unscreened (c = 0)
+    std::vector<TrappedCharge>         charges;             // all trapped charges; grows after every batch
+    bool                               screened = true;     // true: solve screened Poisson (-div(eps_r grad u) + c u = f); false: unscreened (c = 0)
 
-    // PROPOSED, not fully decided: the tets around each tet. neighbours[e][i] is the tet on
-    // the other side of the face opposite node i of element e, or empty if that face is on
-    // the outside of the mesh. Same index as elements.
-    // std::optional doubles the memory here (32 instead of 16 bytes per tet). If that turns
-    // out to matter, a plain uint32_t with a reserved "no neighbour" value may be better.
-    std::vector<std::array<std::optional<uint32_t>, 4>> neighbours;
+    // The tets around each tet. neighbours[e][i] is the tet on the other side of the face
+    // opposite node i of element e, or no_neighbour if that face is on the outside of the
+    // mesh. Same index as elements; always filled (by the Importer and every refiner).
+    std::vector<std::array<uint32_t, 4>> neighbours;
 };
 ```
 
@@ -277,4 +279,3 @@ Assembly, AnalyticalMaker and Ray Tracing.
   is a data class, so the Solution Builder returns it wrapped with its `Info`
   (`SolutionBuildResult { solution, info }`).
 - `Output`: contents not decided.
-- `neighbours` in `MeshProperties`: proposed, not decided.

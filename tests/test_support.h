@@ -140,7 +140,7 @@ inline MeshProperties cube_mesh(int n, std::array<uint16_t, 6> side_bc = {0, 0, 
     mesh.materials = std::move(materials);
     // Neighbours.
     std::map<std::array<uint32_t, 3>, std::pair<uint32_t, int>> seen;
-    mesh.neighbours.assign(mesh.elements.size(), {});
+    mesh.neighbours.assign(mesh.elements.size(), MeshProperties::no_neighbours);
     for (uint32_t e = 0; e < mesh.elements.size(); ++e)
         for (int f = 0; f < 4; ++f) {
             std::array<uint32_t, 3> key{};

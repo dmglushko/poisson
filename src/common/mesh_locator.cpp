@@ -106,16 +106,14 @@ MeshLocator::MeshLocator(const MeshProperties& mesh) : mesh_(&mesh) {
         if (!finite_vec(mesh.nodes[i]))
             throw std::invalid_argument("MeshLocator: node " + std::to_string(i) + " has non-finite coordinates");
 
-    if (!mesh.neighbours.empty()) {
-        if (mesh.neighbours.size() != n_tets)
-            throw std::invalid_argument("MeshLocator: neighbours has " + std::to_string(mesh.neighbours.size()) +
-                                        " entries for " + std::to_string(n_tets) + " tets");
-        for (std::size_t k = 0; k < n_tets; ++k)
-            for (const auto& nb : mesh.neighbours[k])
-                if (nb && *nb >= n_tets)
-                    throw std::invalid_argument("MeshLocator: tet " + std::to_string(k) + " names neighbour " +
-                                                std::to_string(*nb) + " out of range");
-    }
+    if (mesh.neighbours.size() != n_tets)
+        throw std::invalid_argument("MeshLocator: neighbours has " + std::to_string(mesh.neighbours.size()) +
+                                    " entries for " + std::to_string(n_tets) + " tets");
+    for (std::size_t k = 0; k < n_tets; ++k)
+        for (const uint32_t nb : mesh.neighbours[k])
+            if (nb != MeshProperties::no_neighbour && nb >= n_tets)
+                throw std::invalid_argument("MeshLocator: tet " + std::to_string(k) + " names neighbour " +
+                                            std::to_string(nb) + " out of range");
 
     if (n_tets == 0) return;
 
@@ -256,11 +254,9 @@ std::optional<MeshLocator::Location> MeshLocator::locate_near(const Vec3& x, uin
         throw std::invalid_argument("MeshLocator::locate_near: hint element " + std::to_string(hint_element) +
                                     " is out of range (" + std::to_string(mesh_->elements.size()) + " tets)");
 
-    if (mesh_->neighbours.empty()) return locate(x);
-
     const uint32_t max_steps = std::min<uint32_t>(256u, static_cast<uint32_t>(mesh_->elements.size()));
     uint32_t cur = hint_element;
-    std::optional<uint32_t> prev;
+    uint32_t prev = MeshProperties::no_neighbour;
     for (uint32_t step = 0; step < max_steps; ++step) {
         const auto lambda = barycentric(cur, x);
         int worst = 0;
@@ -269,10 +265,10 @@ std::optional<MeshLocator::Location> MeshLocator::locate_near(const Vec3& x, uin
         if (lambda[worst] >= -bary_tol) return Location{cur, lambda};
 
         // Step across the face opposite the most negative barycentric coordinate.
-        const auto next = mesh_->neighbours[cur][worst];
-        if (!next || (prev && *next == *prev)) break;   // hit boundary/hole or grazing 2-cycle: fall back to BVH
+        const uint32_t next = mesh_->neighbours[cur][worst];
+        if (next == MeshProperties::no_neighbour || next == prev) break;   // hit boundary/hole or grazing 2-cycle: fall back to BVH
         prev = cur;
-        cur = *next;
+        cur = next;
     }
     return locate(x);
 }

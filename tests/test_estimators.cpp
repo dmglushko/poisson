@@ -77,14 +77,14 @@ void test_natural_conditions() {
 void test_screening() {
     MeshProperties mesh = cube_mesh(2, {0, 0, 0, 0, 0, 0}, {{BcType::Dirichlet, 0, {}}}, {{"screened", 1, 0.5, false, {}}});
     const auto u = interpolate(mesh, [](const Vec3& p) { return p[0]; });
-    // Unscreened by default: c = 0, so f = 0 is exact and f = 4x is wrong.
-    CHECK(!mesh.screened);
-    CHECK_NEAR(total(ResidualEstimator(), mesh, input_for(u)), 0, 1e-12);
-    CHECK(total(ResidualEstimator(), mesh, input_for(u, [](const auto& x, uint32_t) { return 4 * x[0]; })) > 0.1);
-    // Screened enabled: c = 4, so f = 4x is exact and f = 0 is wrong.
-    mesh.screened = true;
+    // Screened by default: c = 4, so f = 4x is exact and f = 0 is wrong.
+    CHECK(mesh.screened);
     CHECK_NEAR(total(ResidualEstimator(), mesh, input_for(u, [](const auto& x, uint32_t) { return 4 * x[0]; })), 0, 1e-12);
     CHECK(total(ResidualEstimator(), mesh, input_for(u)) > 0.1);
+    // Screening disabled: c = 0, so f = 0 is exact and f = 4x is wrong.
+    mesh.screened = false;
+    CHECK_NEAR(total(ResidualEstimator(), mesh, input_for(u)), 0, 1e-12);
+    CHECK(total(ResidualEstimator(), mesh, input_for(u, [](const auto& x, uint32_t) { return 4 * x[0]; })) > 0.1);
 }
 
 // Two materials, eps 1 for x < 0.5 and 4 beyond. u with a kink at the interface and a

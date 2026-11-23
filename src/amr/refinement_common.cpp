@@ -179,7 +179,7 @@ void build_neighbours(MeshProperties& mesh) {
     for (uint32_t k = 0; k < mesh.elements.size(); ++k)
         for (uint8_t i = 0; i < 4; ++i) all.push_back({sorted(face_nodes(mesh.elements[k].node, i)), k, i});
     std::sort(all.begin(), all.end(), [](const TetFace& a, const TetFace& b) { return a.key < b.key; });
-    mesh.neighbours.assign(mesh.elements.size(), {});
+    mesh.neighbours.assign(mesh.elements.size(), MeshProperties::no_neighbours);
     for (std::size_t i = 1; i < all.size(); ++i)
         if (all[i].key == all[i - 1].key) {
             mesh.neighbours[all[i].element][all[i].local] = all[i - 1].element;

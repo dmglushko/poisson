@@ -115,18 +115,7 @@ void write_mesh_properties(const fs::path& file, const MeshProperties& mesh) {
     }
 
     {
-        std::vector<std::array<uint32_t, 4>> neighbours;
-        neighbours.reserve(mesh.neighbours.size());
-        for (const auto& nb : mesh.neighbours) {
-            std::array<uint32_t, 4> row{};
-            for (std::size_t i = 0; i < 4; ++i) {
-                if (nb[i] && *nb[i] == kNoneU32)
-                    fail(file, "neighbour index collides with sentinel UINT32_MAX");
-                row[i] = nb[i].value_or(kNoneU32);
-            }
-            neighbours.push_back(row);
-        }
-        write_dataset_2d(file, h5.id, "neighbours", neighbours);
+        write_dataset_2d(file, h5.id, "neighbours", mesh.neighbours);   // no_neighbour (UINT32_MAX) on disk too
     }
 
     h5.close_file_checked(file);
@@ -242,21 +231,13 @@ MeshProperties read_mesh_properties(const fs::path& file) {
     }
 
     {
-        const auto raw = read_dataset_2d<uint32_t, 4>(file, h5.id, "neighbours");
-        if (!raw.empty() && raw.size() != mesh.elements.size())
-            fail(file, "neighbours length must be 0 or match elements count");
-        mesh.neighbours.resize(raw.size());
-        for (std::size_t i = 0; i < raw.size(); ++i) {
-            for (std::size_t k = 0; k < 4; ++k) {
-                if (raw[i][k] == kNoneU32) {
-                    mesh.neighbours[i][k] = std::nullopt;
-                } else if (raw[i][k] >= mesh.elements.size()) {
-                    fail(file, "neighbours references out-of-range element index " + std::to_string(raw[i][k]));
-                } else {
-                    mesh.neighbours[i][k] = raw[i][k];
-                }
-            }
-        }
+        mesh.neighbours = read_dataset_2d<uint32_t, 4>(file, h5.id, "neighbours");
+        if (mesh.neighbours.size() != mesh.elements.size())
+            fail(file, "neighbours length must match elements count");
+        for (const auto& nb : mesh.neighbours)
+            for (const uint32_t k : nb)
+                if (k != MeshProperties::no_neighbour && k >= mesh.elements.size())
+                    fail(file, "neighbours references out-of-range element index " + std::to_string(k));
     }
 
     return mesh;
