@@ -30,8 +30,8 @@ public:
 private:
     double                exact_u(const std::array<double, 3>& x, std::size_t material) const override;
     std::array<double, 3> exact_grad(const std::array<double, 3>& x, std::size_t material) const override;
-    std::optional<MeshProperties::BoundaryCondition> condition_on(const std::array<std::array<double, 3>, 3>& triangle) const override;
-    bool fits_region(const std::array<std::array<double, 3>, 4>& tet, std::size_t material) const override;
+    std::vector<std::string> geometry_mismatches(const MeshProperties& mesh,
+                                                 const std::vector<std::optional<std::size_t>>& material) const override;
 
     Settings              settings_;
     std::array<double, 3> charge_position_{};   // as stored in .cha
@@ -66,8 +66,8 @@ public:
 private:
     double                exact_u(const std::array<double, 3>& x, std::size_t material) const override;
     std::array<double, 3> exact_grad(const std::array<double, 3>& x, std::size_t material) const override;
-    std::optional<MeshProperties::BoundaryCondition> condition_on(const std::array<std::array<double, 3>, 3>& triangle) const override;
-    bool fits_region(const std::array<std::array<double, 3>, 4>& tet, std::size_t material) const override;
+    std::vector<std::string> geometry_mismatches(const MeshProperties& mesh,
+                                                 const std::vector<std::optional<std::size_t>>& material) const override;
 
     Settings settings_;
     double   d_ = 0;                      // charge height as stored in .cha
@@ -101,8 +101,8 @@ public:
 private:
     double                exact_u(const std::array<double, 3>& x, std::size_t material) const override;
     std::array<double, 3> exact_grad(const std::array<double, 3>& x, std::size_t material) const override;
-    std::optional<MeshProperties::BoundaryCondition> condition_on(const std::array<std::array<double, 3>, 3>& triangle) const override;
-    bool fits_region(const std::array<std::array<double, 3>, 4>& tet, std::size_t material) const override;
+    std::vector<std::string> geometry_mismatches(const MeshProperties& mesh,
+                                                 const std::vector<std::optional<std::size_t>>& material) const override;
 
     Settings settings_;
     double   d_ = 0;

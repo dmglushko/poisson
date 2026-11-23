@@ -229,39 +229,36 @@ std::array<double, 3> DielectricInterfaceCase::exact_grad(const std::array<doubl
 
 // ---------------------------------------------------------------- geometry checks
 
-std::optional<MeshProperties::BoundaryCondition> GroundedBallImageCase::condition_on(const std::array<Vec3, 3>& triangle) const {
-    const double R = settings_.radius, r = radius_range(triangle).second;
-    if (r > R + 1e-9 * R || r < 0.5 * R) return std::nullopt;
-    return grounded;
+std::vector<std::string> GroundedBallImageCase::geometry_mismatches(const MeshProperties& mesh,
+                                                                    const std::vector<std::optional<std::size_t>>& material) const {
+    return spherical_geometry_mismatches(mesh, material, {"medium"}, {{0, settings_.radius}}, {{settings_.radius, grounded}});
 }
 
-bool GroundedBallImageCase::fits_region(const std::array<Vec3, 4>& tet, std::size_t) const {
-    return radius_range(tet).second <= settings_.radius * (1 + 1e-9);
-}
-
-std::optional<MeshProperties::BoundaryCondition> HalfSpaceImageCase::condition_on(const std::array<Vec3, 3>& triangle) const {
+std::vector<std::string> HalfSpaceImageCase::geometry_mismatches(const MeshProperties& mesh,
+                                                                 const std::vector<std::optional<std::size_t>>& material) const {
     const double W = settings_.half_width, H = settings_.height, tol = 1e-9 * std::max(W, H);
     const Vec3 lo{-W, -W, 0}, hi{W, W, H};
-    if (!inside_box(triangle, lo, hi, tol)) return std::nullopt;
-    const auto [axis, side] = box_face(triangle, lo, hi, tol);
-    if (axis < 0) return std::nullopt;
-    if (axis == 2 && side == 0) return settings_.plane == Plane::Dirichlet ? grounded : insulated;
-    return grounded;
+    const auto condition_on = [&](const std::array<Vec3, 3>& triangle) -> std::optional<MeshProperties::BoundaryCondition> {
+        if (!inside_box(triangle, lo, hi, tol)) return std::nullopt;
+        const auto [axis, side] = box_face(triangle, lo, hi, tol);
+        if (axis < 0) return std::nullopt;
+        if (axis == 2 && side == 0) return settings_.plane == Plane::Dirichlet ? grounded : insulated;
+        return grounded;
+    };
+    const auto fits = [&](const std::array<Vec3, 4>& tet, std::size_t) { return inside_box(tet, lo, hi, tol); };
+    return flat_geometry_mismatches(mesh, material, condition_on, fits);
 }
 
-bool HalfSpaceImageCase::fits_region(const std::array<Vec3, 4>& tet, std::size_t) const {
-    const double W = settings_.half_width, H = settings_.height;
-    return inside_box(tet, {-W, -W, 0}, {W, W, H}, 1e-9 * std::max(W, H));
-}
-
-std::optional<MeshProperties::BoundaryCondition> DielectricInterfaceCase::condition_on(const std::array<Vec3, 3>& triangle) const {
+std::vector<std::string> DielectricInterfaceCase::geometry_mismatches(const MeshProperties& mesh,
+                                                                      const std::vector<std::optional<std::size_t>>& material) const {
     const double W = settings_.half_width, H = settings_.half_height, tol = 1e-9 * std::max(W, H);
     const Vec3 lo{-W, -W, -H}, hi{W, W, H};
-    if (!inside_box(triangle, lo, hi, tol) || box_face(triangle, lo, hi, tol).first < 0) return std::nullopt;
-    return grounded;
-}
-
-bool DielectricInterfaceCase::fits_region(const std::array<Vec3, 4>& tet, std::size_t material) const {
-    const double W = settings_.half_width, H = settings_.half_height, tol = 1e-9 * std::max(W, H);
-    return material == 0 ? inside_box(tet, {-W, -W, 0}, {W, W, H}, tol) : inside_box(tet, {-W, -W, -H}, {W, W, 0}, tol);
+    const auto condition_on = [&](const std::array<Vec3, 3>& triangle) -> std::optional<MeshProperties::BoundaryCondition> {
+        if (!inside_box(triangle, lo, hi, tol) || box_face(triangle, lo, hi, tol).first < 0) return std::nullopt;
+        return grounded;
+    };
+    const auto fits = [&](const std::array<Vec3, 4>& tet, std::size_t m) {
+        return m == 0 ? inside_box(tet, {-W, -W, 0}, hi, tol) : inside_box(tet, lo, {W, W, 0}, tol);
+    };
+    return flat_geometry_mismatches(mesh, material, condition_on, fits);
 }

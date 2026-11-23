@@ -33,7 +33,7 @@ ErrorEvaluationResult ErrorEvaluator::evaluate(const MeshProperties& mesh, const
     const double r0 = settings_.exclusion_radius < 0 ? problem.default_exclusion_radius : settings_.exclusion_radius;
     const auto near_charge = [&](const std::array<double, 3>& x) {
         for (const auto& charge : problem.charges)
-            if (verification_detail::distance(x, charge.position) < r0) return true;
+            if (distance(x, charge.position) < r0) return true;
         return false;
     };
     const auto rule = tet_rule(settings_.quadrature_degree);
@@ -82,7 +82,13 @@ ErrorEvaluationResult ErrorEvaluator::evaluate(const MeshProperties& mesh, const
             const double ue = c.u(x, m);
             const auto ge = c.grad_u(x, m);
             if (!std::isfinite(ue) || !std::isfinite(ge[0]) || !std::isfinite(ge[1]) || !std::isfinite(ge[2])) {
-                ++info.excluded_points;   // exactly on a charge
+                // Only a point exactly on a charge (exclusion radius 0) may do this.
+                bool on_charge = false;
+                for (const auto& charge : problem.charges) on_charge = on_charge || verification_detail::distance(x, charge.position) == 0;
+                if (!on_charge)
+                    throw std::runtime_error("ErrorEvaluator: the exact solution of case '" + std::string(c.name()) +
+                                             "' is not finite at a quadrature point of tet " + std::to_string(e));
+                ++info.excluded_points;
                 continue;
             }
             double dg = 0, ge2 = 0;

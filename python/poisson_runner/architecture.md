@@ -32,8 +32,10 @@ result's `mesh` and `state` (the status is `result["mesh"].info["status"]`).
 ### Verification stages
 
 The verification cases live in C++ ([src/verification/architecture.md](../../src/verification/architecture.md));
-a Python `Case` only carries `name` and `params` and gives the C++ stages `case.spec()`
-(`{"name", "params"}`), which also puts every parameter into the request key.
+a Python `Case` only carries `name` and `params` (stored read-only, so its hash cannot
+change) and gives the C++ stages `case.spec()` (`{"name", "params"}`), which also puts every
+parameter into the request key. Equality and hashing use the normalised spec (`1 == 1.0`,
+`true != 1`).
 
 | Helper | Stage | Result |
 |---|---|---|

@@ -17,6 +17,7 @@ from __future__ import annotations
 import json
 from collections.abc import Mapping
 from dataclasses import dataclass, field
+from types import MappingProxyType
 from typing import Any
 
 from .hashing import normalize_integral_floats
@@ -41,6 +42,15 @@ def _plain(value: Any, where: str) -> Any:
     raise TypeError(f"{where}: {type(value).__name__} is not a valid case parameter")
 
 
+def _frozen(value: Any) -> Any:
+    """A read-only copy of plain parameters: mappings as MappingProxyType, lists as tuples."""
+    if isinstance(value, Mapping):
+        return MappingProxyType({k: _frozen(v) for k, v in value.items()})
+    if isinstance(value, (list, tuple)):
+        return tuple(_frozen(v) for v in value)
+    return value
+
+
 def _canonical(value: Any) -> str:
     """Canonical JSON for equality and hashing: integral floats (also -0.0) as ints, bools kept apart."""
     return json.dumps(normalize_integral_floats(value), sort_keys=True, separators=(",", ":"))
@@ -49,7 +59,10 @@ def _canonical(value: Any) -> str:
 @register_record("verification_case")
 @dataclass(frozen=True, eq=False)
 class Case:
-    """A verification case: its C++ name (e.g. `"planar_layers"`) and its parameters."""
+    """A verification case: its C++ name (e.g. `"planar_layers"`) and its parameters.
+
+    `params` is stored read-only (nested mappings and tuples); `spec()` gives the plain JSON form.
+    """
 
     name: str
     params: Mapping[str, Any] = field(default_factory=dict)
@@ -57,7 +70,8 @@ class Case:
     def __post_init__(self) -> None:
         if not isinstance(self.name, str) or not self.name:
             raise ValueError("Case needs a non-empty name")
-        object.__setattr__(self, "params", _plain(self.params, "params"))
+        # Read-only, so the hash cannot change after the case is put in a set or dict.
+        object.__setattr__(self, "params", _frozen(_plain(self.params, "params")))
 
     @classmethod
     def of(cls, name: str, **params: Any) -> Case:
@@ -86,7 +100,15 @@ class Case:
         return hash(_canonical(self.spec()))
 
     def __str__(self) -> str:
-        return f"{self.name}{json.dumps(self.params, sort_keys=True, separators=(',', ':'))}"
+        return f"{self.name}{json.dumps(self.spec()['params'], sort_keys=True, separators=(',', ':'))}"
+
+    def to_dict(self) -> dict[str, Any]:
+        """Saved form (`register_record`): plain JSON parameters."""
+        return self.spec()
+
+    @classmethod
+    def from_dict(cls, data: Mapping[str, Any]) -> Case:
+        return cls(data["name"], data.get("params", {}))
 
 
 def dirichlet(value: float) -> dict[str, Any]:

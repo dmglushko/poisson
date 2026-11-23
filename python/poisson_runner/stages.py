@@ -455,11 +455,35 @@ GMSH_ALGORITHMS = ("del3d", "front3d", "hxt", "mmg3d", "initial3d")
 # .geo commands that read other files. The cache hashes only the .geo itself, so a script
 # that loads anything else could be served a stale mesh.
 _GEO_EXTERNAL_RE = re.compile(r"\b(Include|Merge|ShapeFromFile|System|SystemCall|OnelabRun|Background\s+Mesh)\b")
-_GEO_COMMENT_RE = re.compile(r"/\*.*?\*/|//[^\n]*", re.DOTALL)
+
+
+def _geo_code(text: str) -> str:
+    """The .geo text with comments and string literals blanked out (a `//` inside a string is not a comment)."""
+    out: list[str] = []
+    i, n = 0, len(text)
+    while i < n:
+        c = text[i]
+        if c == '"':
+            j = i + 1
+            while j < n and text[j] != '"':
+                j += 2 if text[j] == "\\" else 1
+            out.append(" ")
+            i = j + 1
+        elif text.startswith("//", i):
+            j = text.find("\n", i)
+            i = n if j < 0 else j
+        elif text.startswith("/*", i):
+            j = text.find("*/", i + 2)
+            out.append(" ")
+            i = n if j < 0 else j + 2
+        else:
+            out.append(c)
+            i += 1
+    return "".join(out)
 
 
 def _check_self_contained_geo(path: Path) -> None:
-    text = _GEO_COMMENT_RE.sub(" ", path.read_text(encoding="utf-8", errors="replace"))
+    text = _geo_code(path.read_text(encoding="utf-8", errors="replace"))
     match = _GEO_EXTERNAL_RE.search(text)
     if match:
         raise ValueError(

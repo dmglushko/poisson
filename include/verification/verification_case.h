@@ -53,15 +53,6 @@ public:
     // if there is none.
     std::size_t material_index(std::string_view name) const;
 
-    // The condition the case puts on a boundary triangle with these vertices, or empty if the
-    // triangle does not lie on the case's boundary. A triangle on a sphere is classified by its
-    // vertices (which lie on the sphere, or inside it on a refined facet).
-    std::optional<MeshProperties::BoundaryCondition> expected_condition(const std::array<std::array<double, 3>, 3>& triangle) const;
-
-    // Whether a tet with these vertices lies in the region of problem().materials[material]
-    // (allowing the flat facets of a meshed sphere). Throws std::invalid_argument for a
-    // material index out of range.
-    bool fits(const std::array<std::array<double, 3>, 4>& tet, std::size_t material) const;
 
     // The .geo constants that set the mesh sizes, with their defaults in the generated script.
     static constexpr std::array<std::string_view, 5> mesh_size_constants{"h_max", "h_min", "h_charge", "r_fine", "r_coarse"};
@@ -73,12 +64,20 @@ protected:
 private:
     virtual double                exact_u(const std::array<double, 3>& x, std::size_t material) const = 0;
     virtual std::array<double, 3> exact_grad(const std::array<double, 3>& x, std::size_t material) const = 0;
-    virtual std::optional<MeshProperties::BoundaryCondition> condition_on(const std::array<std::array<double, 3>, 3>& triangle) const = 0;
-    virtual bool fits_region(const std::array<std::array<double, 3>, 4>& tet, std::size_t material) const = 0;
+    // Differences between where the mesh puts its tets and boundary conditions and where the
+    // case has them. `material[m]` is the case material of mesh material m, if any.
+    virtual std::vector<std::string> geometry_mismatches(const MeshProperties& mesh,
+                                                         const std::vector<std::optional<std::size_t>>& material) const = 0;
+
+    friend std::vector<std::string> mesh_mismatches(const MeshProperties& mesh, const VerificationCase& c);
 };
 
-// Differences between an imported mesh and the problem of `c`: screened flag, materials (by
-// name: eps_r, screening length, metal, voltage), trapped charges, the set of boundary
-// conditions, the condition of every boundary triangle where it lies, every tet inside its
-// material's region, and outer tet faces without a boundary condition. Empty when they match.
+// Differences between an imported mesh and the problem of `c`, empty when they match:
+// - the screened flag, every mesh material against the case material of its name (metal,
+//   voltage, and for dielectrics eps_r and screening length), the set of boundary
+//   conditions, and the trapped charges;
+// - geometry: every tet in its material's region and every boundary triangle carrying the
+//   condition the case has there (exactly on flat faces; on spheres see
+//   src/verification/architecture.md), every boundary triangle an outer face, and every
+//   outer face with a condition.
 std::vector<std::string> mesh_mismatches(const MeshProperties& mesh, const VerificationCase& c);

@@ -46,34 +46,36 @@ public:
     std::size_t material_index(std::string_view name) const;
 };
 
-std::optional<MeshProperties::BoundaryCondition> expected_condition(triangle) const;   // NVI
-bool fits(tet, material) const;                                                        // NVI
-
 std::vector<std::string> mesh_mismatches(const MeshProperties&, const VerificationCase&);
 ```
 
 - `u` and `grad_u` take the **material** of the point, not just its position: at an
   interface the potential is continuous but its gradient is not, and a faceted mesh of a
   curved interface puts some tets slightly on the other side. The formula of the tet's
-  material is used, evaluated where the point is.
+  material is used. In the spherical case it is evaluated at the radius clamped into the
+  layer (extending a strongly screened layer's exponentials past its edge would overflow).
 - Each case has a nested `Settings` validated in its constructor (`std::invalid_argument`,
   including a problem without a unique solution).
 - Charge positions are rounded to float32 in the constructor, so the formula, the `.cha`
   file and the imported mesh agree bit for bit.
 - `mesh_mismatches` compares an imported mesh with the case: the screened flag, every
-  material by name (metal, voltage, and for dielectrics `eps_r` and `screening_length`), the
-  set of boundary conditions, the trapped charges, and where things are:
-  - every boundary triangle has the condition the case puts there (`expected_condition`;
-    a triangle that is not on the case's boundary at all is reported too), so swapped end
-    conditions are caught;
-  - every tet lies in its material's region (`fits`), so a different layer thickness or
-    box size is caught;
-  - every outer tet face has a boundary condition.
-
-  Flat faces and interfaces are checked to `1e-9` of the case size. A meshed sphere is a
-  polyhedron inside the sphere whose vertices lie on it (or, after refinement, on its flat
-  facets), so radii are bounded exactly from above and only within half the neighbouring
-  layer from below; a triangle belongs to the nearer of the inner and outer spheres.
+  mesh material against the case material of its name (metal, voltage, and for dielectrics
+  `eps_r` and `screening_length`; a name can occur twice, e.g. `"gate 5V"` and `"gate 7V"`),
+  the set of boundary conditions, the trapped charges, and where things are (each case's
+  private `geometry_mismatches`), plus: every boundary triangle is an outer face and every
+  outer face has a boundary condition.
+  - **Flat cases** (planar layers, the image boxes) know exactly where each face and region
+    is, to `1e-9` of the case size: every boundary triangle has the condition the case puts
+    there (one off the case's boundary is reported too), every tet lies in its material's
+    region. Swapped end conditions, other layer thicknesses and box sizes are caught.
+  - **Spheres.** A meshed sphere is a polyhedron inside the sphere: some vertices lie on it,
+    others (after AMR, on flat facets) inside. So: every tet vertex within its layer's outer
+    radius, and at most half the layer below under its inner radius; some vertex of every
+    layer on its outer radius (a too small domain is caught); every boundary triangle carries
+    a condition the case puts on a sphere it does not extend past, and some triangle with
+    each sphere's condition reaches that sphere (swapped inner/outer conditions are caught).
+    No triangle is classified by its own radius, so refined meshes whose new boundary nodes
+    lie inside the sphere still match.
 
 ## Cases
 
@@ -120,8 +122,11 @@ The coefficients follow from one small dense system (Eigen full-pivot LU, rows e
 Uniqueness is decided structurally: two solutions differ by a field of zero energy, so by a
 constant, which a Dirichlet end, a Robin end with `alpha > 0`, a metal at a voltage or a
 screened dielectric forces to 0. Without any of them (for example Neumann everywhere and no
-screening) the case is rejected as having no unique solution. Otherwise the system is solved
-and a large residual is reported as too ill-conditioned. A layer with `k L < 1` uses the
+screening) the case is rejected as having no unique solution. When screening alone fixes it,
+the constant is set by terms of order `(L / lambda)^2` (L the whole problem's size); below
+`1e-10` they are lost to rounding, so such a case is rejected as too ill-conditioned rather
+than solved wrongly. Otherwise the system is solved, and a large residual or an estimated
+reciprocal condition number below `1e-12` is reported as too ill-conditioned. A layer with `k L < 1` uses the
 centred pair `cosh(k t)`, `sinh(k t) / k` (`t` from the layer middle; `1`, `t` at `k = 0`)
 instead of the two exponentials, which become indistinguishable as `k -> 0`; this keeps
 very weak screening (screening length far above the size) accurate. A metal layer at an end needs Neumann 0 on that end face, and two
@@ -205,6 +210,8 @@ Rules:
   boundary or interface)`. With radius 0 in a case with charges, a warning says that the
   H1 and nodal numbers depend on where points fall (the exact H1 seminorm is infinite).
 - A field with a non-finite value is rejected (`std::invalid_argument`), as by the sampler.
+  An exact value that is not finite anywhere but exactly on a charge is an error
+  (`std::runtime_error`), not silently skipped.
 
 ## Point sampling
 

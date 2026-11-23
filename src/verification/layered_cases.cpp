@@ -228,16 +228,25 @@ void solve(std::string_view where, Geometry geometry, std::vector<SolvedLayer>& 
     const auto fixes = [](const MeshProperties::BoundaryCondition& c) {
         return c.type == BcType::Dirichlet || (c.type == BcType::Robin && *c.alpha > 0);
     };
-    bool unique = false;
+    bool fixed = false;        // by a condition or a metal voltage
+    double screening = 0;      // max (k L)^2 over the dielectrics, L the size of the whole problem
+    const double size = layers.back().end - layers.front().start;
     for (auto& layer : layers) {
         if (layer.metal && layer.voltage) layer.c[0] = *layer.voltage;
-        unique = unique || (layer.metal && layer.voltage) || (!layer.metal && layer.k > 0);
+        fixed = fixed || (layer.metal && layer.voltage);
+        if (!layer.metal) screening = std::max(screening, layer.k * size * layer.k * size);
     }
-    if (start_condition && !layers.front().metal) unique = unique || fixes(*start_condition);
-    if (!layers.back().metal) unique = unique || fixes(end_condition);
-    if (!unique)
+    if (start_condition && !layers.front().metal) fixed = fixed || fixes(*start_condition);
+    if (!layers.back().metal) fixed = fixed || fixes(end_condition);
+    if (!fixed && screening == 0)
         invalid(where, "the problem has no unique solution (nothing fixes the potential: add a Dirichlet or Robin "
                        "condition, a metal with a voltage, or screening)");
+    // Fixed by screening alone, the constant is set by terms of order (L / lambda)^2 relative
+    // to the rest; below 1e-10 they are lost to rounding (the basis degenerates to the
+    // unscreened one), so the answer would be wrong while looking accurate.
+    if (!fixed && screening < 1e-10)
+        invalid(where, "the problem is too ill-conditioned to solve accurately: only screening fixes the potential, and "
+                       "the screening length is too large for the size (L / lambda)^2 = " + number(screening));
 
     if (unknowns == 0) return;
     if (static_cast<int>(equations.size()) != unknowns)
@@ -258,13 +267,16 @@ void solve(std::string_view where, Geometry geometry, std::vector<SolvedLayer>& 
             rhs(row) /= norm;
         }
     }
-    const Eigen::VectorXd z = matrix.fullPivLu().solve(rhs);
-    // Unique, but possibly too ill-conditioned for double precision (e.g. a screening length
-    // many orders of magnitude above the size with no other condition fixing the potential).
+    // Unique, but possibly too ill-conditioned for double precision: when only a screening
+    // length far above the size fixes the potential, the constant is set by a term of order
+    // (L / lambda)^2 and is lost to rounding although the residual stays small.
+    const Eigen::FullPivLU<Eigen::MatrixXd> lu(matrix);
+    const Eigen::VectorXd z = lu.solve(rhs);
     const double residual = (matrix * z - rhs).cwiseAbs().maxCoeff();
     const double scale = matrix.cwiseAbs().rowwise().sum().maxCoeff() * z.cwiseAbs().maxCoeff() + rhs.cwiseAbs().maxCoeff();
-    if (!z.allFinite() || !(residual <= 1e-9 * scale))
-        invalid(where, "the problem is too ill-conditioned to solve accurately");
+    if (!z.allFinite() || !(residual <= 1e-9 * scale) || !(lu.rcond() >= 1e-12))
+        invalid(where, "the problem is too ill-conditioned to solve accurately (estimated reciprocal condition number " +
+                           number(lu.rcond()) + ")");
 
     for (auto& layer : layers) {
         if (layer.metal) {
@@ -499,59 +511,52 @@ SphericalLayersCase::SphericalLayersCase(Settings settings) : settings_(std::mov
     problem_.geometry = geo.str();
 }
 
+// A meshed sphere puts points of a layer slightly outside it (a shell tet on a flat facet of
+// its inner sphere). There the layer's formula is taken at the nearest radius of the layer:
+// extending it instead would overflow for strong screening (exp(k * depth)).
 double SphericalLayersCase::exact_u(const std::array<double, 3>& x, std::size_t material) const {
-    const double r = std::sqrt(x[0] * x[0] + x[1] * x[1] + x[2] * x[2]);
-    return layer_value(Geometry::Spherical, solution_->layers[material], r);
+    const auto& layer = solution_->layers[material];
+    const double r = std::clamp(radius(x), layer.start, layer.end);
+    return layer_value(Geometry::Spherical, layer, r);
 }
 
 std::array<double, 3> SphericalLayersCase::exact_grad(const std::array<double, 3>& x, std::size_t material) const {
-    const double r = std::sqrt(x[0] * x[0] + x[1] * x[1] + x[2] * x[2]);
-    if (r == 0) return {0, 0, 0};
-    const double d = layer_derivative(Geometry::Spherical, solution_->layers[material], r) / r;
+    const auto& layer = solution_->layers[material];
+    const double distance = radius(x);
+    if (distance == 0) return {0, 0, 0};
+    const double d = layer_derivative(Geometry::Spherical, layer, std::clamp(distance, layer.start, layer.end)) / distance;
     return {d * x[0], d * x[1], d * x[2]};
 }
 
 // ---------------------------------------------------------------- geometry checks
 
-std::optional<MeshProperties::BoundaryCondition> PlanarLayersCase::condition_on(const std::array<Vec3, 3>& triangle) const {
+std::vector<std::string> PlanarLayersCase::geometry_mismatches(const MeshProperties& mesh,
+                                                               const std::vector<std::optional<std::size_t>>& material) const {
     const double L = solution_->layers.back().end, W = settings_.width, H = settings_.height;
     const double tol = 1e-9 * std::max({L, W, H});
-    if (on_plane(triangle, 0, 0, tol)) return settings_.left;
-    if (on_plane(triangle, 0, L, tol)) return settings_.right;
-    if (!inside_box(triangle, {0, 0, 0}, {L, W, H}, tol) || box_face(triangle, {0, 0, 0}, {L, W, H}, tol).first < 0)
-        return std::nullopt;
-    return MeshProperties::BoundaryCondition{BcType::Neumann, 0, std::nullopt};
+    const auto condition_on = [&](const std::array<Vec3, 3>& triangle) -> std::optional<MeshProperties::BoundaryCondition> {
+        if (on_plane(triangle, 0, 0, tol)) return settings_.left;
+        if (on_plane(triangle, 0, L, tol)) return settings_.right;
+        if (!inside_box(triangle, {0, 0, 0}, {L, W, H}, tol) || box_face(triangle, {0, 0, 0}, {L, W, H}, tol).first < 0)
+            return std::nullopt;
+        return MeshProperties::BoundaryCondition{BcType::Neumann, 0, std::nullopt};
+    };
+    const auto fits = [&](const std::array<Vec3, 4>& tet, std::size_t m) {
+        const auto& layer = solution_->layers[m];
+        return inside_box(tet, {layer.start, 0, 0}, {layer.end, W, H}, tol);
+    };
+    return flat_geometry_mismatches(mesh, material, condition_on, fits);
 }
 
-bool PlanarLayersCase::fits_region(const std::array<Vec3, 4>& tet, std::size_t material) const {
-    const auto& layer = solution_->layers[material];
-    const double tol = 1e-9 * std::max({solution_->layers.back().end, settings_.width, settings_.height});
-    return inside_box(tet, {layer.start, 0, 0}, {layer.end, settings_.width, settings_.height}, tol);
-}
-
-// A meshed sphere is a polyhedron inside the sphere: its vertices lie on the sphere (or on a
-// refined facet, inside it). So radii are bounded above exactly, and below only by half the
-// neighbouring layers.
-std::optional<MeshProperties::BoundaryCondition> SphericalLayersCase::condition_on(const std::array<Vec3, 3>& triangle) const {
-    const auto& layers = solution_->layers;
-    const double R = layers.back().end, tol = 1e-9 * R;
-    const double r = radius_range(triangle).second;
-    if (r > R + tol) return std::nullopt;
-    if (settings_.inner) {
-        const double a = settings_.inner_radius;
-        if (r < a - tol) return std::nullopt;
-        if (r < a + 0.5 * (layers.front().end - a)) return settings_.inner;
+std::vector<std::string> SphericalLayersCase::geometry_mismatches(const MeshProperties& mesh,
+                                                                  const std::vector<std::optional<std::size_t>>& material) const {
+    std::vector<std::string> names;
+    std::vector<std::pair<double, double>> layers;
+    for (std::size_t m = 0; m < solution_->layers.size(); ++m) {
+        names.push_back(problem_.materials[m].name);
+        layers.emplace_back(solution_->layers[m].start, solution_->layers[m].end);
     }
-    if (r >= R - 0.5 * (R - layers.back().start)) return settings_.outer;
-    return std::nullopt;
-}
-
-bool SphericalLayersCase::fits_region(const std::array<Vec3, 4>& tet, std::size_t material) const {
-    const auto& layers = solution_->layers;
-    const auto& layer = layers[material];
-    const double tol = 1e-9 * layers.back().end;
-    const auto [lo, hi] = radius_range(tet);
-    double slack = 0.5 * (layer.end - layer.start);
-    if (material > 0) slack = std::min(slack, 0.5 * (layers[material - 1].end - layers[material - 1].start));
-    return hi <= layer.end + tol && (layer.start == 0 || lo >= layer.start - slack);
+    std::vector<SphereBoundary> spheres{{solution_->layers.back().end, settings_.outer}};
+    if (settings_.inner) spheres.push_back({settings_.inner_radius, *settings_.inner});
+    return spherical_geometry_mismatches(mesh, material, names, layers, spheres);
 }

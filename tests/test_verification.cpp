@@ -3,6 +3,7 @@
 // generated input files import into a mesh that matches the case (with gmsh, if installed);
 // the error evaluator and the sampler measure the right thing.
 
+#include "amr/red_green_refinement.h"
 #include "common/constants.h"
 #include "importer/importer.h"
 #include "verification/case_inputs.h"
@@ -292,8 +293,11 @@ void test_spherical() {
         const double r = 2, h = 1e-6;
         CHECK_NEAR(c.u({0, 0, r}, 0), c.u({0, 0, r}, 1), 1e-12);
         CHECK_NEAR(3 * c.grad_u({0, 0, r}, 0)[2], 9 * c.grad_u({0, 0, r}, 1)[2], 1e-10);
-        const double du = (c.u({0, 0, 5 + h}, 1) - c.u({0, 0, 5 - h}, 1)) / (2 * h);
+        // One-sided inside the shell: beyond r = 5 the formula is held at its edge value.
+        const double du = (c.u({0, 0, 5}, 1) - c.u({0, 0, 5 - 2 * h}, 1)) / (2 * h);
         CHECK_NEAR(9 * du + 0.3 * c.u({0, 0, 5}, 1), 0.01, 1e-7);
+        CHECK_NEAR(9 * c.grad_u({0, 0, 5}, 1)[2] + 0.3 * c.u({0, 0, 5}, 1), 0.01, 1e-12);
+        CHECK(c.u({0, 0, 5.5}, 1) == c.u({0, 0, 5}, 1));
         CHECK_PDE(c, {0.5, 0.6, 0.7}, 0);
         CHECK_PDE(c, {2.5, 2.0, 1.0}, 1);
     }
@@ -362,6 +366,9 @@ void test_regressions() {
         CHECK_NEAR(du, shell.grad_u({0, 0, 1.5}, 0)[2], 1e-5);
         PlanarLayersCase almost_linear({{dielectric("doped", 1, 1, 1e11)}, dirichlet(0), dirichlet(1), 1, 1, true});
         CHECK_NEAR(almost_linear.u({0.25, 0, 0}, 0), 0.25, 1e-12);
+        // Screening this weak as the only thing fixing the potential is rejected, not solved wrongly.
+        CHECK_INVALID(PlanarLayersCase({{dielectric("a", 1, 1, 1e8), dielectric("b", 1, 1)}, neumann(-1), neumann(1), 1, 1, true}),
+                      "too ill-conditioned");
         // Still rejected when nothing fixes the potential.
         CHECK_INVALID(SphericalLayersCase({{dielectric("shell", 1, eps)}, 1, neumann(0), neumann(1), 0, true}), "no unique solution");
     }
@@ -477,6 +484,11 @@ void test_meshes(const fs::path& dir) {
         CHECK_NEAR(s.info.max_error, 1e-3, 1e-12);
         CHECK_NEAR(s.info.metal_potential_error, 1e-3, 1e-12);
         CHECK(s.info.h1_error < 1e-10);
+        // A gradient error of 1e-3 in x over the measured 2.5 nm^3 gives exactly that H1 error.
+        std::vector<double> tilted = exact.u;
+        for (std::size_t n = 0; n < tilted.size(); ++n) tilted[n] += 1e-3 * mesh.nodes[n][0];
+        const ErrorEvaluationResult t = evaluator.evaluate(mesh, tilted, c);
+        CHECK_NEAR(t.info.h1_error, 1e-3 * std::sqrt(2.5), 1e-12);
 
         // Sampling along the slab gives the exact values back.
         const FieldSampler sampler;
@@ -515,6 +527,60 @@ void test_meshes(const fs::path& dir) {
         mesh.boundary_elements.pop_back();
         CHECK(has(c, "1 outer tet faces have no boundary condition"));
     }
+    // Spheres: a too small ball is caught; uniform AMR refinement (new boundary nodes on
+    // flat facets, inside the sphere) still matches; swapped shell conditions are caught.
+    {
+        SphericalLayersCase big({{dielectric("ball", 10, 3.9, 2)}, 0, std::nullopt, dirichlet(1), 0, true});
+        SphericalLayersCase small({{dielectric("ball", 6, 3.9, 2)}, 0, std::nullopt, dirichlet(1), 0, true});
+        const MeshProperties mesh = mesh_case(small, dir, "small_ball", 2);
+        CHECK_MATCHES(mesh, small);
+        const auto mismatches = mesh_mismatches(mesh, big);
+        bool reach = false, sphere = false;
+        for (const auto& m : mismatches) {
+            reach = reach || m.find("reaches radius") != std::string::npos;
+            sphere = sphere || m.find("lies on the sphere of radius 10") != std::string::npos;
+        }
+        CHECK(reach && sphere);
+
+        SphericalLayersCase shell({{dielectric("shell", 0.5, 3.9)}, 10, dirichlet(0), dirichlet(1), 0, true});
+        const MeshProperties coarse = mesh_case(shell, dir, "thin_shell", 3);
+        CHECK_MATCHES(coarse, shell);
+        std::vector<uint32_t> all(coarse.elements.size());
+        for (uint32_t e = 0; e < all.size(); ++e) all[e] = e;
+        MeshProperties refined = RedGreenRefinement().refine(coarse, all).mesh;
+        refined = RedGreenRefinement().refine(refined, std::vector<uint32_t>{0, 1, 2, 3, 4, 5, 6, 7}).mesh;
+        CHECK_MATCHES(refined, shell);
+        SphericalLayersCase swapped({{dielectric("shell", 0.5, 3.9)}, 10, dirichlet(1), dirichlet(0), 0, true});
+        CHECK(!mesh_mismatches(coarse, swapped).empty());
+        CHECK(!mesh_mismatches(refined, swapped).empty());
+
+        // Strong screening: points of the shell on facets of the inner sphere stay finite.
+        SphericalLayersCase strong({{dielectric("core", 2, 3.9), dielectric("skin", 2, 3.9, 1e-5)}, 0, std::nullopt, dirichlet(1), 0, true});
+        const MeshProperties m = mesh_case(strong, dir, "strong", 1);
+        const ErrorEvaluationResult e = evaluator.evaluate(m, interpolate_exact(m, strong).u, strong);
+        CHECK(e.info.excluded_points == 0 && std::isfinite(e.info.l2_error));
+    }
+    // Two volumes of one material name with different voltages are both checked.
+    {
+        PlanarLayersCase c({{dielectric("a", 1, 2), metal("gate", 0.5, 5.0), dielectric("b", 1, 3)}, dirichlet(0), dirichlet(1), 1, 1, true});
+        MeshProperties mesh = mesh_case(c, dir, "gate", 0.5);
+        CHECK_MATCHES(mesh, c);
+        const std::size_t gate = c.material_index("gate");
+        uint16_t index = 0;
+        while (mesh.materials[index].name != "gate") ++index;
+        MeshProperties::Material other = mesh.materials[index];
+        other.voltage = 7.0;
+        mesh.materials.push_back(other);
+        for (auto& element : mesh.elements)
+            if (element.material == index) {
+                element.material = static_cast<uint16_t>(mesh.materials.size() - 1);
+                break;
+            }
+        bool voltage = false;
+        for (const auto& m : mesh_mismatches(mesh, c)) voltage = voltage || m.find("has voltage 7") != std::string::npos;
+        CHECK(voltage && gate == 1);
+    }
+
     // A thin layer still gets every face and volume named.
     {
         PlanarLayersCase c({{dielectric("a", 1, 2), dielectric("film", 1e-3, 5), dielectric("b", 1, 3)}, dirichlet(0), dirichlet(1), 1, 1, true});

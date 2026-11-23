@@ -8,6 +8,8 @@
 #include <algorithm>
 #include <array>
 #include <cmath>
+#include <functional>
+#include <optional>
 #include <utility>
 #include <string>
 #include <string_view>
@@ -104,6 +106,29 @@ std::pair<double, double> radius_range(const std::array<Vec3, N>& points) {
     }
     return {lo, hi};
 }
+
+// Geometry checks shared by the cases (see mesh_mismatches). Flat cases know exactly where
+// each face and region is: `condition_on` gives the condition the case puts on a triangle
+// (empty if the triangle is not on the case's boundary), `fits` whether a tet lies in a
+// material's region.
+std::vector<std::string> flat_geometry_mismatches(
+    const MeshProperties& mesh, const std::vector<std::optional<std::size_t>>& material,
+    const std::function<std::optional<BoundaryCondition>(const std::array<Vec3, 3>&)>& condition_on,
+    const std::function<bool(const std::array<Vec3, 4>&, std::size_t)>& fits);
+
+// Concentric cases. A meshed sphere is a polyhedron inside the sphere: some of its vertices
+// lie on the sphere, the others (refined facets) inside it. So every vertex must be within
+// its layer's outer radius, and some vertex of every layer, and of every sphere's boundary
+// triangles, must lie on that radius. Below, a tet may reach half the layer under it.
+struct SphereBoundary {
+    double            radius;
+    BoundaryCondition condition;
+};
+std::vector<std::string> spherical_geometry_mismatches(const MeshProperties& mesh,
+                                                       const std::vector<std::optional<std::size_t>>& material,
+                                                       const std::vector<std::string>& names,
+                                                       const std::vector<std::pair<double, double>>& layers,
+                                                       const std::vector<SphereBoundary>& spheres);
 
 inline double distance(const Vec3& a, const Vec3& b) {
     return std::sqrt((a[0] - b[0]) * (a[0] - b[0]) + (a[1] - b[1]) * (a[1] - b[1]) + (a[2] - b[2]) * (a[2] - b[2]));

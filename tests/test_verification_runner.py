@@ -189,6 +189,11 @@ class VerificationRunnerTest(unittest.TestCase):
 
         with self.assertRaisesRegex(ValueError, "Include"):
             run_experiment(lambda run: gmsh_mesh(run, main, h_max=0.5), cache=self.cache)
+        # A "//" inside a string is not a comment.
+        url = self.tmp / "url.geo"
+        url.write_text('Printf("http://example.invalid"); Include "box.geo";\n', encoding="utf-8")
+        with self.assertRaisesRegex(ValueError, "Include"):
+            run_experiment(lambda run: gmsh_mesh(run, url, h_max=0.5), cache=self.cache)
         report = run_experiment(lambda run: gmsh_mesh(run, commented, h_max=0.5), cache=self.cache)
         self.assertTrue(report.branches[0].ok)
 
@@ -211,7 +216,14 @@ class VerificationRunnerTest(unittest.TestCase):
         self.assertFalse((self.tmp / "case.yaml").exists())
 
     def test_case_record(self) -> None:
-        self.assertEqual(Case.of("x", a=(1, 2)).params, {"a": [1, 2]})
+        self.assertEqual(Case.of("x", a=(1, 2)).spec()["params"], {"a": [1, 2]})
+        # Parameters are read-only, so a case cannot change its hash inside a set.
+        layered = Case.of("x", layers=[{"thickness": 1}])
+        members = {layered}
+        with self.assertRaises(TypeError):
+            layered.params["layers"][0]["thickness"] = 2   # type: ignore[index]
+        self.assertIn(layered, members)
+        self.assertEqual(Case.from_dict(layered.to_dict()), layered)
         self.assertEqual(hash(Case.of("x", a=1, b=2)), hash(Case("x", {"b": 2, "a": 1})))
         self.assertFalse(Case.of("x", screened=False).screened)
         with self.assertRaises(TypeError):

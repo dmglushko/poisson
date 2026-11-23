@@ -1,6 +1,8 @@
 #include "case_support.h"
 
+#include <algorithm>
 #include <charconv>
+#include <cstdint>
 #include <cmath>
 #include <sstream>
 #include <stdexcept>
@@ -129,6 +131,112 @@ std::string geo_physicals(const char* kind, const std::vector<PhysicalGroup>& gr
         out << "};\n";
     }
     return out.str();
+}
+
+std::vector<std::string> flat_geometry_mismatches(
+    const MeshProperties& mesh, const std::vector<std::optional<std::size_t>>& material,
+    const std::function<std::optional<BoundaryCondition>(const std::array<Vec3, 3>&)>& condition_on,
+    const std::function<bool(const std::array<Vec3, 4>&, std::size_t)>& fits) {
+    std::vector<std::string> out;
+    uint64_t misplaced = 0;
+    std::size_t first = 0;
+    for (std::size_t e = 0; e < mesh.elements.size(); ++e) {
+        const auto& element = mesh.elements[e];
+        if (element.material >= material.size() || !material[element.material]) continue;
+        std::array<Vec3, 4> tet;
+        for (int i = 0; i < 4; ++i) tet[i] = mesh.nodes[element.node[i]];
+        if (!fits(tet, *material[element.material]) && misplaced++ == 0) first = e;
+    }
+    if (misplaced > 0)
+        out.push_back(std::to_string(misplaced) + " tets lie outside the region of their material (first: tet " +
+                      std::to_string(first) + ", material '" + mesh.materials[mesh.elements[first].material].name + "')");
+
+    uint64_t off_boundary = 0, wrong = 0;
+    std::string first_off, first_wrong;
+    for (std::size_t b = 0; b < mesh.boundary_elements.size(); ++b) {
+        const auto& element = mesh.boundary_elements[b];
+        if (element.boundary_condition >= mesh.boundary_conditions.size()) continue;
+        std::array<Vec3, 3> triangle;
+        for (int i = 0; i < 3; ++i) triangle[i] = mesh.nodes[element.node[i]];
+        const auto expected = condition_on(triangle);
+        if (!expected) {
+            if (off_boundary++ == 0) first_off = std::to_string(b);
+            continue;
+        }
+        const auto& actual = mesh.boundary_conditions[element.boundary_condition];
+        if (!same_condition(actual, *expected) && wrong++ == 0)
+            first_wrong = "triangle " + std::to_string(b) + " has '" + surface_name(actual) + "', the case '" +
+                          surface_name(*expected) + "'";
+    }
+    if (off_boundary > 0)
+        out.push_back(std::to_string(off_boundary) + " boundary triangles do not lie on the boundary of the case (first: triangle " +
+                      first_off + ")");
+    if (wrong > 0) out.push_back(std::to_string(wrong) + " boundary triangles have the wrong condition (first: " + first_wrong + ")");
+    return out;
+}
+
+std::vector<std::string> spherical_geometry_mismatches(const MeshProperties& mesh,
+                                                       const std::vector<std::optional<std::size_t>>& material,
+                                                       const std::vector<std::string>& names,
+                                                       const std::vector<std::pair<double, double>>& layers,
+                                                       const std::vector<SphereBoundary>& spheres) {
+    std::vector<std::string> out;
+    double outer = 0;
+    for (const auto& [start, end] : layers) outer = std::max(outer, end);
+    const double tol = 1e-9 * outer;
+
+    // Tets: within their layer's outer radius; at most half the layer below under its inner
+    // radius (a cavity: half its radius); some vertex of each layer on its outer radius.
+    std::vector<double> reach(layers.size(), -1);
+    uint64_t misplaced = 0;
+    std::size_t first = 0;
+    for (std::size_t e = 0; e < mesh.elements.size(); ++e) {
+        const auto& element = mesh.elements[e];
+        if (element.material >= material.size() || !material[element.material]) continue;
+        const std::size_t m = *material[element.material];
+        std::array<Vec3, 4> tet;
+        for (int i = 0; i < 4; ++i) tet[i] = mesh.nodes[element.node[i]];
+        const auto [lo, hi] = radius_range(tet);
+        const auto [start, end] = layers[m];
+        const double below = m > 0 ? 0.5 * (layers[m - 1].second - layers[m - 1].first) : 0.5 * start;
+        reach[m] = std::max(reach[m], hi);
+        if ((hi > end + tol || lo < start - below) && misplaced++ == 0) first = e;
+    }
+    if (misplaced > 0)
+        out.push_back(std::to_string(misplaced) + " tets lie outside the region of their material (first: tet " +
+                      std::to_string(first) + ", material '" + mesh.materials[mesh.elements[first].material].name + "')");
+    for (std::size_t m = 0; m < layers.size(); ++m)
+        if (reach[m] >= 0 && reach[m] < layers[m].second - tol)
+            out.push_back("material '" + names[m] + "' reaches radius " + number(reach[m]) + " instead of " +
+                          number(layers[m].second));
+
+    // Boundary triangles: a condition the case puts on a sphere the triangle does not extend
+    // past; and for every sphere, some triangle with its condition reaching its radius.
+    std::vector<double> sphere_reach(spheres.size(), -1);
+    uint64_t wrong = 0;
+    std::string first_wrong;
+    for (std::size_t b = 0; b < mesh.boundary_elements.size(); ++b) {
+        const auto& element = mesh.boundary_elements[b];
+        if (element.boundary_condition >= mesh.boundary_conditions.size()) continue;
+        const auto& actual = mesh.boundary_conditions[element.boundary_condition];
+        std::array<Vec3, 3> triangle;
+        for (int i = 0; i < 3; ++i) triangle[i] = mesh.nodes[element.node[i]];
+        const double r = radius_range(triangle).second;
+        bool ok = false;
+        for (std::size_t s = 0; s < spheres.size(); ++s)
+            if (same_condition(actual, spheres[s].condition) && r <= spheres[s].radius + tol) {
+                ok = true;
+                sphere_reach[s] = std::max(sphere_reach[s], r);
+            }
+        if (!ok && wrong++ == 0)
+            first_wrong = "triangle " + std::to_string(b) + " has '" + surface_name(actual) + "' at radius " + number(r);
+    }
+    if (wrong > 0) out.push_back(std::to_string(wrong) + " boundary triangles have the wrong condition (first: " + first_wrong + ")");
+    for (std::size_t s = 0; s < spheres.size(); ++s)
+        if (sphere_reach[s] < spheres[s].radius - tol)
+            out.push_back("no boundary triangle with '" + surface_name(spheres[s].condition) + "' lies on the sphere of radius " +
+                          number(spheres[s].radius));
+    return out;
 }
 
 }   // namespace verification_detail
