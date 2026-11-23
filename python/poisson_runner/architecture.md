@@ -83,7 +83,9 @@ as a `Case` on load). Comparing a solution with the case's exact solution waits 
   all downstream stages still get cache hits.
 - **Safety:** Validates request JSON schema, `output_specs`, and recorded `size_bytes` on hit
   (with optional full digest verification via `Cache(verify_hashes=True)`), detects mid-run
-  input/binary drift before publishing, and supports three cross-process locking modes via
+  input/binary drift before publishing (by file signature; inputs that are cache objects,
+  which other processes touch for LRU or re-publish with identical content, only by presence
+  and size), and supports three cross-process locking modes via
   `Cache(lock_mode=...)` or `POISSON_CACHE_LOCK_MODE`:
   - `"flock"` *(default locally)*: POSIX `fcntl.flock` on `.cache.lock` and `leases/` (auto-falls back
     to `"lockfile"` if the filesystem returns `ENOSYS`/`EOPNOTSUPP`/`ENOLCK`). The lock mode is

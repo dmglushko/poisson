@@ -547,5 +547,69 @@ print(f"{{1000 + count}};delftblue")
         self.assertIn("/results/exp/1002", lines[2])
 
 
+    def test_shared_cached_input_touched_by_another_process_mid_stage(self) -> None:
+        # Shard A runs a slow stage on a cached object while shard B gets a cache hit on the
+        # stage that produced it (which touches the object for LRU) and re-publishes the same
+        # content. Neither may make A believe its input changed.
+        cache_root = self.tmp / "shared_cache"
+        started = self.tmp / "started"
+        producer = _write_executable(
+            self.tmp / "producer",
+            """
+import sys
+open(sys.argv[sys.argv.index("--out") + 1], "w").write("shared")
+""",
+        )
+        slow = _write_executable(
+            self.tmp / "slow",
+            f"""
+import pathlib, sys, time
+args = sys.argv
+pathlib.Path({str(started)!r}).write_text("x")
+time.sleep(1.0)
+open(args[args.index("--out") + 1], "w").write(open(args[args.index("--in") + 1]).read() + "!")
+""",
+        )
+        script = self.tmp / "shared_experiment.py"
+        script.write_text(
+            textwrap.dedent(
+                f"""
+                import sys
+                sys.path.insert(0, {str(REPO_ROOT / "python")!r})
+                from poisson_runner import Cache, Stage, run_experiment
+                produce = Stage(name="produce", executable={str(producer)!r},
+                                build_command=lambda call: [str(call.executable), "--out", str(call.outputs["out"])],
+                                output_specs={{"out": ".txt"}})
+                consume = Stage(name="consume", executable={str(slow)!r},
+                                build_command=lambda call: [str(call.executable), "--in", str(call.inputs["x"].path),
+                                                            "--out", str(call.outputs["out"])],
+                                output_specs={{"out": ".txt"}})
+                cache = Cache({str(cache_root)!r}, lock_mode="lockfile")
+                if sys.argv[1] == "consume":
+                    report = run_experiment(lambda run: run.run_stage(consume, inputs={{"x": run.run_stage(produce)}}), cache=cache)
+                else:
+                    mode = "refresh" if sys.argv[1] == "refresh" else None
+                    report = run_experiment(lambda run: run.run_stage(produce), cache=cache, cache_mode=mode)
+                sys.exit(0 if all(b.ok for b in report.branches) else 1)
+                """
+            ),
+            encoding="utf-8",
+        )
+        env = {**os.environ, "POISSON_BUILD_DIR": os.environ.get("POISSON_BUILD_DIR", "")}
+        consumer = subprocess.Popen([sys.executable, str(script), "consume"], env=env, stderr=subprocess.PIPE, text=True)
+        try:
+            deadline = time.monotonic() + 30
+            while not started.exists() and time.monotonic() < deadline:
+                time.sleep(0.02)
+            self.assertTrue(started.exists(), "the slow stage never started")
+            for mode in ("hit", "refresh"):   # a lookup touching the object; a re-publication of it
+                other = subprocess.run([sys.executable, str(script), mode], env=env, capture_output=True, text=True)
+                self.assertEqual(other.returncode, 0, other.stderr)
+            self.assertEqual(consumer.wait(timeout=30), 0, consumer.stderr.read() if consumer.stderr else "")
+        finally:
+            if consumer.poll() is None:
+                consumer.kill()
+                consumer.wait()
+
 if __name__ == "__main__":
     unittest.main()

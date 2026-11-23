@@ -584,7 +584,15 @@ class RunContext:
                 return self._ephemeral_artifacts(stage, output_paths, m.info, m.execution)
 
             # Refuse to publish under a stale key if an input or the binary changed mid-run.
+            # A cache object is named by its content, but other processes touch it (LRU) or
+            # re-publish identical content, which changes its mtime, ctime or inode; for those
+            # only its presence and size are checked.
+            objects_dir = self.cache.objects_dir.resolve()
             for p, before in pre_signatures.items():
+                if Path(before[0]).parent == objects_dir:
+                    if not p.is_file() or p.stat().st_size != before[2]:
+                        raise RuntimeError(f"Cache object '{p}' disappeared while stage '{stage.name}' was running")
+                    continue
                 if not p.is_file() or file_signature(p) != before:
                     raise RuntimeError(
                         f"File '{p}' changed while stage '{stage.name}' was running; "
