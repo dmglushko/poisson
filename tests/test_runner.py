@@ -138,6 +138,18 @@ class RunnerTestSuite(unittest.TestCase):
             self.assertEqual(h5["electrons/energy"].shape, (1,))
             self.assertAlmostEqual(float(h5["electrons/energy"][0]), 500.0)
 
+        with h5py.File(mesh_art.path, "r") as h5:
+            self.assertEqual(int(h5.attrs["screened"]), 1)   # screening is on by default
+
+        # Turning screening off is a different request with its own result.
+        unscreened = run_experiment(
+            lambda run: run.import_mesh(self.mesh_file, materials=[self.mat_file], charges=self.cha_file, screening=False),
+            cache=cache,
+        ).branches[0].result
+        self.assertNotEqual(unscreened.content_id, mesh_art.content_id)
+        with h5py.File(unscreened.path, "r") as h5:
+            self.assertEqual(int(h5.attrs["screened"]), 0)
+
         # Second run hits cache immediately without re-executing poisson_import.
         r2 = run_experiment(pipe, cache=cache)
         self.assertEqual(r2.cache_hits, 2)

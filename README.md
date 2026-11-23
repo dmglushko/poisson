@@ -8,7 +8,8 @@ The high-level data flow, data classes, and stage contracts are described in
 [architecture.md](architecture.md). So far the data classes, the Importer
 ([src/importer/architecture.md](src/importer/architecture.md)), shared geometry/quadrature
 primitives ([src/common/architecture.md](src/common/architecture.md)), adaptive mesh
-refinement ([src/amr/architecture.md](src/amr/architecture.md)), stage CLIs & deterministic
+refinement ([src/amr/architecture.md](src/amr/architecture.md)), verification cases with
+exact solutions ([src/verification/architecture.md](src/verification/architecture.md)), stage CLIs & deterministic
 HDF5 serialization ([cli/architecture.md](cli/architecture.md)), and the Python caching/compare
 runner ([python/poisson_runner/architecture.md](python/poisson_runner/architecture.md)) are
 implemented.
@@ -72,6 +73,28 @@ def analysis(run, b):                        # once per successful saved branch,
     ref = saved.match(b, mesh="fine.msh")    # same choices except `mesh`
     return {"same_mesh": b["mesh"].content_id == ref["mesh"].content_id}
 evaluate(saved, analysis).save_csv("results/sweep_analysis.csv")
+```
+
+Check results against exact solutions (needs `gmsh`; see
+[src/verification/architecture.md](src/verification/architecture.md) for the cases and their
+parameters):
+
+```python
+from poisson_runner import Case, compare, dirichlet, run_experiment
+
+slab = Case.of("planar_layers",
+               layers=[{"name": "oxide", "thickness": 1, "eps_r": 3.9},
+                       {"name": "si", "thickness": 2, "eps_r": 11.7, "screening_length": 0.5}],
+               left=dirichlet(0), right=dirichlet(1))
+
+def convergence(run):
+    h = compare("h", [0.4, 0.2, 0.1])
+    mesh = run.case_mesh(slab, h_max=h)            # poisson_case -> gmsh -> poisson_import
+    solution = run.exact_field(slab, mesh)         # stand-in until the solver stage exists
+    errors = run.verify(slab, mesh, solution)      # norms in errors.info: l2_error, h1_error, ...
+    return {"mesh": mesh, "solution": solution, "case": slab}
+
+run_experiment(convergence).save_csv("convergence.csv")   # columns verify.l2_error, ...
 ```
 
 Manage the scratch cache from the command line:

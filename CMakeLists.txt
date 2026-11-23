@@ -95,9 +95,23 @@ target_include_directories(poisson_amr PUBLIC include)
 target_link_libraries(poisson_amr PUBLIC poisson_common)
 target_compile_options(poisson_amr PRIVATE -Wall -Wextra -Wpedantic)
 
+# Exact solutions of verification cases, their input files, and error evaluation.
+add_library(poisson_verification STATIC
+    src/verification/case_support.cpp
+    src/verification/verification_case.cpp
+    src/verification/layered_cases.cpp
+    src/verification/image_cases.cpp
+    src/verification/case_inputs.cpp
+    src/verification/error_evaluator.cpp
+    src/verification/field_sampler.cpp
+)
+target_include_directories(poisson_verification PUBLIC include)
+target_link_libraries(poisson_verification PUBLIC poisson_common PRIVATE Eigen3::Eigen)
+target_compile_options(poisson_verification PRIVATE -Wall -Wextra -Wpedantic)
+
 # ---------------------------------------------------------------- Core C++ umbrella library
 add_library(poisson INTERFACE)
-target_link_libraries(poisson INTERFACE poisson_common poisson_importer poisson_amr Eigen3::Eigen)
+target_link_libraries(poisson INTERFACE poisson_common poisson_importer poisson_amr poisson_verification Eigen3::Eigen)
 
 # ---------------------------------------------------------------- Stage HDF5/JSON serialization library
 # Split into one translation unit per data type so each stage CLI binary only pulls in the
@@ -110,6 +124,7 @@ add_library(poisson_io STATIC
     src/io/assembled_problem_io.cpp
     src/io/solver_result_io.cpp
     src/io/amr_io.cpp
+    src/io/verification_io.cpp
 )
 target_include_directories(poisson_io PUBLIC include)
 target_include_directories(poisson_io PRIVATE ${HDF5_INCLUDE_DIRS})
@@ -129,6 +144,13 @@ target_include_directories(poisson_adapt PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")
 target_link_libraries(poisson_adapt PRIVATE poisson_amr poisson_io)
 target_compile_options(poisson_adapt PRIVATE -Wall -Wextra -Wpedantic)
 
+foreach(name case sample diff)
+    add_executable(poisson_${name} cli/verification/poisson_${name}.cpp)
+    target_include_directories(poisson_${name} PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")
+    target_link_libraries(poisson_${name} PRIVATE poisson_verification poisson_io)
+    target_compile_options(poisson_${name} PRIVATE -Wall -Wextra -Wpedantic)
+endforeach()
+
 # ---------------------------------------------------------------- Tests
 enable_testing()
 
@@ -144,6 +166,11 @@ foreach(name constants quadrature locator marking estimators refiners adapter)
     target_compile_options(test_${name} PRIVATE -Wall -Wextra -Wpedantic)
     add_test(NAME ${name} COMMAND test_${name})
 endforeach()
+
+add_executable(test_verification tests/test_verification.cpp)
+target_link_libraries(test_verification PRIVATE poisson)
+target_compile_options(test_verification PRIVATE -Wall -Wextra -Wpedantic)
+add_test(NAME verification COMMAND test_verification)
 
 add_executable(test_serialization tests/test_serialization.cpp)
 target_link_libraries(test_serialization PRIVATE poisson poisson_io poisson_blake3_static ${HDF5_LIBRARIES})

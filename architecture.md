@@ -261,6 +261,14 @@ quadrature rules on tetrahedra and triangles (`quadrature.h`) and a BVH + neighb
 spatial lookup index over `MeshProperties` (`mesh_locator.h`). Described in
 [src/common/architecture.md](src/common/architecture.md).
 
+### Verification
+
+Not a pipeline stage: cases with a known exact solution (geometry, materials, boundary
+conditions, charges and formula in one C++ class), the CLIs that turn a case into input
+files and its exact solution, and the error of a nodal field against it
+(`include/verification/`, `src/verification/`). Described in
+[src/verification/architecture.md](src/verification/architecture.md).
+
 ### Driver (placeholder)
 
 `PoissonDriver` (`include/poisson_driver.h`) is a placeholder header sketching the top-level

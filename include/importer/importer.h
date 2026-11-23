@@ -36,10 +36,22 @@ struct FreeChargesImportResult {
 // files). Things that are suspicious but usable are recorded in result.info.warnings.
 class Importer {
 public:
+    struct Settings {
+        // Copied into MeshProperties::screened: false solves the unscreened equation (c = 0)
+        // even where a material has a screening length.
+        bool screened = true;
+    };
+
+    Importer() = default;
+    explicit Importer(Settings settings) : settings_(settings) {}
+
+    const Settings& settings() const { return settings_; }
+
     // mesh_file:      Gmsh 2.2 ASCII mesh (.msh / .msh2) with tetrahedra, boundary triangles
     //                 and $PhysicalNames.
-    // material_files: material .yaml or .mat files; eps_r and conductor type are assigned to
-    //                 the volume with the same name.
+    // material_files: material .yaml or .mat files; eps_r, screening length and conductor
+    //                 type are assigned to the volume with the same name. A .yaml file may
+    //                 hold several materials, separated by "---" lines.
     // charges_file:   initial trapped charges (.cha); optional.
     MeshImportResult import_mesh(const std::filesystem::path& mesh_file,
                                  const std::vector<std::filesystem::path>& material_files = {},
@@ -47,4 +59,7 @@ public:
 
     // primaries_file: primary electrons (.pri).
     FreeChargesImportResult import_free_charges(const std::filesystem::path& primaries_file) const;
+
+private:
+    Settings settings_{};
 };

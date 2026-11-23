@@ -324,6 +324,72 @@ void test_small_files(const fs::path& dir) {
                             .info.warnings, "no potential is prescribed anywhere"));
     CHECK(!has_warning(imported.info.warnings, "no potential") && !has_warning(imported.info.warnings, "pieces"));
 
+    // Robin surfaces: "R<alpha>" (g = 0) and "R<alpha>,<g>". A Robin condition with alpha > 0
+    // fixes the potential; alpha = 0 is the same as Neumann (a warning); alpha < 0 is invalid.
+    {
+        const auto robin = [&](const std::string& name) {
+            return importer.import_mesh(write_file(dir, "robin.msh", replaced(neumann_only, "\"D0\"", "\"" + name + "\"")));
+        };
+        const MeshImportResult r1 = robin("R0.5");
+        CHECK(r1.mesh.boundary_conditions[1].type == MeshProperties::BcType::Robin);
+        CHECK(r1.mesh.boundary_conditions[1].alpha == 0.5 && r1.mesh.boundary_conditions[1].value == 0.0);
+        CHECK(!has_warning(r1.info.warnings, "no potential is prescribed anywhere"));
+        const MeshImportResult r2 = robin("R2.5e-1,-0.125");
+        CHECK(r2.mesh.boundary_conditions[1].alpha == 0.25 && r2.mesh.boundary_conditions[1].value == -0.125);
+        const MeshImportResult r0 = robin("R0");
+        CHECK(has_warning(r0.info.warnings, "alpha = 0, which is the same as Neumann"));
+        CHECK(has_warning(r0.info.warnings, "no potential is prescribed anywhere"));
+        CHECK_THROWS(robin("R-1"), "alpha must not be negative");
+        CHECK_THROWS(robin("R1,"), "is not a boundary condition");
+        CHECK_THROWS(robin("Rx"), "is not a boundary condition");
+    }
+
+    // Screening: on by default, off through Importer::Settings. With screening on, a screened
+    // dielectric fixes the potential even without a Dirichlet or Robin condition.
+    {
+        const fs::path neumann_mesh = write_file(dir, "neumann.msh", neumann_only);
+        const fs::path screened_material = write_file(
+            dir, "screened.yaml", "name: siliconnitride\ndielectric:\n    epsilon_r: 7.5\n    screening_length: 2.5 nm\n");
+        const MeshImportResult on = importer.import_mesh(neumann_mesh, {screened_material});
+        CHECK(on.mesh.screened && on.mesh.materials[0].screening_length == 2.5);
+        CHECK(!has_warning(on.info.warnings, "no potential is prescribed anywhere"));
+        const Importer unscreened(Importer::Settings{.screened = false});
+        const MeshImportResult off = unscreened.import_mesh(neumann_mesh, {screened_material});
+        CHECK(!off.mesh.screened && off.mesh.materials[0].screening_length == 2.5);
+        CHECK(has_warning(off.info.warnings, "no potential is prescribed anywhere"));
+        CHECK(importer.settings().screened && !unscreened.settings().screened);
+
+        const auto length_of = [&](const std::string& value) {
+            const fs::path file = write_file(dir, "length.yaml", "name: siliconnitride\ndielectric: {epsilon_r: 7.5, screening_length: " + value + "}\n");
+            return importer.import_mesh(mesh_file, {file}).mesh.materials[0].screening_length;
+        };
+        CHECK(length_of("3") == 3.0);
+        CHECK(std::abs(length_of("4 A") - 0.4) < 1e-15 && std::abs(length_of("2e-9 m") - 2.0) < 1e-12);
+        CHECK_THROWS(length_of("3 eV"), "unknown unit 'eV'");
+        CHECK_THROWS(length_of("-1"), "must not be negative");
+        CHECK_THROWS(length_of("long"), "screening_length is not a number");
+        CHECK_THROWS(length_of("1e300 m"), "screening_length is too large");
+    }
+
+    // Several materials in one .yaml file, one YAML document each.
+    {
+        const fs::path two = write_file(dir, "two.yaml",
+                                        "---\nname: siliconnitride\ndielectric:\n    epsilon_r: 7.5\n"
+                                        "---  # the second material\nname: vacuum\ndielectric:\n    epsilon_r: 1.5\n");
+        const MeshImportResult both = importer.import_mesh(mesh_file, {two});
+        CHECK(both.mesh.materials[0].eps_r == 7.5 && both.mesh.materials[1].eps_r == 1.5);
+        CHECK(both.info.warnings.size() == 1);   // only the reoriented tet
+        CHECK_THROWS(importer.import_mesh(mesh_file, {write_file(dir, "dup.yaml", small_material + "---\n" + small_material)}),
+                     "'siliconnitride' is given more than once");
+        CHECK_THROWS(importer.import_mesh(mesh_file, {write_file(dir, "nameless.yaml", small_material + "---\ndensity: 1\n")}),
+                     "nameless.yaml:9: the material file has no 'name'");
+    }
+
+    // Voltages in volume names may use scientific notation.
+    CHECK(voltage_of("metal 1.5e-3V").voltage == 1.5e-3 && voltage_of("metal 1.5e-3V").name == "metal");
+    CHECK(voltage_of("metal -2E+1V").voltage == -20.0);
+    CHECK(voltage_of("metal .5V").voltage == 0.5);
+
     // Two tets that share no face: the mesh is in two pieces.
     std::string two_pieces = replaced(small_mesh, "$Nodes\n5", "$Nodes\n8\n60 5 0 0\n70 6 0 0\n80 5 1 0");
     two_pieces = replaced(two_pieces, "50 0 0 -1", "50 5 0 1");
@@ -384,7 +450,7 @@ void test_small_files(const fs::path& dir) {
                  "epsilon_r is not a number");
     CHECK_THROWS(importer.import_mesh(mesh_file, {write_file(dir, "c.yaml", replaced(small_material, "7.5", "-1"))}),
                  "must be positive");
-    CHECK_THROWS(importer.import_mesh(mesh_file, {material_file, material_file}), "more than one file");
+    CHECK_THROWS(importer.import_mesh(mesh_file, {material_file, material_file}), "is given more than once");
     CHECK_THROWS(importer.import_mesh(mesh_file, {}, write_file(dir, "short.cha", std::string(15, '\0'))),
                  "not a multiple of 16");
     // Any charge value is accepted; zero is only a warning.

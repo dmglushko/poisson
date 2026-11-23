@@ -259,11 +259,12 @@ def make_import_mesh_stage(build_dir: Path | str | None = None) -> Stage:
         name="import_mesh",
         binary="poisson_import",
         input_flags={"mesh": "--mesh", "materials": "--material", "charges": "--charges"},
+        setting_flags={"screening": "--screening"},
         output_flags={"out": "--out"},
         output_specs={"out": ".h5"},
         info_flag="--info-out",
         build_dir=build_dir,
-        version="import_mesh_v1",
+        version="import_mesh_v2",
     )
 
 
@@ -315,9 +316,14 @@ def import_mesh(
     *,
     materials: Sequence[Artifact | str | os.PathLike[str]] = (),
     charges: Artifact | str | os.PathLike[str] | None = None,
+    screening: bool = True,
     **options: Any,
 ) -> Artifact:
-    """Run the cached `poisson_import --mesh` stage and return the `MeshProperties` Artifact."""
+    """Run the cached `poisson_import --mesh` stage and return the `MeshProperties` Artifact.
+
+    `screening=False` imports the mesh unscreened (`MeshProperties::screened = false`), so the
+    screened term is dropped even where a material has a screening length.
+    """
     stage = run.get_stage("import_mesh", make_import_mesh_stage)
 
     mat_pairs = []
@@ -329,7 +335,7 @@ def import_mesh(
     mat_pairs.sort(key=lambda item: (item[0], item[1], item[2]))
 
     inputs: dict[str, Any] = {"mesh": mesh_file}
-    settings: dict[str, Any] = {}
+    settings: dict[str, Any] = {"screening": "on" if screening else "off"}
     if mat_pairs:
         inputs["materials"] = [item[3] for item in mat_pairs]
         settings["material_formats"] = [item[1] for item in mat_pairs]
@@ -374,4 +380,278 @@ def adapt_mesh(
         inputs["state"] = state
     result = run.run_stage(stage, inputs=inputs, settings=config, **options)
     assert isinstance(result, dict)
+    return result
+
+
+# ---------------------------------------------------------------------------------------------
+# Verification: case inputs -> gmsh -> import, the exact solution on a mesh, point samples,
+# and error norms against a case (src/verification/architecture.md). A case is anything with
+# `spec()` (the `{"name", "params"}` JSON the C++ stages read) and `screened`, normally a
+# `poisson_runner.Case`.
+# ---------------------------------------------------------------------------------------------
+
+
+def make_case_inputs_stage(build_dir: Path | str | None = None) -> Stage:
+    """`poisson_case` input mode: outputs `geometry` (.geo), `materials` (.yaml), `charges` (.cha)."""
+    return Stage.from_cli(
+        name="case_inputs",
+        binary="poisson_case",
+        config_flag="--config",
+        output_flags={"geometry": "--geo-out", "materials": "--materials-out", "charges": "--charges-out"},
+        output_specs={"geometry": ".geo", "materials": ".yaml", "charges": ".cha"},
+        info_flag="--info-out",
+        build_dir=build_dir,
+        version="case_inputs_v1",
+    )
+
+
+def make_exact_field_stage(build_dir: Path | str | None = None) -> Stage:
+    """`poisson_case` exact mode: the exact potential at every node of `mesh`, as a NodalField."""
+    return Stage.from_cli(
+        name="exact_field",
+        binary="poisson_case",
+        input_flags={"mesh": "--mesh"},
+        config_flag="--config",
+        output_flags={"out": "--out"},
+        output_specs={"out": ".h5"},
+        info_flag="--info-out",
+        build_dir=build_dir,
+        version="exact_field_v1",
+    )
+
+
+def make_sample_stage(build_dir: Path | str | None = None) -> Stage:
+    """`poisson_sample`: a nodal field (and optionally a case's exact solution) at chosen points."""
+    return Stage.from_cli(
+        name="sample_field",
+        binary="poisson_sample",
+        input_flags={"mesh": "--mesh", "field": "--field"},
+        config_flag="--config",
+        output_flags={"out": "--out"},
+        output_specs={"out": ".h5"},
+        info_flag="--info-out",
+        build_dir=build_dir,
+        version="sample_field_v1",
+    )
+
+
+def make_verify_stage(build_dir: Path | str | None = None) -> Stage:
+    """`poisson_diff`: error norms of a nodal field against a case (in the info), per-tet/node errors (.h5)."""
+    return Stage.from_cli(
+        name="verify",
+        binary="poisson_diff",
+        input_flags={"mesh": "--mesh", "field": "--field"},
+        config_flag="--config",
+        output_flags={"out": "--out"},
+        output_specs={"out": ".h5"},
+        info_flag="--info-out",
+        build_dir=build_dir,
+        version="verify_v1",
+    )
+
+
+GMSH_ALGORITHMS = ("del3d", "front3d", "hxt", "mmg3d", "initial3d")
+
+# .geo commands that read other files. The cache hashes only the .geo itself, so a script
+# that loads anything else could be served a stale mesh.
+_GEO_EXTERNAL_RE = re.compile(r"\b(Include|Merge|ShapeFromFile|System|SystemCall|OnelabRun|Background\s+Mesh)\b")
+_GEO_COMMENT_RE = re.compile(r"/\*.*?\*/|//[^\n]*", re.DOTALL)
+
+
+def _check_self_contained_geo(path: Path) -> None:
+    text = _GEO_COMMENT_RE.sub(" ", path.read_text(encoding="utf-8", errors="replace"))
+    match = _GEO_EXTERNAL_RE.search(text)
+    if match:
+        raise ValueError(
+            f"{path}: the .geo uses '{match.group(1)}', which reads another file; gmsh_mesh caches by the .geo "
+            "text alone, so it only accepts self-contained scripts"
+        )
+
+
+def make_gmsh_stage(build_dir: Path | str | None = None) -> Stage:
+    """Mesh a `.geo` script with the system `gmsh` into a Gmsh 2.2 ASCII `.msh` (the importer's format).
+
+    Always first order, single-threaded (`-nt 1`, so the same input gives the same mesh) and
+    `-format msh22`. Settings: `h_max`, `h_min`, `h_charge`, `r_fine`, `r_coarse` (set as .geo
+    constants with `-setnumber`), `algorithm` (`-algo`), `optimize` (`-optimize`),
+    `optimize_netgen` (`-optimize_netgen`), `random_factor` (`-rand`).
+    """
+    del build_dir   # gmsh is a system binary
+    gmsh = shutil.which("gmsh")
+    if gmsh is None:
+        raise FileNotFoundError("gmsh not found on PATH; it is needed to mesh verification cases")
+
+    def build(call: StageCall) -> list[str]:
+        s = call.settings
+        cmd = [str(call.executable)]
+        for name in ("h_max", "h_min", "h_charge", "r_fine", "r_coarse"):
+            if s.get(name) is not None:
+                cmd += ["-setnumber", name, repr(float(s[name]))]
+        cmd.append(str(call.inputs["geometry"].path))   # type: ignore[union-attr]
+        cmd += ["-3", "-format", "msh22", "-order", "1", "-nt", "1"]
+        if s.get("algorithm") is not None:
+            cmd += ["-algo", str(s["algorithm"])]
+        if s.get("optimize"):
+            cmd.append("-optimize")
+        if s.get("optimize_netgen"):
+            cmd.append("-optimize_netgen")
+        if s.get("random_factor") is not None:
+            cmd += ["-rand", repr(float(s["random_factor"]))]
+        cmd += ["-o", str(call.outputs["out"])]
+        return cmd
+
+    return Stage(
+        name="gmsh",
+        build_command=build,
+        executable=Path(gmsh).resolve(),
+        output_specs={"out": ".msh"},
+        version="gmsh_v1",
+    )
+
+
+def case_inputs(run: RunContext, case: Any, **options: Any) -> dict[str, Artifact]:
+    """Run `poisson_case` for `case`: returns `{"geometry", "materials", "charges"}`."""
+    stage = run.get_stage("case_inputs", make_case_inputs_stage)
+    result = run.run_stage(stage, settings={"case": case.spec()}, **options)
+    assert isinstance(result, dict)
+    return result
+
+
+def gmsh_mesh(
+    run: RunContext,
+    geometry: Artifact | str | os.PathLike[str],
+    *,
+    h_max: float = 1.0,
+    h_min: float | None = None,
+    h_charge: float | None = None,
+    r_fine: float | None = None,
+    r_coarse: float | None = None,
+    algorithm: str | None = None,
+    optimize: bool = False,
+    optimize_netgen: bool = False,
+    random_factor: float | None = None,
+    **options: Any,
+) -> Artifact:
+    """Mesh a `.geo` with gmsh (see `make_gmsh_stage`); returns the `.msh` Artifact.
+
+    The `.geo` must be self-contained (no `Include`, `Merge`, ...), since only its own text is
+    hashed into the cache key.
+
+    `h_charge` > 0 makes the mesh finer around the case's charges: `h_charge` within `r_fine`
+    of a charge, growing to `h_max` at `r_coarse` (which must then exceed `r_fine`).
+    """
+    if not h_max > 0:
+        raise ValueError("h_max must be positive")
+    if h_charge is not None and h_charge > 0:
+        if r_fine is None or r_coarse is None or not 0 <= r_fine < r_coarse:
+            raise ValueError("h_charge needs 0 <= r_fine < r_coarse")
+        if h_charge > h_max:
+            raise ValueError("h_charge must not exceed h_max")
+    if algorithm is not None and algorithm not in GMSH_ALGORITHMS:
+        raise ValueError(f"algorithm must be one of {GMSH_ALGORITHMS}, not {algorithm!r}")
+    geo = geometry.path if isinstance(geometry, Artifact) else Path(geometry)
+    if not (isinstance(geometry, Artifact) and geometry.content_id.startswith("dryrun:")):
+        _check_self_contained_geo(geo)
+    stage = run.get_stage("gmsh", make_gmsh_stage)
+    settings: dict[str, Any] = {
+        "h_max": h_max,
+        "h_min": h_min,
+        "h_charge": h_charge,
+        "r_fine": r_fine,
+        "r_coarse": r_coarse,
+        "algorithm": algorithm,
+        "optimize": optimize,
+        "optimize_netgen": optimize_netgen,
+        "random_factor": random_factor,
+    }
+    settings = {k: v for k, v in settings.items() if v is not None and v is not False}
+    result = run.run_stage(stage, inputs={"geometry": geometry}, settings=settings, **options)
+    assert isinstance(result, Artifact)
+    return result
+
+
+def case_mesh(run: RunContext, case: Any, **mesh_options: Any) -> Artifact:
+    """The imported `MeshProperties` of `case`: `poisson_case` -> gmsh -> `import_mesh`.
+
+    `mesh_options` go to `gmsh_mesh` (`h_max`, `h_charge`, `algorithm`, ...). Screening is
+    imported as the case says (`case.screened`).
+    """
+    inputs = case_inputs(run, case)
+    msh = gmsh_mesh(run, inputs["geometry"], **mesh_options)
+    charges = inputs["charges"]
+    # An empty .cha (no charges) is left out, so the importer does not warn about it. Only a
+    # dry-run placeholder has no known size; it is passed on.
+    has_charges = charges.content_id.startswith("dryrun:") or charges.size_bytes > 0
+    return import_mesh(
+        run,
+        msh,
+        materials=[inputs["materials"]],
+        charges=charges if has_charges else None,
+        screening=case.screened,
+    )
+
+
+def exact_field(run: RunContext, case: Any, mesh: Artifact | str | os.PathLike[str], **options: Any) -> Artifact:
+    """The exact potential of `case` at every node of `mesh`, as a NodalField `.h5`."""
+    stage = run.get_stage("exact_field", make_exact_field_stage)
+    result = run.run_stage(stage, inputs={"mesh": mesh}, settings={"case": case.spec()}, **options)
+    assert isinstance(result, Artifact)
+    return result
+
+
+def sample_field(
+    run: RunContext,
+    mesh: Artifact | str | os.PathLike[str],
+    field: Artifact | str | os.PathLike[str],
+    *,
+    line: tuple[Sequence[float], Sequence[float], int] | None = None,
+    points: Sequence[Sequence[float]] | None = None,
+    case: Any = None,
+    **options: Any,
+) -> Artifact:
+    """Values of a nodal `field` at `line=(from, to, n)` or explicit `points`, as PointSamples `.h5`.
+
+    With `case`, the exact solution is evaluated at the same points too (`u_exact`, `grad_exact`).
+    """
+    if (line is None) == (points is None):
+        raise ValueError("give exactly one of line=(from, to, n) and points=[...]")
+    settings: dict[str, Any] = {}
+    if line is not None:
+        start, end, n = line
+        settings["line"] = {"from": [float(v) for v in start], "to": [float(v) for v in end], "n": int(n)}
+    else:
+        settings["points"] = [[float(v) for v in p] for p in points]   # type: ignore[union-attr]
+    if case is not None:
+        settings["case"] = case.spec()
+    stage = run.get_stage("sample_field", make_sample_stage)
+    result = run.run_stage(stage, inputs={"mesh": mesh, "field": field}, settings=settings, **options)
+    assert isinstance(result, Artifact)
+    return result
+
+
+def verify(
+    run: RunContext,
+    case: Any,
+    mesh: Artifact | str | os.PathLike[str],
+    field: Artifact | str | os.PathLike[str],
+    *,
+    exclusion_radius: float | None = None,
+    quadrature_degree: int = 4,
+    check_mesh: bool = True,
+    **options: Any,
+) -> Artifact:
+    """Error of a nodal `field` against `case` on `mesh` (`poisson_diff`).
+
+    The norms are in the result's info (`l2_error`, `h1_error`, `max_error`, `l2_exact`, ...;
+    CSV columns `verify.<name>`); the `.h5` holds the per-tet and per-node errors. By default
+    no error is measured within the case's exclusion radius around each charge.
+    """
+    settings: dict[str, Any] = {"case": case.spec(), "quadrature_degree": int(quadrature_degree), "check_mesh": bool(check_mesh)}
+    if exclusion_radius is not None:
+        if exclusion_radius < 0:
+            raise ValueError("exclusion_radius must not be negative")
+        settings["exclusion_radius"] = float(exclusion_radius)
+    stage = run.get_stage("verify", make_verify_stage)
+    result = run.run_stage(stage, inputs={"mesh": mesh, "field": field}, settings=settings, **options)
+    assert isinstance(result, Artifact)
     return result

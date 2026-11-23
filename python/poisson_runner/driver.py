@@ -597,10 +597,11 @@ class RunContext:
         *,
         materials: Sequence[Artifact | str | os.PathLike[str]] = (),
         charges: Artifact | str | os.PathLike[str] | None = None,
+        screening: bool = True,
         **options: Any,
     ) -> Artifact:
         """See `stages.import_mesh`."""
-        return _stages.import_mesh(self, mesh_file, materials=materials, charges=charges, **options)
+        return _stages.import_mesh(self, mesh_file, materials=materials, charges=charges, screening=screening, **options)
 
     def import_free_charges(self, primaries_file: Artifact | str | os.PathLike[str], **options: Any) -> Artifact:
         """See `stages.import_free_charges`."""
@@ -617,6 +618,26 @@ class RunContext:
     ) -> dict[str, Artifact]:
         """See `stages.adapt_mesh`."""
         return _stages.adapt_mesh(self, mesh, solution, config=config, state=state, **options)
+
+    def case_mesh(self, case: Any, **mesh_options: Any) -> Artifact:
+        """See `stages.case_mesh`."""
+        return _stages.case_mesh(self, case, **mesh_options)
+
+    def exact_field(self, case: Any, mesh: Artifact | str | os.PathLike[str], **options: Any) -> Artifact:
+        """See `stages.exact_field`."""
+        return _stages.exact_field(self, case, mesh, **options)
+
+    def sample_field(
+        self, mesh: Artifact | str | os.PathLike[str], field: Artifact | str | os.PathLike[str], **options: Any
+    ) -> Artifact:
+        """See `stages.sample_field`."""
+        return _stages.sample_field(self, mesh, field, **options)
+
+    def verify(
+        self, case: Any, mesh: Artifact | str | os.PathLike[str], field: Artifact | str | os.PathLike[str], **options: Any
+    ) -> Artifact:
+        """See `stages.verify`."""
+        return _stages.verify(self, case, mesh, field, **options)
 
 
 def compare(

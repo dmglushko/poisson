@@ -159,14 +159,25 @@ struct MeshReadState {
     std::vector<uint64_t> boundary_use;                      // triangles per boundary condition
 };
 
-// A surface name is "<number>V" (Dirichlet, volts) or "D<number>" (Neumann).
+// A surface name is "<number>V" (Dirichlet, u in volts), "D<g>" (Neumann, g in V/nm), or
+// "R<alpha>" / "R<alpha>,<g>" (Robin: eps_r du/dn + alpha u = g, alpha in 1/nm, g = 0 if
+// not given).
 std::optional<MeshProperties::BoundaryCondition> parse_boundary_condition(std::string_view name) {
+    using BcType = MeshProperties::BcType;
     name = trim(name);
     double value = 0;
     if (name.size() >= 2 && name.back() == 'V' && parse_number(name.substr(0, name.size() - 1), value))
-        return MeshProperties::BoundaryCondition{MeshProperties::BcType::Dirichlet, value, std::nullopt};
+        return MeshProperties::BoundaryCondition{BcType::Dirichlet, value, std::nullopt};
     if (name.size() >= 2 && name.front() == 'D' && parse_number(name.substr(1), value))
-        return MeshProperties::BoundaryCondition{MeshProperties::BcType::Neumann, value, std::nullopt};
+        return MeshProperties::BoundaryCondition{BcType::Neumann, value, std::nullopt};
+    if (name.size() >= 2 && name.front() == 'R') {
+        const std::string_view rest = name.substr(1);
+        const std::size_t comma = rest.find(',');
+        double alpha = 0;
+        if (!parse_number(rest.substr(0, comma), alpha)) return std::nullopt;
+        if (comma != std::string_view::npos && !parse_number(rest.substr(comma + 1), value)) return std::nullopt;
+        return MeshProperties::BoundaryCondition{BcType::Robin, value, alpha};
+    }
     return std::nullopt;
 }
 
@@ -186,8 +197,8 @@ void read_mesh_format(TextReader& reader) {
 
 void read_physical_names(TextReader& reader, MeshProperties& mesh, MeshReadState& state) {
     // A signed number followed by V that is not glued to a word: "silicon 5V", "silicon -5V",
-    // "detector+5V". Unlike Nebula's regex, the sign is part of the number.
-    static const std::regex voltage(R"((^|\s+|\b)([+-]?[\d.]+)V\b)");
+    // "detector+5V", "metal 1.5e-3V". Unlike Nebula's regex, the sign is part of the number.
+    static const std::regex voltage(R"((^|\s+|\b)([+-]?(?:\d+\.?\d*|\.\d+)(?:[eE][+-]?\d+)?)V\b)");
 
     std::string_view line = reader.require("the number of physical names");
     uint64_t count = 0;
@@ -233,7 +244,9 @@ void read_physical_names(TextReader& reader, MeshProperties& mesh, MeshReadState
             const auto condition = parse_boundary_condition(name);
             if (!condition)
                 reader.fail("surface name '" + name + "' is not a boundary condition; expected "
-                            "'<number>V' (Dirichlet) or 'D<number>' (Neumann)");
+                            "'<number>V' (Dirichlet), 'D<number>' (Neumann) or 'R<alpha>[,<g>]' (Robin)");
+            if (condition->alpha && *condition->alpha < 0)
+                reader.fail("surface '" + name + "': the Robin coefficient alpha must not be negative");
 
             state.surface_index[tag] = static_cast<uint16_t>(mesh.boundary_conditions.size());
             mesh.boundary_conditions.push_back(*condition);
@@ -431,17 +444,33 @@ void read_mesh_file(const fs::path& file, MeshProperties& mesh, MeshReadState& s
             warnings.push_back("surface '" + state.surface_names[b] + "' has no triangles");
     if (mesh.boundary_elements.empty())
         warnings.push_back("the mesh has no boundary conditions");
+}
 
-    // Without a prescribed potential somewhere, the solution is only fixed up to a constant.
+// Run after the materials are read. Without a Dirichlet condition, a Robin condition with
+// alpha > 0, a volume with a voltage, or screening somewhere, the solution is only fixed up
+// to a constant.
+void check_potential(const MeshProperties& mesh, const MeshReadState& state, std::vector<std::string>& warnings) {
+    using BcType = MeshProperties::BcType;
     bool has_potential = false;
-    for (std::size_t b = 0; b < mesh.boundary_conditions.size(); ++b)
-        if (mesh.boundary_conditions[b].type == MeshProperties::BcType::Dirichlet && state.boundary_use[b] > 0)
+    for (std::size_t b = 0; b < mesh.boundary_conditions.size(); ++b) {
+        const auto& condition = mesh.boundary_conditions[b];
+        if (condition.type == BcType::Robin && *condition.alpha == 0)
+            warnings.push_back("surface '" + state.surface_names[b] +
+                               "' is a Robin condition with alpha = 0, which is the same as Neumann");
+        if (state.boundary_use[b] == 0) continue;
+        if (condition.type == BcType::Dirichlet || (condition.type == BcType::Robin && *condition.alpha > 0))
             has_potential = true;
-    for (std::size_t m = 0; m < mesh.materials.size(); ++m)
-        if (mesh.materials[m].voltage && state.material_use[m] > 0) has_potential = true;
+    }
+    for (std::size_t m = 0; m < mesh.materials.size(); ++m) {
+        const auto& material = mesh.materials[m];
+        if (state.material_use[m] == 0) continue;
+        if (material.voltage) has_potential = true;
+        if (mesh.screened && !material.is_metal && material.screening_length > 0) has_potential = true;
+    }
     if (!has_potential)
-        warnings.push_back("no potential is prescribed anywhere (no Dirichlet boundary condition and no "
-                           "volume with a voltage); the solution is only fixed up to a constant");
+        warnings.push_back("no potential is prescribed anywhere (no Dirichlet or Robin boundary condition with "
+                           "alpha > 0, no volume with a voltage and no screening); the solution is only fixed "
+                           "up to a constant");
 }
 
 // Checks that the mesh fits together: every face belongs to at most two tets, which lie on
@@ -570,13 +599,26 @@ struct MaterialFile {
     bool is_metal = false;
 };
 
+// Factor from a length unit to nm, or empty for an unknown unit. No unit means nm.
+std::optional<double> length_unit_to_nm(std::string_view unit) {
+    if (unit.empty() || unit == "nm") return 1.0;
+    if (unit == "m") return 1e9;
+    if (unit == "um" || unit == "µm") return 1e3;
+    if (unit == "Å" || unit == "A" || unit == "angstrom") return 0.1;
+    return std::nullopt;
+}
+
 // Reads only what is needed from a material .yaml file: the top-level "name", "epsilon_r"
-// inside "dielectric", and "model" inside "band_structure" (a metal if it says "metal").
-MaterialFile read_material_file(const fs::path& file) {
+// and "screening_length" inside "dielectric", and "model" inside "band_structure" (a metal
+// if it says "metal"). A file may hold several materials, each a YAML document started by a
+// "---" line.
+std::vector<MaterialFile> read_material_file(const fs::path& file) {
     const std::string text = read_file(file);
     TextReader reader(file, text);
+    std::vector<MaterialFile> results;
     MaterialFile result;
-    bool has_name = false;
+    bool has_name = false, has_keys = false;
+    std::size_t document_line = 1;
     std::string section;
 
     const auto find_yaml_value = [](std::string_view s, std::string_view key) -> std::optional<std::string_view> {
@@ -608,10 +650,34 @@ MaterialFile read_material_file(const fs::path& file) {
         result.eps_r = value;
     };
 
+    // "screening_length: 2" or "screening_length: 2 nm" (also m, um, A / angstrom).
+    const auto read_screening_length = [&](std::string_view s) {
+        const auto val = find_yaml_value(s, "screening_length");
+        if (!val) return;
+        std::string_view rest = *val;
+        double value = 0;
+        if (!take(rest, value) || !std::isfinite(value)) reader.fail("screening_length is not a number");
+        const auto to_nm = length_unit_to_nm(trim(rest));
+        if (!to_nm) reader.fail("screening_length has the unknown unit '" + std::string(trim(rest)) + "'");
+        if (value < 0) reader.fail("screening_length must not be negative");
+        if (result.screening_length) reader.fail("screening_length is given twice");
+        if (!std::isfinite(value * *to_nm)) reader.fail("screening_length is too large");
+        result.screening_length = value * *to_nm;
+    };
+
     const auto read_model = [&](std::string_view s) {
         const auto val = find_yaml_value(s, "model");
         if (!val) return;
         result.is_metal = *val == "metal";
+    };
+
+    const auto finish_document = [&] {
+        if (!has_keys) return;
+        if (!has_name) fail(file, document_line, "the material file has no 'name'");
+        results.push_back(std::move(result));
+        result = MaterialFile{};
+        has_name = has_keys = false;
+        section.clear();
     };
 
     std::size_t pos = 0;
@@ -628,6 +694,13 @@ MaterialFile read_material_file(const fs::path& file) {
         if (line.empty()) continue;
         const bool top_level = !is_blank(raw.front());
 
+        if (top_level && line == "---") {
+            finish_document();
+            document_line = reader.line();
+            continue;
+        }
+        has_keys = true;
+
         if (top_level) {
             const std::size_t colon = line.find(':');
             if (colon == std::string_view::npos) reader.fail("expected 'key: value'");
@@ -642,18 +715,21 @@ MaterialFile read_material_file(const fs::path& file) {
                 has_name = true;
             } else if (section == "dielectric") {
                 read_eps_r(value);
+                read_screening_length(value);
             } else if (section == "band_structure") {
                 read_model(value);
             }
         } else if (section == "dielectric") {
             read_eps_r(line);
+            read_screening_length(line);
         } else if (section == "band_structure") {
             read_model(line);
         }
     }
+    finish_document();
 
-    if (!has_name) fail(file, "the material file has no 'name'");
-    return result;
+    if (results.empty()) fail(file, "the material file has no 'name'");
+    return results;
 }
 
 // ---- Nebula .mat files (HDF5)
@@ -785,13 +861,10 @@ MaterialFile read_mat_file(const fs::path& file) {
     if (const auto length = read_mat_property(file, h5.id, "screening_length")) {
         if (!length->value || !std::isfinite(*length->value)) fail(file, "screening_length is not a number");
         if (*length->value < 0) fail(file, "screening_length must not be negative");
-        double to_nm = 1;
-        if (length->unit == "m") to_nm = 1e9;
-        else if (length->unit == "um" || length->unit == "µm") to_nm = 1e3;
-        else if (length->unit == "Å" || length->unit == "angstrom") to_nm = 0.1;
-        else if (!length->unit.empty() && length->unit != "nm")
-            fail(file, "screening_length has the unknown unit '" + length->unit + "'");
-        result.screening_length = *length->value * to_nm;
+        const auto to_nm = length_unit_to_nm(length->unit);
+        if (!to_nm) fail(file, "screening_length has the unknown unit '" + length->unit + "'");
+        if (!std::isfinite(*length->value * *to_nm)) fail(file, "screening_length is too large");
+        result.screening_length = *length->value * *to_nm;
     }
     return result;
 }
@@ -802,25 +875,28 @@ void read_materials(const std::vector<fs::path>& files, MeshProperties& mesh, st
 
     for (const fs::path& file : files) {
         // A .mat file is Nebula's compiled material (HDF5); anything else is read as .yaml.
-        const MaterialFile material = file.extension() == ".mat" ? read_mat_file(file) : read_material_file(file);
-        if (std::find(seen.begin(), seen.end(), material.name) != seen.end())
-            fail(file, "material '" + material.name + "' is given by more than one file");
-        seen.push_back(material.name);
+        const std::vector<MaterialFile> in_file =
+            file.extension() == ".mat" ? std::vector<MaterialFile>{read_mat_file(file)} : read_material_file(file);
+        for (const MaterialFile& material : in_file) {
+            if (std::find(seen.begin(), seen.end(), material.name) != seen.end())
+                fail(file, "material '" + material.name + "' is given more than once");
+            seen.push_back(material.name);
 
-        bool found = false;
-        for (std::size_t m = 0; m < mesh.materials.size(); ++m) {
-            if (mesh.materials[m].name != material.name) continue;
-            found = true;
-            has_file[m] = true;
-            if (material.eps_r) mesh.materials[m].eps_r = *material.eps_r;
-            if (material.screening_length) mesh.materials[m].screening_length = *material.screening_length;
-            if (material.is_metal) mesh.materials[m].is_metal = true;
+            bool found = false;
+            for (std::size_t m = 0; m < mesh.materials.size(); ++m) {
+                if (mesh.materials[m].name != material.name) continue;
+                found = true;
+                has_file[m] = true;
+                if (material.eps_r) mesh.materials[m].eps_r = *material.eps_r;
+                if (material.screening_length) mesh.materials[m].screening_length = *material.screening_length;
+                if (material.is_metal) mesh.materials[m].is_metal = true;
+            }
+            if (!found)
+                warnings.push_back("material '" + material.name + "' (" + file.string() + ") is not used by the mesh");
+            else if (!material.eps_r && !material.is_metal)   // eps_r means nothing for a metal
+                warnings.push_back("material '" + material.name + "' (" + file.string() +
+                                   ") has no dielectric epsilon_r; eps_r is left at 1");
         }
-        if (!found)
-            warnings.push_back("material '" + material.name + "' (" + file.string() + ") is not used by the mesh");
-        else if (!material.eps_r && !material.is_metal)   // eps_r means nothing for a metal
-            warnings.push_back("material '" + material.name + "' (" + file.string() +
-                               ") has no dielectric epsilon_r; eps_r is left at 1");
     }
 
     for (std::size_t m = 0; m < mesh.materials.size(); ++m)
@@ -902,7 +978,9 @@ MeshImportResult Importer::import_mesh(const std::filesystem::path& mesh_file,
     check_geometry(mesh_file, result.mesh, state, result.info.warnings);
     result.info.time_geometry = seconds_since(geometry_start);
 
+    result.mesh.screened = settings_.screened;
     read_materials(material_files, result.mesh, result.info.warnings);
+    check_potential(result.mesh, state, result.info.warnings);
     if (charges_file) read_charges(*charges_file, result.mesh, result.info.warnings);
 
     result.info.time = seconds_since(start);

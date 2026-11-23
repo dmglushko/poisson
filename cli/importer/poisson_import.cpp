@@ -18,7 +18,7 @@ namespace fs = std::filesystem;
 void print_usage(std::ostream& out) {
     out << "Usage:\n"
         << "  poisson_import --mesh <mesh.msh> [--material <mat.yaml|.mat>]... [--charges <file.cha>]\n"
-        << "                 --out <mesh.h5> [--info-out <info.json>]\n"
+        << "                 [--screening on|off] --out <mesh.h5> [--info-out <info.json>]\n"
         << "  poisson_import --primaries <file.pri> --out <free_charges.h5> [--info-out <info.json>]\n";
 }
 
@@ -31,6 +31,7 @@ int main(int argc, char** argv) {
     std::optional<fs::path> primaries_file;
     std::optional<fs::path> out_file;
     std::optional<fs::path> info_out_file;
+    std::optional<bool> screening;
 
     auto require_value = [&](int& i, std::string_view flag) -> fs::path {
         if (i + 1 >= argc) {
@@ -53,6 +54,13 @@ int main(int argc, char** argv) {
             charges_file = require_value(i, arg);
         } else if (arg == "--primaries") {
             primaries_file = require_value(i, arg);
+        } else if (arg == "--screening") {
+            const std::string value = require_value(i, arg).string();
+            if (value != "on" && value != "off") {
+                std::cerr << "error: --screening must be 'on' or 'off', not '" << value << "'\n";
+                return EXIT_FAILURE;
+            }
+            screening = value == "on";
         } else if (arg == "--out") {
             out_file = require_value(i, arg);
         } else if (arg == "--info-out") {
@@ -74,8 +82,8 @@ int main(int argc, char** argv) {
         print_usage(std::cerr);
         return EXIT_FAILURE;
     }
-    if (primaries_file && (!material_files.empty() || charges_file)) {
-        std::cerr << "error: --material and --charges are only valid with --mesh\n";
+    if (primaries_file && (!material_files.empty() || charges_file || screening)) {
+        std::cerr << "error: --material, --charges and --screening are only valid with --mesh\n";
         return EXIT_FAILURE;
     }
 
@@ -102,7 +110,9 @@ int main(int argc, char** argv) {
     }
 
     try {
-        const Importer importer;
+        Importer::Settings settings;
+        if (screening) settings.screened = *screening;
+        const Importer importer(settings);
         const fs::path staged_out = poisson::cli::make_staging_path(*out_file, "out");
         poisson::cli::TempFileCleanup out_guard{staged_out};
         fs::path staged_info;
