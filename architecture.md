@@ -101,6 +101,7 @@ struct MeshProperties {
     std::vector<BoundaryCondition>     boundary_conditions;
     std::vector<Material>              materials;
     std::vector<Charge>                charges;             // all trapped charges; grows after every batch
+    bool                               screened = false;    // true: solve screened Poisson (-div(eps_r grad u) + c u = f); false: unscreened (c = 0)
 
     // PROPOSED, not fully decided: the tets around each tet. neighbours[e][i] is the tet on
     // the other side of the face opposite node i of element e, or empty if that face is on
@@ -118,7 +119,7 @@ All stages (`Importer`, `AnalyticalMaker`, `Assembly`, `Solver`, `AMR`, `Ray Tra
 - **Length:** nanometers (`nm`). Coordinates in `.msh`, `.cha`, and `.pri` are read as-is in `nm`; `.mat` `screening_length` values are converted to `nm`.
 - **Potential:** volts (`V`).
 - **Permittivity:** dimensionless relative permittivity $\varepsilon_r$ (without $\varepsilon_0$ on the left-hand side).
-- **Equation:** inside each non-metal tet, with $c = \varepsilon_r / \lambda^2$ ($0$ when `screening_length == 0`):
+- **Equation:** inside each non-metal tet, with $c = \varepsilon_r / \lambda^2$ when `mesh.screened && screening_length > 0` (and $c = 0$ otherwise):
   $$-\nabla \cdot (\varepsilon_r \nabla u) + c u = f = \frac{\rho}{\varepsilon_0}$$
   so $f$ has units $\text{V}/\text{nm}^2$, and a point charge of $q$ elementary charges contributes $q \cdot \frac{e}{\varepsilon_0\,\mathrm{nm}} \approx 18.0951\,q\;\text{V}\cdot\text{nm}$ to the integrated right-hand side.
 - **Boundary conditions:** Dirichlet prescribes $u\;\text{[V]}$; Neumann and Robin satisfy $\varepsilon_r \frac{\partial u}{\partial n} + \alpha u = g$ with $g$ in $\text{V}/\text{nm}$ and $\alpha$ in $\text{nm}^{-1}$ ($\alpha = 0$ for Neumann).

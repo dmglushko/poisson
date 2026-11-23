@@ -117,6 +117,7 @@ MeshProperties make_sample_mesh() {
         {{0.1, 0.2, 0.3}, 1},
         {{0.1, 0.2, -0.5}, -3},
     };
+    mesh.screened = true;
     mesh.neighbours = {
         {std::nullopt, std::nullopt, std::nullopt, 1u},
         {std::nullopt, std::nullopt, std::nullopt, 0u},
@@ -160,6 +161,7 @@ void test_mesh_roundtrip_and_determinism(const fs::path& dir) {
           loaded.materials[1].voltage == 10.0);
     CHECK(loaded.charges.size() == 2);
     CHECK(loaded.charges[1].position == mesh.charges[1].position && loaded.charges[1].value == -3);
+    CHECK(loaded.screened == mesh.screened);
     CHECK(loaded.neighbours == mesh.neighbours);
 
     // Negative zero (-0.0) normalizes to +0.0 so hashes match byte-for-byte.
@@ -176,7 +178,7 @@ void test_mesh_roundtrip_and_determinism(const fs::path& dir) {
     poisson::io::write_mesh_properties(empty_file, empty);
     const MeshProperties empty_loaded = poisson::io::read_mesh_properties(empty_file);
     CHECK(empty_loaded.nodes.empty() && empty_loaded.elements.empty() && empty_loaded.materials.empty() &&
-          empty_loaded.charges.empty() && empty_loaded.neighbours.empty());
+          empty_loaded.charges.empty() && !empty_loaded.screened && empty_loaded.neighbours.empty());
 }
 
 void test_other_data_classes(const fs::path& dir) {
@@ -270,6 +272,34 @@ void test_other_data_classes(const fs::path& dir) {
     const auto hist_loaded = poisson::io::read_refinement_history(hist_file);
     CHECK(hist_loaded.families.size() == 1 && hist_loaded.families[0].parent == hist.families[0].parent);
     CHECK(hist_loaded.families[0].midpoint == hist.families[0].midpoint && hist_loaded.family == hist.family);
+
+    // ErrorBasedAdapter::State: history + optional initial_error
+    const ErrorBasedAdapter::State state{hist, 0.125};
+    const fs::path state_file = dir / "state.h5";
+    poisson::io::write_adaptation_state(state_file, state);
+    const auto state_loaded = poisson::io::read_adaptation_state(state_file);
+    CHECK(state_loaded.initial_error == 0.125);
+    CHECK(state_loaded.history.families.size() == 1 && state_loaded.history.family == hist.family);
+    CHECK(state_loaded.history.families[0].midpoint == hist.families[0].midpoint);
+    const fs::path state_again = dir / "state_again.h5";
+    poisson::io::write_adaptation_state(state_again, state_loaded);
+    CHECK(read_bytes(state_file) == read_bytes(state_again));   // deterministic bytes
+
+    const fs::path empty_state_file = dir / "empty_state.h5";
+    poisson::io::write_adaptation_state(empty_state_file, ErrorBasedAdapter::State{});
+    const auto empty_state = poisson::io::read_adaptation_state(empty_state_file);
+    CHECK(!empty_state.initial_error && empty_state.history.families.empty() && empty_state.history.family.empty());
+    CHECK_THROWS(poisson::io::read_refinement_history(state_file), "expected schema 'RefinementHistory'");
+    CHECK_THROWS(poisson::io::write_adaptation_state(dir / "bad_state.h5", ErrorBasedAdapter::State{{}, -1.0}),
+                 "initial_error");
+
+    // Error indicators (eta), including the empty case
+    const std::vector<double> eta = {0.5, 0.0, 1.25};
+    const fs::path eta_file = dir / "eta.h5";
+    poisson::io::write_error_indicators(eta_file, eta);
+    CHECK(poisson::io::read_error_indicators(eta_file) == eta);
+    poisson::io::write_error_indicators(dir / "eta_empty.h5", {});
+    CHECK(poisson::io::read_error_indicators(dir / "eta_empty.h5").empty());
 }
 
 void test_info_json(const fs::path& dir) {

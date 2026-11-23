@@ -162,6 +162,7 @@ RefinementResult output(const WorkMesh& work, const std::vector<WorkTet>& tets) 
     mesh.boundary_conditions = input.boundary_conditions;
     mesh.materials = input.materials;
     mesh.charges = input.charges;
+    mesh.screened = input.screened;
     build_neighbours(mesh);
     result.parents.nodes = work.node_parents;
     return result;

@@ -46,6 +46,7 @@ struct MeshProperties {
     std::vector<BoundaryCondition>     boundary_conditions;
     std::vector<Material>              materials;
     std::vector<Charge>                charges;             // all trapped charges; grows after every batch
+    bool                               screened = false;    // true: solve screened Poisson (-div(eps_r grad u) + c u = f); false: unscreened (c = 0)
 
     // PROPOSED, not fully decided: the tets around each tet. neighbours[e][i] is the tet on
     // the other side of the face opposite node i of element e, or empty if that face is on

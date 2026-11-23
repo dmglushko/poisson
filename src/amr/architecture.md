@@ -48,10 +48,54 @@ destruction.
 
 `ErrorBasedAdapter` composes `(ErrorEstimator, MarkingStrategy, Refiner)` with its own
 stopping settings (`absolute_tolerance`, `relative_tolerance`, `max_elements`,
-`estimate_at_limit`). Its session privately stores `RefinementHistory` (for red-green
-refinement) and the first cycle's error (for `relative_tolerance`), so neither leaks into
-`MeshAdapter` or `PoissonDriver`. A future metric-based adapter implements `MeshAdapter`
-directly without using `ErrorEstimator`, `MarkingStrategy`, or `RefinementHistory`.
+`estimate_at_limit`). A future metric-based adapter implements `MeshAdapter` directly
+without using `ErrorEstimator`, `MarkingStrategy`, or `RefinementHistory`.
+
+### What one `adapt()` call returns
+
+```cpp
+struct ErrorBasedExtras {
+    std::vector<double> eta;      // per tet of the INPUT mesh
+};
+using AdaptationExtras = std::variant<std::monostate, ErrorBasedExtras>;
+
+struct AdaptationResult {
+    AdaptationStatus              status;   // adapted / converged / limit_reached / unchanged
+    std::optional<MeshProperties> mesh;     // iff adapted
+    std::optional<Parents>        parents;  // iff adapted (new mesh -> input mesh)
+    AdaptationExtras              extras;   // adapter-specific per-cycle outputs, if any
+    Info                          info;     // metadata only: time, counts, error_estimate, warnings, stages
+};
+```
+
+Adapter-specific per-cycle data goes in the `extras` variant so top-level `AdaptationResult`
+fields stay strictly common across all adapters. For `ErrorBasedAdapter`, `extras` holds
+`ErrorBasedExtras{eta}` (computed on the input mesh before any refinement; `info.error_estimate`
+is its norm $\sqrt{\sum_K \eta_K^2}$) on every outcome where the estimator ran (`adapted`,
+`converged`, `unchanged`, and `limit_reached` with `estimate_at_limit = true`), and
+`std::monostate` when estimation was skipped. Mesh-sized arrays (`mesh`, `parents`, `eta`)
+are result data, never `Info`, so CLIs write them as `.h5` and `Info` as `.info.json`.
+
+### Cross-cycle state: `ErrorBasedAdapter::State`
+
+```cpp
+struct ErrorBasedAdapter::State {
+    RefinementHistory     history;        // red-green green families (empty otherwise)
+    std::optional<double> initial_error;  // first estimated cycle's total, base of relative_tolerance
+};
+auto session = adapter.start();        // fresh: State{}
+auto session = adapter.start(state);   // resume; returns the typed ErrorBasedAdapter::Session
+session->state();                      // state after the latest successful adapt()
+```
+
+The session updates its state by itself, so an in-process loop never touches it. The state
+is a plain value so that cycles can also run in separate processes (`poisson_adapt` runs one
+cycle per call): save `session->state()` after a cycle and `start(state)` the next one; the
+sequence is identical to one long session (`test_adapter` checks this). After each call the
+state belongs to the mesh the caller continues with: the refined mesh after `adapted`,
+otherwise the unchanged input mesh. `State` lives on `ErrorBasedAdapter`, not on the generic
+`MeshAdapter`, because cross-cycle state is encapsulated inside `Session` in-process and only
+leaves `Session` for concrete HDF5 serialization across CLI invocations.
 
 ## Shared shape of the interfaces
 
@@ -78,7 +122,8 @@ that Assembly integrates) and `point_sources` (deltas that are still deltas). Th
 estimators do not know how the analytical solution is represented.
 
 The equation they assume, per tet with its material's `eps_r` and `screening_length`:
-`-div(eps grad u) + c u = f`, `eps = eps_r`, `c = eps_r / screening_length^2`.
+`-div(eps grad u) + c u = f`, `eps = eps_r`, `c = eps_r / screening_length^2` when
+`mesh.screened && screening_length > 0` (and `0` otherwise).
 
 | | element term | face jumps | Neumann / Robin faces | uses `source` |
 |---|---|---|---|---|
@@ -127,8 +172,9 @@ nodes it is the midpoint of.
 | shape | bounded in practice; not proven in 3D | bounded (green tets are never refined further) |
 
 `RefinementHistory` exists only for red-green: green tets must not be subdivided again, so
-the next refinement has to know which tets are green and what their parent was. The
-caller passes the previous result's history back with its mesh.
+the next refinement has to know which tets are green and what their parent was. A direct
+`Refiner::refine` caller passes the previous result's history back with its mesh;
+`ErrorBasedAdapter` keeps it in its `State`.
 
 ## Tests
 
@@ -138,14 +184,15 @@ on interpolants: exact piecewise linear functions (including a kink at a materia
 with continuous flux) must give 0, and a smooth function must give O(h). The refiners are
 checked after every cycle for positive volumes, conformity, boundary conditions per area,
 orientation, neighbours and parents, on a structured and on a jittered mesh. `test_adapter`
-verifies session-scoped red-green history, absolute/relative tolerances, `max_elements` with
-and without `estimate_at_limit`, `StageInfo` collection, and the `PoissonDriver` placeholder.
+verifies session-scoped red-green history, that resuming every cycle from a saved `State`
+reproduces one long session (meshes, statuses, reopened green families, `relative_tolerance`
+convergence), `eta` on every outcome, absolute/relative tolerances, `max_elements` with and
+without `estimate_at_limit`, `StageInfo` collection, and the `PoissonDriver` placeholder.
 
 ## Open points
 
-- `RefinementHistory` is now hidden from outer callers inside `ErrorBasedAdapter`'s session,
-  but it still appears in the lower-level `Refiner::refine()` signature (and in
-  `ErrorBasedAdapter::adapt_once()` for stateless CLI invocations).
+- The weights `1/eps` and `eps_F = max(eps_K, eps_L)` in the residual and Kelly
+  estimators, and `eps = eps_r` without `eps_0`: they must match Assembly's units.
 - Faces between a dielectric and a floating metal (no voltage) are skipped like Dirichlet
   faces.
 - An interior face with a Neumann or Robin boundary element is treated as an ordinary

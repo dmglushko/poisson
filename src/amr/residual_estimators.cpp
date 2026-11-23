@@ -36,7 +36,7 @@ Terms residual_terms(const MeshProperties& mesh, const RefinementInput& input, b
     const std::vector<TetGeometry> geometry = tet_geometry(mesh, who);
     const std::size_t count = mesh.elements.size();
     std::vector<Coefficients> material(mesh.materials.size());
-    for (std::size_t m = 0; m < mesh.materials.size(); ++m) material[m] = coefficients(mesh.materials[m]);
+    for (std::size_t m = 0; m < mesh.materials.size(); ++m) material[m] = coefficients(mesh.materials[m], mesh.screened);
     std::vector<Vec3> grad(count);
     for (uint32_t k = 0; k < count; ++k) grad[k] = gradient(mesh, geometry[k], k, input.u);
     const auto coef = [&](uint32_t k) -> const Coefficients& { return material[mesh.elements[k].material]; };

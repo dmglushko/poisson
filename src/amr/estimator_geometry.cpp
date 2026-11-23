@@ -53,10 +53,12 @@ Vec3 point_at(const MeshProperties& mesh, uint32_t element, const std::array<dou
     return x;
 }
 
-Coefficients coefficients(const MeshProperties::Material& material) {
+Coefficients coefficients(const MeshProperties::Material& material, bool screened) {
     Coefficients c;
     c.eps = material.eps_r;
-    c.c = material.screening_length > 0 ? material.eps_r / (material.screening_length * material.screening_length) : 0;
+    c.c = (screened && material.screening_length > 0)
+              ? material.eps_r / (material.screening_length * material.screening_length)
+              : 0;
     c.metal = material.is_metal;
     return c;
 }

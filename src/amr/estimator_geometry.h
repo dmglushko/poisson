@@ -46,7 +46,7 @@ struct Coefficients {
     double c = 0;
     bool   metal = false;
 };
-Coefficients coefficients(const MeshProperties::Material& material);
+Coefficients coefficients(const MeshProperties::Material& material, bool screened);
 
 // Every face of the mesh once. Local face i of a tet is opposite its node i.
 struct Face {

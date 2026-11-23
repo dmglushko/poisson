@@ -10,6 +10,7 @@ using namespace detail;
 void write_mesh_properties(const fs::path& file, const MeshProperties& mesh) {
     H5Handle h5 = create_deterministic_h5(file);
     write_schema_header(file, h5.id, "MeshProperties");
+    write_u32_attr(file, h5.id, "screened", mesh.screened ? 1u : 0u);
 
     write_dataset_2d(file, h5.id, "nodes", mesh.nodes);
 
@@ -136,6 +137,9 @@ MeshProperties read_mesh_properties(const fs::path& file) {
     verify_schema_header(file, h5.id, "MeshProperties");
 
     MeshProperties mesh;
+    const uint32_t screened_raw = read_u32_attr(file, h5.id, "screened");
+    if (screened_raw > 1u) fail(file, "attribute 'screened' must be 0 or 1");
+    mesh.screened = screened_raw != 0u;
     mesh.nodes = read_dataset_2d<double, 3>(file, h5.id, "nodes");
 
     {

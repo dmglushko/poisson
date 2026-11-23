@@ -20,7 +20,7 @@ std::vector<double> RecoveryEstimator::indicators(const MeshProperties& mesh, co
     const std::vector<TetGeometry> geometry = tet_geometry(mesh, who);
     const std::size_t count = mesh.elements.size();
     std::vector<Coefficients> material(mesh.materials.size());
-    for (std::size_t m = 0; m < mesh.materials.size(); ++m) material[m] = coefficients(mesh.materials[m]);
+    for (std::size_t m = 0; m < mesh.materials.size(); ++m) material[m] = coefficients(mesh.materials[m], mesh.screened);
     const bool flux = settings_.quantity == Quantity::flux;
 
     // The recovered quantity per tet: grad u_h or eps grad u_h.

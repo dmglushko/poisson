@@ -47,6 +47,7 @@ double smallest_quality(const MeshProperties& mesh) {
 // Everything a refined mesh must satisfy, relative to the mesh it came from.
 void check_refined(const MeshProperties& before, const RefinementResult& r, std::span<const uint32_t> marked) {
     const MeshProperties& mesh = r.mesh;
+    CHECK(mesh.screened == before.screened);
     // Input nodes first and unchanged.
     for (std::size_t i = 0; i < before.nodes.size(); ++i) CHECK(mesh.nodes[i] == before.nodes[i]);
     // Positive volumes, same total volume per material.
@@ -221,6 +222,7 @@ void cycles(const Refiner& refiner, int count, bool jitter) {
                                     {Bc{MeshProperties::BcType::Dirichlet, 0, {}}, Bc{MeshProperties::BcType::Dirichlet, 1, {}},
                                      Bc{MeshProperties::BcType::Neumann, 0, {}}},
                                     materials, 0.5);
+    mesh.screened = true;
     mesh.charges = {{{0.3, 0.3, 0.3}, -1}};
     if (jitter) {
         // Move the interior nodes by up to 0.15 h, the same way every run: an irregular mesh.

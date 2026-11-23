@@ -11,8 +11,8 @@
 // right-hand side of the problem the FEM solved. It says nothing about how the analytical
 // part is represented; whoever builds the right-hand side wraps it in `source`.
 //
-// The equation, per tet K with eps_K = eps_r and c_K = eps_r / screening_length^2 (0 without
-// screening) of its material:
+// The equation, per tet K with eps_K = eps_r and c_K = eps_r / screening_length^2 when
+// mesh.screened && screening_length > 0 (0 otherwise):
 //     -div(eps_K grad u) + c_K u = f + sum of point sources.
 struct RefinementInput {
     struct PointSource {                          // a delta in the right-hand side
