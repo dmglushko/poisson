@@ -1,14 +1,12 @@
 // Tests for the verification cases: the exact solutions satisfy the equation, the boundary
 // and interface conditions, and match closed forms; invalid settings are rejected; the
-// generated input files import into a mesh that matches the case (with gmsh, if installed);
-// the error evaluator and the sampler measure the right thing.
+// generated input files import into a mesh that matches the case (with gmsh, if installed),
+// and meshes of other problems are caught.
 
 #include "amr/red_green_refinement.h"
 #include "common/constants.h"
 #include "importer/importer.h"
 #include "verification/case_inputs.h"
-#include "verification/error_evaluator.h"
-#include "verification/field_sampler.h"
 #include "verification/image_cases.h"
 #include "verification/layered_cases.h"
 
@@ -387,15 +385,18 @@ void test_regressions() {
     HalfSpaceImageCase narrow({1, 1, -1, 2, 0.4, 2.2, HalfSpaceImageCase::Plane::Dirichlet, true});
     CHECK(narrow.problem().default_exclusion_radius <= 0.1 + 1e-12);
 
-    // A field with NaN is rejected.
+    // A lone tet without boundary triangles: its outer faces are reported.
     PlanarLayersCase c({{dielectric("a", 1, 1)}, dirichlet(0), dirichlet(1), 1, 1, true});
     MeshProperties tet;
     tet.nodes = {{0, 0, 0}, {1, 0, 0}, {0, 1, 0}, {0, 0, 1}};
     tet.elements = {{{0, 1, 2, 3}, 0}};
     tet.materials = c.problem().materials;
     tet.neighbours = {MeshProperties::no_neighbours};
-    CHECK_INVALID(ErrorEvaluator().evaluate(tet, {std::nan(""), 0, 0, 0}, c), "non-finite");
-    CHECK_INVALID(FieldSampler().sample(tet, {0, 0, 0, std::numeric_limits<double>::infinity()}, {{0.1, 0.1, 0.1}}), "non-finite");
+
+    // Strong screening: a shell's formula just inside its inner sphere (a flat facet of a
+    // meshed sphere) stays finite.
+    SphericalLayersCase strong({{dielectric("core", 2, 3.9), dielectric("skin", 2, 3.9, 1e-5)}, 0, std::nullopt, dirichlet(1), 0, true});
+    CHECK(std::isfinite(strong.u({0, 0, 1.9}, 1)) && std::isfinite(strong.grad_u({0, 0, 1.9}, 1)[2]));
     // Its untagged outer faces are reported.
     bool untagged = false;
     for (const auto& m : mesh_mismatches(tet, c)) untagged = untagged || m.find("4 outer tet faces have no boundary condition") != std::string::npos;
@@ -460,48 +461,12 @@ void test_inputs_without_gmsh() {
 }
 
 void test_meshes(const fs::path& dir) {
-    const ErrorEvaluator evaluator;
-
-    // Linear cases: the exact solution is piecewise linear, so its interpolant is exact on any
-    // mesh whose element faces lie on the interfaces, including a floating metal.
+    // Every case meshes and imports into a mesh that matches it, a floating metal and a Robin
+    // face included; a mesh of another case is caught.
     {
         PlanarLayersCase c({{dielectric("left", 1, 2), metal("plate", 0.5), dielectric("right", 1.5, 5)}, dirichlet(0), robin(0.5, 0.1), 1, 1, true});
         const MeshProperties mesh = mesh_case(c, dir, "planar", 0.3);
         CHECK_MATCHES(mesh, c);
-        const ExactInterpolationResult exact = interpolate_exact(mesh, c);
-        CHECK(exact.info.warnings.empty());
-        const ErrorEvaluationResult e = evaluator.evaluate(mesh, exact.u, c);
-        CHECK(e.info.l2_error < 1e-12 && e.info.h1_error < 1e-11 && e.info.max_error < 1e-13);
-        CHECK(e.info.metal_potential_error < 1e-13 && e.info.metal_elements > 0);
-        CHECK_NEAR(e.info.measured_volume, 2.5, 1e-9);   // the metal is not measured
-        CHECK(e.info.l2_exact > 0 && e.info.h1_exact > 0);
-
-        // A constant offset shows up as exactly that error.
-        std::vector<double> shifted = exact.u;
-        for (auto& v : shifted) v += 1e-3;
-        const ErrorEvaluationResult s = evaluator.evaluate(mesh, shifted, c);
-        CHECK_NEAR(s.info.l2_error, 1e-3 * std::sqrt(2.5), 1e-12);
-        CHECK_NEAR(s.info.max_error, 1e-3, 1e-12);
-        CHECK_NEAR(s.info.metal_potential_error, 1e-3, 1e-12);
-        CHECK(s.info.h1_error < 1e-10);
-        // A gradient error of 1e-3 in x over the measured 2.5 nm^3 gives exactly that H1 error.
-        std::vector<double> tilted = exact.u;
-        for (std::size_t n = 0; n < tilted.size(); ++n) tilted[n] += 1e-3 * mesh.nodes[n][0];
-        const ErrorEvaluationResult t = evaluator.evaluate(mesh, tilted, c);
-        CHECK_NEAR(t.info.h1_error, 1e-3 * std::sqrt(2.5), 1e-12);
-
-        // Sampling along the slab gives the exact values back.
-        const FieldSampler sampler;
-        const SamplingResult line = sampler.sample(mesh, exact.u, FieldSampler::line({0.01, 0.5, 0.5}, {2.99, 0.5, 0.5}, 50), &c);
-        CHECK(line.info.outside == 0);
-        double worst = 0;
-        for (std::size_t i = 0; i < 50; ++i) worst = std::max(worst, std::abs(line.samples.u[i] - line.samples.u_exact[i]));
-        CHECK(worst < 1e-12);
-        const SamplingResult outside = sampler.sample(mesh, exact.u, {{5, 0, 0}});
-        CHECK(outside.info.outside == 1 && !outside.samples.found[0] && std::isnan(outside.samples.u[0]));
-        CHECK(outside.samples.u_exact.empty());
-
-        // A mesh of another case is caught.
         PlanarLayersCase other({{dielectric("left", 1, 3), metal("plate", 0.5), dielectric("right", 1.5, 5)}, dirichlet(0), robin(0.5, 0.1), 1, 1, true});
         CHECK(!mesh_mismatches(mesh, other).empty());
         CHECK(mesh_mismatches(mesh, other)[0].find("eps_r") != std::string::npos);
@@ -534,9 +499,8 @@ void test_meshes(const fs::path& dir) {
         SphericalLayersCase small({{dielectric("ball", 6, 3.9, 2)}, 0, std::nullopt, dirichlet(1), 0, true});
         const MeshProperties mesh = mesh_case(small, dir, "small_ball", 2);
         CHECK_MATCHES(mesh, small);
-        const auto mismatches = mesh_mismatches(mesh, big);
         bool reach = false, sphere = false;
-        for (const auto& m : mismatches) {
+        for (const auto& m : mesh_mismatches(mesh, big)) {
             reach = reach || m.find("reaches radius") != std::string::npos;
             sphere = sphere || m.find("lies on the sphere of radius 10") != std::string::npos;
         }
@@ -553,19 +517,12 @@ void test_meshes(const fs::path& dir) {
         SphericalLayersCase swapped({{dielectric("shell", 0.5, 3.9)}, 10, dirichlet(1), dirichlet(0), 0, true});
         CHECK(!mesh_mismatches(coarse, swapped).empty());
         CHECK(!mesh_mismatches(refined, swapped).empty());
-
-        // Strong screening: points of the shell on facets of the inner sphere stay finite.
-        SphericalLayersCase strong({{dielectric("core", 2, 3.9), dielectric("skin", 2, 3.9, 1e-5)}, 0, std::nullopt, dirichlet(1), 0, true});
-        const MeshProperties m = mesh_case(strong, dir, "strong", 1);
-        const ErrorEvaluationResult e = evaluator.evaluate(m, interpolate_exact(m, strong).u, strong);
-        CHECK(e.info.excluded_points == 0 && std::isfinite(e.info.l2_error));
     }
     // Two volumes of one material name with different voltages are both checked.
     {
         PlanarLayersCase c({{dielectric("a", 1, 2), metal("gate", 0.5, 5.0), dielectric("b", 1, 3)}, dirichlet(0), dirichlet(1), 1, 1, true});
         MeshProperties mesh = mesh_case(c, dir, "gate", 0.5);
         CHECK_MATCHES(mesh, c);
-        const std::size_t gate = c.material_index("gate");
         uint16_t index = 0;
         while (mesh.materials[index].name != "gate") ++index;
         MeshProperties::Material other = mesh.materials[index];
@@ -578,64 +535,24 @@ void test_meshes(const fs::path& dir) {
             }
         bool voltage = false;
         for (const auto& m : mesh_mismatches(mesh, c)) voltage = voltage || m.find("has voltage 7") != std::string::npos;
-        CHECK(voltage && gate == 1);
+        CHECK(voltage);
     }
-
     // A thin layer still gets every face and volume named.
     {
         PlanarLayersCase c({{dielectric("a", 1, 2), dielectric("film", 1e-3, 5), dielectric("b", 1, 3)}, dirichlet(0), dirichlet(1), 1, 1, true});
-        const MeshProperties mesh = mesh_case(c, dir, "thin", 0.3);
-        CHECK_MATCHES(mesh, c);
-        CHECK(evaluator.evaluate(mesh, interpolate_exact(mesh, c).u, c).info.l2_error < 1e-12);
+        CHECK_MATCHES(mesh_case(c, dir, "thin", 0.3), c);
     }
-
-    // Screened slab: the interpolation error converges at second order in L2.
-    {
-        PlanarLayersCase c({{dielectric("doped", 3, 11.7, 0.5)}, dirichlet(0.3), dirichlet(1.7), 1, 1, true});
-        double previous = 0;
-        for (const double h : {0.2, 0.1}) {
-            const MeshProperties mesh = mesh_case(c, dir, "screened", h);
-            CHECK_MATCHES(mesh, c);
-            const ErrorEvaluationResult e = evaluator.evaluate(mesh, interpolate_exact(mesh, c).u, c);
-            if (previous > 0) {
-                const double rate = std::log2(previous / e.info.l2_error);
-                if (rate < 1.6) {
-                    std::cerr << "FAILED: screened L2 rate " << rate << "\n";
-                    ++failures;
-                }
-            }
-            previous = e.info.l2_error;
-        }
-    }
-
-    // A charge at the centre of a shell-wrapped ball, and the charge cases with images.
+    // Charges, refinement around them, shells and the image boxes.
     {
         SphericalLayersCase c({{dielectric("core", 2, 3.9, 2), dielectric("shell", 2, 11.7, 2)}, 0, std::nullopt, dirichlet0, -1, true});
-        const MeshProperties mesh = mesh_case(c, dir, "ball", 0.8);
-        CHECK_MATCHES(mesh, c);
-        const ErrorEvaluationResult e = evaluator.evaluate(mesh, interpolate_exact(mesh, c).u, c);
-        CHECK(e.info.excluded_points > 0 && e.info.exclusion_radius == 1);
-        const ErrorEvaluationResult none = ErrorEvaluator({0.0, 4}).evaluate(mesh, interpolate_exact(mesh, c).u, c);
-        CHECK(!none.info.warnings.empty() && none.info.warnings[0].find("no exclusion radius") != std::string::npos);
-        CHECK(e.info.warnings.empty());
-        // Tets that touch the charge reach beyond 1 nm at this size; beyond 2 nm the
-        // interpolant is close to the exact solution.
-        // interpolant converges at second order there.
-        const ErrorEvaluator far_evaluator({2.0, 4});
-        const ErrorEvaluationResult far = far_evaluator.evaluate(mesh, interpolate_exact(mesh, c).u, c);
-        const MeshProperties fine = mesh_case(c, dir, "ball_fine", 0.4);
-        const ErrorEvaluationResult far_fine = far_evaluator.evaluate(fine, interpolate_exact(fine, c).u, c);
-        const double rate = std::log2(far.info.l2_error / far_fine.info.l2_error);
-        CHECK(far.info.exclusion_radius == 2 && far.info.l2_error < 0.1 * far.info.l2_exact);
-        CHECK(rate > 1.6);
-        CHECK(e.info.l2_error > far.info.l2_error);
+        CHECK_MATCHES(mesh_case(c, dir, "ball", 0.8), c);
         SphericalLayersCase shell({{dielectric("shell", 3, 3.9)}, 1, robin(0.5, 0), dirichlet(1), 0, true});
         CHECK_MATCHES(mesh_case(shell, dir, "shell", 0.8), shell);
-    }
-    {
-        GroundedBallImageCase c({5, 3.9, -1, {1, 0.5, -0.5}});
-        const MeshProperties mesh = mesh_case(c, dir, "image", 1.0, "-setnumber h_charge 0.2 -setnumber r_fine 0.5 -setnumber r_coarse 2");
-        CHECK_MATCHES(mesh, c);
+        GroundedBallImageCase g({5, 3.9, -1, {1, 0.5, -0.5}});
+        const MeshProperties coarse = mesh_case(g, dir, "image", 1.0);
+        const MeshProperties refined = mesh_case(g, dir, "image_refined", 1.0, "-setnumber h_charge 0.2 -setnumber r_fine 0.5 -setnumber r_coarse 2");
+        CHECK_MATCHES(refined, g);
+        CHECK(refined.nodes.size() > coarse.nodes.size());
         HalfSpaceImageCase h({3.9, 1, -1, 1, 6, 6, HalfSpaceImageCase::Plane::Neumann, true});
         CHECK_MATCHES(mesh_case(h, dir, "half_space", 1.5), h);
         DielectricInterfaceCase i({3.9, 11.7, 1, 1, 1, 6, 6, true});
@@ -651,13 +568,6 @@ void test_meshes(const fs::path& dir) {
     }
 }
 
-void test_evaluator_settings() {
-    CHECK_INVALID(ErrorEvaluator(ErrorEvaluator::Settings{-1, 99}), "quadrature_degree");
-    CHECK_INVALID(FieldSampler::line({0, 0, 0}, {1, 0, 0}, 1), "at least 2 points");
-    const auto pts = FieldSampler::line({0, 0, 0}, {1, 2, 3}, 3);
-    CHECK((pts[1] == Vec3{0.5, 1, 1.5}) && (pts[2] == Vec3{1, 2, 3}));
-}
-
 int main() {
     const fs::path dir = fs::temp_directory_path() / "poisson_test_verification";
     fs::create_directories(dir);
@@ -667,7 +577,6 @@ int main() {
         test_images();
         test_regressions();
         test_inputs_without_gmsh();
-        test_evaluator_settings();
         if (have_gmsh()) test_meshes(dir);
         else std::cout << "gmsh not found: skipping the mesh tests\n";
     } catch (const std::exception& error) {

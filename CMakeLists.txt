@@ -95,18 +95,16 @@ target_include_directories(poisson_amr PUBLIC include)
 target_link_libraries(poisson_amr PUBLIC poisson_common)
 target_compile_options(poisson_amr PRIVATE -Wall -Wextra -Wpedantic)
 
-# Exact solutions of verification cases, their input files, and error evaluation.
+# Verification cases: exact solutions and the input files of their problems.
 add_library(poisson_verification STATIC
     src/verification/case_support.cpp
     src/verification/verification_case.cpp
     src/verification/layered_cases.cpp
     src/verification/image_cases.cpp
     src/verification/case_inputs.cpp
-    src/verification/error_evaluator.cpp
-    src/verification/field_sampler.cpp
 )
 target_include_directories(poisson_verification PUBLIC include)
-target_link_libraries(poisson_verification PUBLIC poisson_common PRIVATE Eigen3::Eigen)
+target_link_libraries(poisson_verification PRIVATE Eigen3::Eigen)
 target_compile_options(poisson_verification PRIVATE -Wall -Wextra -Wpedantic)
 
 # ---------------------------------------------------------------- Core C++ umbrella library
@@ -144,12 +142,10 @@ target_include_directories(poisson_adapt PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")
 target_link_libraries(poisson_adapt PRIVATE poisson_amr poisson_io)
 target_compile_options(poisson_adapt PRIVATE -Wall -Wextra -Wpedantic)
 
-foreach(name case sample diff)
-    add_executable(poisson_${name} cli/verification/poisson_${name}.cpp)
-    target_include_directories(poisson_${name} PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")
-    target_link_libraries(poisson_${name} PRIVATE poisson_verification poisson_io)
-    target_compile_options(poisson_${name} PRIVATE -Wall -Wextra -Wpedantic)
-endforeach()
+add_executable(poisson_case cli/verification/poisson_case.cpp)
+target_include_directories(poisson_case PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")
+target_link_libraries(poisson_case PRIVATE poisson_verification poisson_io)
+target_compile_options(poisson_case PRIVATE -Wall -Wextra -Wpedantic)
 
 # ---------------------------------------------------------------- Tests
 enable_testing()

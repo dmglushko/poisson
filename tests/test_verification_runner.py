@@ -1,11 +1,9 @@
-"""End-to-end tests of the verification stages: case -> gmsh -> import -> exact field -> verify / sample,
-inside an experiment and as a separate evaluation of a saved run."""
+"""End-to-end tests of the verification stages: case -> gmsh -> import, caching, saved runs, and the
+safety checks of the gmsh stage and the poisson_case CLI."""
 
 from __future__ import annotations
 
-import csv
 import json
-import math
 import shutil
 import subprocess
 import sys
@@ -23,7 +21,6 @@ from poisson_runner import (  # noqa: E402
     Case,
     compare,
     dirichlet,
-    evaluate,
     gmsh_mesh,
     load_run,
     resolve_binary,
@@ -66,87 +63,45 @@ class VerificationRunnerTest(unittest.TestCase):
     def tearDown(self) -> None:
         self._tmp.cleanup()
 
-    def test_exact_cases_and_convergence(self) -> None:
+    def test_case_meshes_and_caching(self) -> None:
         def experiment(run):
-            case = compare("case", {"planar": PLANAR, "screened": SCREENED})
-            h = compare("h", [0.2, 0.1])
-            mesh = run.case_mesh(case, h_max=h)
-            exact = run.exact_field(case, mesh)
-            errors = run.verify(case, mesh, exact)
-            line = run.sample_field(mesh, exact, line=([0.05, 0.5, 0.5], [2.95, 0.5, 0.5], 20), case=case)
-            return {"mesh": mesh, "exact": exact, "errors": errors, "line": line, "case": case}
+            case = compare("case", {"planar": PLANAR, "screened": SCREENED, "ball": BALL})
+            h = compare("h", [0.4, 0.2])
+            return {"mesh": run.case_mesh(case, h_max=h), "case": case}
 
         report = run_experiment(experiment, cache=self.cache)
-        self.assertEqual(len(report.branches), 4)
+        self.assertEqual(len(report.branches), 6)
         self.assertTrue(all(b.ok for b in report.branches), [b.error for b in report.branches])
         by = {(b.choice_labels["case"], b.choice_labels["h"]): b for b in report.branches}
+        for b in report.branches:
+            self.assertEqual(b["mesh"].info["warnings"], [])
 
-        # Piecewise linear (with a floating metal): the interpolant is exact on any mesh.
-        for h in ("0.2", "0.1"):
-            info = by[("planar", h)]["errors"].info
-            self.assertLess(info["l2_error"], 1e-12)
-            self.assertLess(info["metal_potential_error"], 1e-13)
-            self.assertGreater(info["metal_elements"], 0)
-            self.assertEqual(by[("planar", h)]["mesh"].info["warnings"], [])
-        # Screened: second order in L2 between h = 0.2 and 0.1.
-        coarse = by[("screened", "0.2")]["errors"].info["l2_error"]
-        fine = by[("screened", "0.1")]["errors"].info["l2_error"]
-        self.assertGreater(math.log2(coarse / fine), 1.6)
-
-        # The exact field matches the exact solution at sample points of a linear case.
-        with h5py.File(by[("planar", "0.1")]["line"].path, "r") as f:
-            self.assertEqual(int(f["found"][:].sum()), 20)
-            self.assertLess(float(abs(f["u"][:] - f["u_exact"][:]).max()), 1e-12)
-            self.assertEqual(f["points"].shape, (20, 3))
-
-        # The norms are CSV columns.
-        csv_path = self.tmp / "report.csv"
-        report.save_csv(csv_path, layout="wide")
-        with csv_path.open(newline="", encoding="utf-8") as fh:
-            header = next(csv.reader(fh))
-        self.assertIn("verify.l2_error", header)
-        self.assertIn("verify.h1_error", header)
+        with h5py.File(by[("planar", "0.2")]["mesh"].path, "r") as f:
+            names = f["materials/name_bytes"][:].tobytes().decode()
+            self.assertTrue(all(n in names for n in ("oxide", "plate", "si")))
+            self.assertEqual(int(f.attrs["screened"]), 1)
+            self.assertEqual(f["charges/value"].shape, (0,))
+        with h5py.File(by[("ball", "0.2")]["mesh"].path, "r") as f:
+            self.assertEqual(list(f["charges/value"][:]), [-1])
+        # Finer h, more tets.
+        with h5py.File(by[("screened", "0.4")]["mesh"].path, "r") as a, h5py.File(by[("screened", "0.2")]["mesh"].path, "r") as b:
+            self.assertGreater(b["elements/node"].shape[0], a["elements/node"].shape[0])
 
         # Re-running is all cache hits.
-        again = run_experiment(experiment, cache=self.cache)
-        self.assertEqual(again.cache_misses, 0)
+        self.assertEqual(run_experiment(experiment, cache=self.cache).cache_misses, 0)
 
-    def test_saved_run_is_verified_afterwards(self) -> None:
-        # The experiment only builds meshes and a "solution"; verification happens later.
+    def test_saved_run_keeps_the_case(self) -> None:
         def experiment(run):
-            h = compare("h", [0.8, 0.4])
-            mesh = run.case_mesh(BALL, h_max=h)
-            return {"mesh": mesh, "solution": run.exact_field(BALL, mesh), "case": BALL}
+            return {"mesh": run.case_mesh(BALL, h_max=0.8), "case": BALL}
 
-        report = run_experiment(experiment, cache=self.cache)
-        self.assertTrue(all(b.ok for b in report.branches), [b.error for b in report.branches])
-        mesh_info = report.branches[0]["mesh"].info
-        self.assertEqual(mesh_info["warnings"], [])
-        report.save(self.tmp / "saved")
-
+        run_experiment(experiment, cache=self.cache).save(self.tmp / "saved")
         saved = load_run(self.tmp / "saved")
         self.assertEqual(saved.branches[0]["case"], BALL)   # the case comes back as a Case
 
-        def analysis(run, b):
-            far = run.verify(b["case"], b["mesh"], b["solution"], exclusion_radius=1.5)
-            return {"l2": far.info["l2_error"], "excluded": far.info["excluded_points"]}
-
-        ana = evaluate(saved, analysis, cache=self.cache)
-        self.assertTrue(all(b.ok for b in ana.branches), [b.error for b in ana.branches])
-        l2 = {b.choice_labels["h"]: b.scalars["l2"] for b in ana.branches}
-        self.assertGreater(math.log2(l2["0.8"] / l2["0.4"]), 1.6)
-        self.assertTrue(all(b.scalars["excluded"] > 0 for b in ana.branches))
-
-    def test_mismatched_mesh_is_rejected(self) -> None:
-        other = Case.of("planar_layers", layers=[{"name": "oxide", "thickness": 1, "eps_r": 3.9}])
-
-        def experiment(run):
-            mesh = run.case_mesh(PLANAR, h_max=0.5)
-            run.verify(other, mesh, run.exact_field(PLANAR, mesh))
-
-        report = run_experiment(experiment, cache=self.cache, continue_on_error=True)
-        self.assertFalse(report.branches[0].ok)
-        self.assertIn("does not match case", str(report.branches[0].error))
+        unscreened = Case.of("planar_layers", layers=[{"name": "oxide", "thickness": 1, "eps_r": 3.9}], screened=False)
+        mesh = run_experiment(lambda run: run.case_mesh(unscreened, h_max=0.5), cache=self.cache).branches[0].result
+        with h5py.File(mesh.path, "r") as f:
+            self.assertEqual(int(f.attrs["screened"]), 0)   # imported as the case says
 
     def test_refinement_near_charge_and_options(self) -> None:
         image = Case.of("grounded_ball_image", radius=5, eps_r=3.9, charge=-1, position=[1, 0.5, -0.5])
@@ -171,8 +126,7 @@ class VerificationRunnerTest(unittest.TestCase):
 
     def test_dry_run_of_a_cached_charge_free_case_runs_nothing(self) -> None:
         def experiment(run):
-            mesh = run.case_mesh(PLANAR, h_max=0.5)
-            return {"errors": run.verify(PLANAR, mesh, run.exact_field(PLANAR, mesh))}
+            return {"mesh": run.case_mesh(PLANAR, h_max=0.5)}
 
         run_experiment(experiment, cache=self.cache)
         dry = run_experiment(experiment, cache=self.cache, dry_run=True)
@@ -238,7 +192,7 @@ class VerificationRunnerTest(unittest.TestCase):
         self.assertEqual(len({Case.of("x", t=1), Case.of("x", t=1.0)}), 1)
         self.assertTrue(Case.of("x", screened=None).screened)   # null means the default, as in C++
         import poisson_runner
-        for name in ("Case", "dirichlet", "case_mesh", "gmsh_mesh", "verify", "make_verify_stage"):
+        for name in ("Case", "dirichlet", "case_mesh", "gmsh_mesh", "case_inputs", "make_gmsh_stage"):
             self.assertIn(name, poisson_runner.__all__)
 
 

@@ -384,10 +384,10 @@ def adapt_mesh(
 
 
 # ---------------------------------------------------------------------------------------------
-# Verification: case inputs -> gmsh -> import, the exact solution on a mesh, point samples,
-# and error norms against a case (src/verification/architecture.md). A case is anything with
-# `spec()` (the `{"name", "params"}` JSON the C++ stages read) and `screened`, normally a
-# `poisson_runner.Case`.
+# Verification: the mesh of a case with a known exact solution, case inputs -> gmsh -> import
+# (src/verification/architecture.md). A case is anything with `spec()` (the `{"name",
+# "params"}` JSON the C++ stage reads) and `screened`, normally a `poisson_runner.Case`.
+# Comparing a solution with the exact solution waits for the Solution format.
 # ---------------------------------------------------------------------------------------------
 
 
@@ -402,51 +402,6 @@ def make_case_inputs_stage(build_dir: Path | str | None = None) -> Stage:
         info_flag="--info-out",
         build_dir=build_dir,
         version="case_inputs_v1",
-    )
-
-
-def make_exact_field_stage(build_dir: Path | str | None = None) -> Stage:
-    """`poisson_case` exact mode: the exact potential at every node of `mesh`, as a NodalField."""
-    return Stage.from_cli(
-        name="exact_field",
-        binary="poisson_case",
-        input_flags={"mesh": "--mesh"},
-        config_flag="--config",
-        output_flags={"out": "--out"},
-        output_specs={"out": ".h5"},
-        info_flag="--info-out",
-        build_dir=build_dir,
-        version="exact_field_v1",
-    )
-
-
-def make_sample_stage(build_dir: Path | str | None = None) -> Stage:
-    """`poisson_sample`: a nodal field (and optionally a case's exact solution) at chosen points."""
-    return Stage.from_cli(
-        name="sample_field",
-        binary="poisson_sample",
-        input_flags={"mesh": "--mesh", "field": "--field"},
-        config_flag="--config",
-        output_flags={"out": "--out"},
-        output_specs={"out": ".h5"},
-        info_flag="--info-out",
-        build_dir=build_dir,
-        version="sample_field_v1",
-    )
-
-
-def make_verify_stage(build_dir: Path | str | None = None) -> Stage:
-    """`poisson_diff`: error norms of a nodal field against a case (in the info), per-tet/node errors (.h5)."""
-    return Stage.from_cli(
-        name="verify",
-        binary="poisson_diff",
-        input_flags={"mesh": "--mesh", "field": "--field"},
-        config_flag="--config",
-        output_flags={"out": "--out"},
-        output_specs={"out": ".h5"},
-        info_flag="--info-out",
-        build_dir=build_dir,
-        version="verify_v1",
     )
 
 
@@ -613,69 +568,3 @@ def case_mesh(run: RunContext, case: Any, **mesh_options: Any) -> Artifact:
         charges=charges if has_charges else None,
         screening=case.screened,
     )
-
-
-def exact_field(run: RunContext, case: Any, mesh: Artifact | str | os.PathLike[str], **options: Any) -> Artifact:
-    """The exact potential of `case` at every node of `mesh`, as a NodalField `.h5`."""
-    stage = run.get_stage("exact_field", make_exact_field_stage)
-    result = run.run_stage(stage, inputs={"mesh": mesh}, settings={"case": case.spec()}, **options)
-    assert isinstance(result, Artifact)
-    return result
-
-
-def sample_field(
-    run: RunContext,
-    mesh: Artifact | str | os.PathLike[str],
-    field: Artifact | str | os.PathLike[str],
-    *,
-    line: tuple[Sequence[float], Sequence[float], int] | None = None,
-    points: Sequence[Sequence[float]] | None = None,
-    case: Any = None,
-    **options: Any,
-) -> Artifact:
-    """Values of a nodal `field` at `line=(from, to, n)` or explicit `points`, as PointSamples `.h5`.
-
-    With `case`, the exact solution is evaluated at the same points too (`u_exact`, `grad_exact`).
-    """
-    if (line is None) == (points is None):
-        raise ValueError("give exactly one of line=(from, to, n) and points=[...]")
-    settings: dict[str, Any] = {}
-    if line is not None:
-        start, end, n = line
-        settings["line"] = {"from": [float(v) for v in start], "to": [float(v) for v in end], "n": int(n)}
-    else:
-        settings["points"] = [[float(v) for v in p] for p in points]   # type: ignore[union-attr]
-    if case is not None:
-        settings["case"] = case.spec()
-    stage = run.get_stage("sample_field", make_sample_stage)
-    result = run.run_stage(stage, inputs={"mesh": mesh, "field": field}, settings=settings, **options)
-    assert isinstance(result, Artifact)
-    return result
-
-
-def verify(
-    run: RunContext,
-    case: Any,
-    mesh: Artifact | str | os.PathLike[str],
-    field: Artifact | str | os.PathLike[str],
-    *,
-    exclusion_radius: float | None = None,
-    quadrature_degree: int = 4,
-    check_mesh: bool = True,
-    **options: Any,
-) -> Artifact:
-    """Error of a nodal `field` against `case` on `mesh` (`poisson_diff`).
-
-    The norms are in the result's info (`l2_error`, `h1_error`, `max_error`, `l2_exact`, ...;
-    CSV columns `verify.<name>`); the `.h5` holds the per-tet and per-node errors. By default
-    no error is measured within the case's exclusion radius around each charge.
-    """
-    settings: dict[str, Any] = {"case": case.spec(), "quadrature_degree": int(quadrature_degree), "check_mesh": bool(check_mesh)}
-    if exclusion_radius is not None:
-        if exclusion_radius < 0:
-            raise ValueError("exclusion_radius must not be negative")
-        settings["exclusion_radius"] = float(exclusion_radius)
-    stage = run.get_stage("verify", make_verify_stage)
-    result = run.run_stage(stage, inputs={"mesh": mesh, "field": field}, settings=settings, **options)
-    assert isinstance(result, Artifact)
-    return result

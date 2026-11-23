@@ -667,22 +667,6 @@ class RunContext:
         """See `stages.case_mesh`."""
         return _stages.case_mesh(self, case, **mesh_options)
 
-    def exact_field(self, case: Any, mesh: Artifact | str | os.PathLike[str], **options: Any) -> Artifact:
-        """See `stages.exact_field`."""
-        return _stages.exact_field(self, case, mesh, **options)
-
-    def sample_field(
-        self, mesh: Artifact | str | os.PathLike[str], field: Artifact | str | os.PathLike[str], **options: Any
-    ) -> Artifact:
-        """See `stages.sample_field`."""
-        return _stages.sample_field(self, mesh, field, **options)
-
-    def verify(
-        self, case: Any, mesh: Artifact | str | os.PathLike[str], field: Artifact | str | os.PathLike[str], **options: Any
-    ) -> Artifact:
-        """See `stages.verify`."""
-        return _stages.verify(self, case, mesh, field, **options)
-
 
 def compare(
     name_or_options: str | Sequence[Any] | Mapping[str, Any] | Compare[Any],

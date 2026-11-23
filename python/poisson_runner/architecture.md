@@ -12,7 +12,7 @@
 | `report.py` | `StageTrace`, `BranchResult`, `ExperimentReport` (table, JSON, wide/long CSV, DataFrame, `save`), `info_scalars` |
 | `records.py` | Tagged JSON encoding of branch outputs and choice values; explicit `register_record` registry |
 | `results.py` | `load_run` / `SavedRun` (`select`, `one`, `match`) and `evaluate` for post-hoc evaluation |
-| `stages.py` | `Stage` / `Stage.from_cli`, code hashing (binary + shared libraries), project stage factories and helpers (`import_mesh`, `import_free_charges`, `adapt_mesh`, and the verification stages `case_inputs`, `gmsh_mesh`, `case_mesh`, `exact_field`, `sample_field`, `verify`) |
+| `stages.py` | `Stage` / `Stage.from_cli`, code hashing (binary + shared libraries), project stage factories and helpers (`import_mesh`, `import_free_charges`, `adapt_mesh`, and the verification stages `case_inputs`, `gmsh_mesh`, `case_mesh`) |
 | `cases.py` | `Case(name, params)`: a verification case as a name and its parameters (a registered record), and `dirichlet` / `neumann` / `robin` helpers |
 | `cache.py` | Two-layer content-addressed cache, locking, leases, eviction |
 | `executor.py` | `Executor` backends and per-process OS metrics |
@@ -42,18 +42,13 @@ parameter into the request key. Equality and hashing use the normalised spec (`1
 | `case_inputs(run, case)` | `poisson_case` | `{"geometry": .geo, "materials": .yaml, "charges": .cha}` |
 | `gmsh_mesh(run, geo, h_max=..., h_min=, h_charge=, r_fine=, r_coarse=, algorithm=, optimize=, optimize_netgen=, random_factor=)` | system `gmsh` (`-3 -format msh22 -order 1 -nt 1`; sizes as `-setnumber` constants) | `.msh` |
 | `case_mesh(run, case, **gmsh_options)` | the two above, then `import_mesh` with `screening=case.screened` (an empty `.cha` is left out) | `MeshProperties` `.h5` |
-| `exact_field(run, case, mesh)` | `poisson_case --mesh` | exact potential per node (`NodalField`) |
-| `sample_field(run, mesh, field, line=(a, b, n) or points=[...], case=None)` | `poisson_sample` | `PointSamples` `.h5` |
-| `verify(run, case, mesh, field, exclusion_radius=None, quadrature_degree=4, check_mesh=True)` | `poisson_diff` | error fields `.h5`; norms in `info` (CSV columns `verify.l2_error`, ...) |
 
-`case_mesh`, `exact_field`, `sample_field` and `verify` are also `RunContext` methods
-(`run.case_mesh(...)`, ...); `case_inputs` and `gmsh_mesh` are module functions taking `run`.
-`gmsh_mesh` only accepts self-contained `.geo` scripts (no `Include`, `Merge`, ...), since the
-cache hashes the script's own text. The gmsh
-stage hashes `/usr/bin/gmsh` and the `libgmsh` it links, so a gmsh upgrade re-meshes. A
-convergence study is an experiment over `h` that returns `{"mesh", "solution", "case"}`;
-verification can run in the same experiment or later through `evaluate` on the saved run,
-because the case is saved with its parameters and rebuilt as a `Case` on load.
+`case_mesh` is also a `RunContext` method (`run.case_mesh(case, h_max=...)`); `case_inputs`
+and `gmsh_mesh` are module functions taking `run`. `gmsh_mesh` only accepts self-contained
+`.geo` scripts (no `Include`, `Merge`, ...), since the cache hashes the script's own text.
+An experiment returns `{"mesh", "case"}` (the case is saved with its parameters and rebuilt
+as a `Case` on load). Comparing a solution with the case's exact solution waits for the
+`Solution` format ([issue #6](https://github.com/dmglushko/poisson/issues/6)).
 
 ## Hashing Engine (`hashing.py`, `third_party/blake3/`, `src/blake3/blake3_hash.cpp`)
 

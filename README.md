@@ -75,9 +75,10 @@ def analysis(run, b):                        # once per successful saved branch,
 evaluate(saved, analysis).save_csv("results/sweep_analysis.csv")
 ```
 
-Check results against exact solutions (needs `gmsh`; see
+Build the mesh of a problem with a known exact solution (needs `gmsh`; see
 [src/verification/architecture.md](src/verification/architecture.md) for the cases and their
-parameters):
+parameters). Comparing a solution with it waits for the `Solution` format
+([issue #6](https://github.com/dmglushko/poisson/issues/6)).
 
 ```python
 from poisson_runner import Case, compare, dirichlet, run_experiment
@@ -87,14 +88,11 @@ slab = Case.of("planar_layers",
                        {"name": "si", "thickness": 2, "eps_r": 11.7, "screening_length": 0.5}],
                left=dirichlet(0), right=dirichlet(1))
 
-def convergence(run):
+def meshes(run):
     h = compare("h", [0.4, 0.2, 0.1])
-    mesh = run.case_mesh(slab, h_max=h)            # poisson_case -> gmsh -> poisson_import
-    solution = run.exact_field(slab, mesh)         # stand-in until the solver stage exists
-    errors = run.verify(slab, mesh, solution)      # norms in errors.info: l2_error, h1_error, ...
-    return {"mesh": mesh, "solution": solution, "case": slab}
+    return {"mesh": run.case_mesh(slab, h_max=h), "case": slab}   # poisson_case -> gmsh -> poisson_import
 
-run_experiment(convergence).save_csv("convergence.csv")   # columns verify.l2_error, ...
+run_experiment(meshes).save("results/slab_meshes")
 ```
 
 To run an experiment on the DelftBlue cluster as parallel Slurm jobs, end the script with

@@ -18,8 +18,6 @@ cli/
     case_config.h           case JSON -> VerificationCase (the only place naming case parameters)
     verification_cli.h      flag parsing, aliasing checks, staged multi-output publishing
     poisson_case.cpp        -> build/poisson_case
-    poisson_sample.cpp      -> build/poisson_sample
-    poisson_diff.cpp        -> build/poisson_diff
   assembler/                (future: e.g. p1_assemble.cpp, p2_assemble.cpp)
   solver/                   (future: e.g. cg_solve.cpp, amg_solve.cpp)
   driver/                   (future: poisson_drive.cpp once PoissonDriver is complete)
@@ -67,33 +65,22 @@ poisson_adapt --mesh <mesh.h5> --solution <nodal_field.h5> --config <config.json
   is in `--info-out`.
 - The Python `adapt_mesh` helper always requests all four `.h5` outputs.
 
-## Verification CLIs (`cli/verification/`)
+## Verification CLI (`cli/verification/`)
 
-They link only `poisson_verification` and `poisson_io` (see
-[src/verification/architecture.md](../src/verification/architecture.md)). A case is given in
-the config as `"case": {"name": ..., "params": {...}}`.
+`poisson_case` links only `poisson_verification` and `poisson_io` (see
+[src/verification/architecture.md](../src/verification/architecture.md)):
 
 ```text
-poisson_case   --config <case.json> --geo-out <case.geo> --materials-out <case.yaml>
-               --charges-out <case.cha> [--info-out <info.json>]
-poisson_case   --config <case.json> --mesh <mesh.h5> --out <exact.h5> [--info-out <info.json>]
-poisson_sample --mesh <mesh.h5> --field <nodal_field.h5> --config <sample.json>
-               --out <samples.h5> [--info-out <info.json>]
-poisson_diff   --mesh <mesh.h5> --field <nodal_field.h5> --config <diff.json>
-               --out <errors.h5> [--info-out <info.json>]
+poisson_case --config <case.json> --geo-out <case.geo> --materials-out <case.yaml>
+             --charges-out <case.cha> [--info-out <info.json>]
 ```
 
-- `poisson_case` writes a case's input files (always all three; the `.cha` is empty without
-  charges), or its exact potential at every node of a mesh as a `NodalField`.
-- `poisson_sample`: config `{"line": {"from", "to", "n"}}` or `{"points": [[x, y, z], ...]}`,
-  optional `"case"`; writes `PointSamples`.
-- `poisson_diff`: config `{"case", "exclusion_radius" (nm, default the case's),
-  "quadrature_degree" (4), "check_mesh" (true)}`. With `check_mesh`, a mesh that does not
-  match the case is an error listing every difference. The norms go to the info
-  (`ErrorEvaluationResult::Info`); `errors.h5` holds the per-tet and per-node errors.
-- The field is a `NodalField` (the AMR stage's solution format) until `Solution` is defined.
+- `case.json` is `{"case": {"name": ..., "params": {...}}}`. It writes the case's input
+  files, always all three (the `.cha` is empty without charges).
 - Besides the aliasing checks, an output that is an existing directory is rejected before
   anything is written, so a failed run does not leave some outputs replaced.
+- Comparing a solution with a case waits for the `Solution` format
+  ([issue #6](https://github.com/dmglushko/poisson/issues/6)).
 
 ## Deterministic HDF5 Serialization (`include/io/`, `src/io/`)
 
@@ -101,8 +88,7 @@ poisson_diff   --mesh <mesh.h5> --field <nodal_field.h5> --config <diff.json>
   `Eigen::SparseMatrix<double>` `A`), `SolverResult`, and AMR stage artifacts (`NodalField`,
   `Parents`, `RefinementHistory`, `AdaptationState` — `ErrorBasedAdapter::State`: group
   `/history` with the `RefinementHistory` layout plus `/initial_error` with 0 or 1 float64
-  entries — and `ErrorIndicators` — `/eta`, float64 per tet), and the verification outputs
-  (`PointSamples`, `ErrorFields`), split into matching per-type headers/sources
+  entries — and `ErrorIndicators` — `/eta`, float64 per tet), split into matching per-type headers/sources
   (`mesh_io.h/.cpp`, `free_charges_io.h/.cpp`, `assembled_problem_io.h/.cpp`,
   `solver_result_io.h/.cpp`, `amr_io.h/.cpp`, `verification_io.h/.cpp`).
 - Disables HDF5 object timestamp tracking (`H5Pset_obj_track_times(..., false)`) on the root

@@ -8,21 +8,23 @@ with its gradient. So the mesh a case produces and the formula it is checked aga
 drift apart. Python only names a case and passes its parameters
 (`python/poisson_runner/cases.py`).
 
-Nothing here is part of the solve. Only the three verification CLIs link this library, so
-adding or changing a case does not change the code hash of the import, AMR or solver stages.
+Nothing here is part of the solve. Only the `poisson_case` CLI links this library, so adding
+or changing a case does not change the code hash of the import, AMR or solver stages.
 
 ## Flow
 
 ```text
 Case(name, params) --poisson_case--> case.geo + case.yaml + case.cha
                    --gmsh--> case.msh --poisson_import--> mesh.h5
-mesh.h5 + solution (NodalField)                  --poisson_diff--> per-tet/per-node errors + norms (info)
-mesh.h5 + solution + points [+ case]             --poisson_sample--> PointSamples
-mesh.h5 + case                                   --poisson_case--> exact NodalField (interpolant)
+mesh_mismatches(mesh, case)          checks that a mesh is the mesh of the case
+case.u(x, material), case.grad_u(...)  the exact solution, as plain functions
 ```
 
-The exact interpolant stands in for a solution until Assembly and the Solver exist, and is
-the interpolation-error baseline after that.
+**Not here yet:** comparing a computed solution with the exact one (error norms, values at
+chosen points, the exact field on a mesh). It depends on the `Solution` format, which is not
+defined (with P3M it is the FEM field plus an analytical correction near each charge). See
+[issue #6](https://github.com/dmglushko/poisson/issues/6); a first version that assumed a P1
+nodal field is in commit `63a0427`.
 
 ## Interface
 
@@ -134,7 +136,7 @@ adjacent metals must be merged into one layer.
 
 ### Parameters (JSON)
 
-`poisson_case`, `poisson_sample` and `poisson_diff` read a case as
+`poisson_case` reads a case as
 `{"name": <name>, "params": {...}}` (`cli/verification/case_config.h`, the only place the
 parameter names appear). Unknown names, unknown or missing parameters and wrong types are
 errors. A boundary condition is `{"type": "dirichlet" | "neumann" | "robin", "value": v,
@@ -160,8 +162,8 @@ The half-space and interface formulas hold in an infinite domain; on the box, th
 are set to `u = 0`, which the formula is not. `problem().boundary_error_bound` bounds
 `|u_exact|` there (from the nearest far face, e.g. `|q| K / eps_r * G(min(W, H - d))` for a
 Dirichlet plane). With screening and a box many screening lengths wide it is negligible
-(`e^-20`); without screening it is not, and errors below it mean nothing. The bound is in the
-`poisson_case` info and a warning of `poisson_diff`.
+(`e^-20`); without screening it is not, and errors below it mean nothing. The bound and a
+warning are in the `poisson_case` info.
 
 ## Generated input files
 
@@ -181,47 +183,6 @@ Dirichlet plane). With screening and a box many screening lengths wide it is neg
   importer reads back exactly the same doubles.
 - **`.cha`**: the charges (float32 position, int32 value); empty without charges.
 
-`interpolate_exact(mesh, case)` gives the exact potential at every node (`ExactInterpolationResult`).
-A node takes the formula of one of its tets' materials, a metal one if it has any. A node on
-a charge (within `1e-9` of the mesh's bounding box diagonal) is set to 0 with a warning.
-
-## Error evaluation
-
-`ErrorEvaluator(Settings{exclusion_radius, quadrature_degree})::evaluate(mesh, u, case)`
-returns `ErrorEvaluationResult`:
-
-- outputs: `element_l2_squared` and `element_h1_squared` (per tet, the integrals over its
-  measured part) and `node_error` (`u_h - u` per node, NaN where not measured);
-- `Info`: `l2_error`, `h1_error` (seminorm), `max_error` (nodes), `l2_exact` and `h1_exact`
-  over the same region (for relative errors), `metal_potential_error`, `measured_volume`,
-  `excluded_points`, `metal_elements`, `exclusion_radius`. The norms are sums of the outputs.
-
-Rules:
-
-- `u_h` is the P1 field of the nodal values; the exact values come from the case with the
-  tet's material at tet quadrature points of the chosen degree (default 4).
-- Metal tets are skipped: no equation is solved inside a metal. The potential of metal nodes
-  is checked separately as `metal_potential_error` (this is where a floating metal's
-  potential is tested).
-- Quadrature points and nodes closer than the exclusion radius to a charge are not measured
-  (P1 cannot follow `1/r`), and so is a quadrature point exactly on a charge. The radius is
-  in nm, not in elements, so meshes of different sizes measure the same region. The default
-  is the case's `default_exclusion_radius`: `min(1, half the distance to the nearest
-  boundary or interface)`. With radius 0 in a case with charges, a warning says that the
-  H1 and nodal numbers depend on where points fall (the exact H1 seminorm is infinite).
-- A field with a non-finite value is rejected (`std::invalid_argument`), as by the sampler.
-  An exact value that is not finite anywhere but exactly on a charge is an error
-  (`std::runtime_error`), not silently skipped.
-
-## Point sampling
-
-`FieldSampler::sample(mesh, u, points, case = nullptr)` locates each point with `MeshLocator`
-(walking from the previous point's tet) and returns `PointSamples`: `found`, `element`,
-`material`, `u`, the P1 gradient `grad`, and with a case `u_exact` and `grad_exact` from the
-material of the same located tet, so a plot of both never mixes the two sides of an
-interface. Points outside the mesh get NaN and are counted in the info.
-`FieldSampler::line(from, to, n)` gives `n` equally spaced points.
-
 ## Tests
 
 `tests/test_verification.cpp`:
@@ -236,10 +197,12 @@ interface. Points outside the mesh get NaN and are counted in the info.
 - invalid settings and problems without a unique solution are rejected;
 - the generated `.yaml`, `.geo` names and `.cha` bytes;
 - with gmsh installed: each case is meshed and imported and matches its case
-  (`mesh_mismatches` is empty); the interpolant of a piecewise linear case with a floating
-  metal has zero error, including the metal potential; a constant offset gives exactly that
-  error; the screened slab and a charged ball converge at second order in L2; sampling
-  returns the exact values; meshes of another case, or imported unscreened, are caught.
+  (`mesh_mismatches` is empty), including thin layers, charges with a refined mesh around
+  them, and a thin shell refined twice with AMR; meshes of another case are caught (other
+  `eps_r`, swapped end or shell conditions, other layer thickness or box size, a too small
+  ball, a missing boundary triangle, a second volume of a material with another voltage,
+  screening off at import).
 
-`tests/test_verification_runner.py` runs the same chain through the Python stages, including
-verification of a saved run in a separate evaluation.
+`tests/test_verification_runner.py` runs the chain through the Python stages (meshes of
+several cases and sizes, caching, saved runs keeping their case, the gmsh `.geo` guard, the
+CLI not publishing part of its outputs).
