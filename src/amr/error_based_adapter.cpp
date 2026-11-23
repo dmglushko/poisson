@@ -118,7 +118,7 @@ AdaptationResult ErrorBasedAdapter::Session::adapt_step(const MeshProperties& me
 
     // 2. Mark
     const auto mark_start = std::chrono::steady_clock::now();
-    const std::vector<uint32_t> marked = marking_->mark(mesh, est.eta);
+    const std::vector<uint32_t> marked = marking_->mark(mesh, est.eta, est.sum);
     const double mark_time = std::chrono::duration<double>(std::chrono::steady_clock::now() - mark_start).count();
     result.info.stages.push_back(StageInfo{
         .stage = "mark",

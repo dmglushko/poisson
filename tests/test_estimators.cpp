@@ -5,6 +5,7 @@
 #include "amr/kelly_estimator.h"
 #include "amr/recovery_estimator.h"
 #include "amr/residual_estimator.h"
+#include "amr/trajectory_estimator.h"
 #include "test_support.h"
 
 #include <numbers>
@@ -261,6 +262,210 @@ void test_bad_input() {
     CHECK_THROWS(std::invalid_argument, KellyEstimator().estimate(bad_eps, input_for(u)), "material 0 has eps_r");
 }
 
+// The trajectory estimator: zero where u_h is exact, total = sum of eta, and the right size
+// and rate for a smooth u. The exact contribution of K is |integral over K of grad(u - u_h)|,
+// and with grad u linear that is |K| |grad u(centroid) - grad u_h|.
+void test_trajectory() {
+    const TrajectoryEstimator trajectory;
+    CHECK(trajectory.name() == "trajectory");
+    CHECK(trajectory.indicator_sum() == IndicatorSum::values);
+    CHECK(ResidualEstimator().indicator_sum() == IndicatorSum::squares);
+
+    // Exact cases: linear u with Dirichlet data; u = x with Neumann g = 1 and Robin on x = 1;
+    // the kinked u with continuous flux across a material interface.
+    {
+        const MeshProperties mesh = cube_mesh(3);
+        const auto u = interpolate(mesh, [](const Vec3& p) { return 2 * p[0] + 3 * p[1] - p[2]; });
+        CHECK_NEAR(total(trajectory, mesh, input_for(u)), 0, 1e-12);
+    }
+    const std::vector<Bc> bcs{{BcType::Dirichlet, 0, {}}, {BcType::Neumann, 1, {}}, {BcType::Neumann, 0, {}},
+                              {BcType::Robin, 3, 2.0}, {BcType::Neumann, 0.5, {}}};
+    for (uint16_t side : {1, 3}) {
+        const MeshProperties mesh = cube_mesh(2, {0, side, 2, 2, 2, 2}, bcs);
+        const auto u = interpolate(mesh, [](const Vec3& p) { return p[0]; });
+        CHECK_NEAR(total(trajectory, mesh, input_for(u)), 0, 1e-12);
+    }
+    {
+        const MeshProperties mesh = cube_mesh(2, {0, 4, 2, 2, 2, 2}, bcs);   // wrong g = 0.5
+        const auto u = interpolate(mesh, [](const Vec3& p) { return p[0]; });
+        CHECK(total(trajectory, mesh, input_for(u)) > 1e-3);
+    }
+    {
+        const std::vector<MeshProperties::Material> materials{{"a", 1, 0, false, {}}, {"b", 4, 0, false, {}}};
+        const MeshProperties mesh =
+            cube_mesh(4, {0, 0, 1, 1, 1, 1}, {{BcType::Dirichlet, 0, {}}, {BcType::Neumann, 0, {}}}, materials, 0.5);
+        const auto u = interpolate(mesh, [](const Vec3& p) { return p[0] < 0.5 ? p[0] : 0.5 + (p[0] - 0.5) / 4; });
+        CHECK_NEAR(total(trajectory, mesh, input_for(u)), 0, 1e-12);
+    }
+
+    // u = x^2 + y z + 2 z^2 with Dirichlet data, f = -lap u = -6.
+    const auto exact = [](const Vec3& p) { return p[0] * p[0] + p[1] * p[2] + 2 * p[2] * p[2]; };
+    const auto grad_exact = [](const Vec3& p) { return Vec3{2 * p[0], p[2], p[1] + 4 * p[2]}; };
+    const auto f = [](const std::array<double, 3>&, uint32_t) { return -6.0; };
+    double previous = 0;
+    for (int n : {2, 4, 8}) {
+        const MeshProperties mesh = cube_mesh(n);
+        const auto u = interpolate(mesh, exact);
+        const ErrorEstimate e = trajectory.estimate(mesh, input_for(u, f));
+        CHECK(e.sum == IndicatorSum::values);
+        double sum = 0, true_total = 0;
+        for (uint32_t k = 0; k < mesh.elements.size(); ++k) {
+            sum += e.eta[k];
+            const auto& t = mesh.elements[k].node;
+            Vec3 centroid{};
+            for (uint32_t node : t)
+                for (int d = 0; d < 3; ++d) centroid[d] += mesh.nodes[node][d] / 4;
+            // grad u_h from the 3x3 system of the edge differences (Cramer).
+            std::array<Vec3, 3> edge;
+            Vec3 du;
+            for (int i = 0; i < 3; ++i) {
+                for (int d = 0; d < 3; ++d) edge[i][d] = mesh.nodes[t[i + 1]][d] - mesh.nodes[t[0]][d];
+                du[i] = u[t[i + 1]] - u[t[0]];
+            }
+            const auto det = [](const std::array<Vec3, 3>& m) {
+                return m[0][0] * (m[1][1] * m[2][2] - m[1][2] * m[2][1]) - m[0][1] * (m[1][0] * m[2][2] - m[1][2] * m[2][0]) +
+                       m[0][2] * (m[1][0] * m[2][1] - m[1][1] * m[2][0]);
+            };
+            const double d0 = det(edge);
+            Vec3 grad_h;
+            for (int c = 0; c < 3; ++c) {
+                auto m = edge;
+                for (int i = 0; i < 3; ++i) m[i][c] = du[i];
+                grad_h[c] = det(m) / d0;
+            }
+            const Vec3 g = grad_exact(centroid);
+            const double volume = std::abs(d0) / 6;
+            true_total += volume * std::sqrt((g[0] - grad_h[0]) * (g[0] - grad_h[0]) + (g[1] - grad_h[1]) * (g[1] - grad_h[1]) +
+                                             (g[2] - grad_h[2]) * (g[2] - grad_h[2]));
+        }
+        CHECK_NEAR(e.total, sum, 1e-12 * sum);
+        std::cout << "INFO trajectory n = " << n << ": estimate " << e.total << ", true " << true_total
+                  << ", effectivity " << e.total / true_total << "\n";
+        CHECK(e.total / true_total > 0.8 && e.total / true_total < 1.25);
+        if (n > 2) {
+            std::cout << "INFO trajectory rate n = " << n << ": ratio " << previous / e.total << "\n";
+            CHECK(previous / e.total > 1.7 && previous / e.total < 2.3);
+        }
+        previous = e.total;
+        // scale multiplies every indicator.
+        const ErrorEstimate scaled = TrajectoryEstimator({.scale = 2.5}).estimate(mesh, input_for(u, f));
+        CHECK_NEAR(scaled.total, 2.5 * e.total, 1e-12 * e.total);
+    }
+
+    // Metal tets are zero, and a source is needed.
+    const std::vector<MeshProperties::Material> materials{{"oxide", 3.9, 0, false, {}}, {"gate", 1, 0, true, 1.0}};
+    const MeshProperties metal = cube_mesh(4, {0, 0, 0, 0, 0, 0}, {{BcType::Dirichlet, 0, {}}}, materials, 0.5);
+    const auto u = interpolate(metal, [](const Vec3& p) { return std::sin(3 * p[0]) + p[1] * p[1]; });
+    const ErrorEstimate e = trajectory.estimate(metal, input_for(u));
+    bool metal_zero = true, oxide_positive = false;
+    for (uint32_t k = 0; k < metal.elements.size(); ++k) {
+        if (metal.elements[k].material == 1) metal_zero = metal_zero && e.eta[k] == 0;
+        else oxide_positive = oxide_positive || e.eta[k] > 0;
+    }
+    CHECK(metal_zero);
+    CHECK(oxide_positive);
+    CHECK_THROWS(std::invalid_argument, trajectory.estimate(metal, RefinementInput{u, {}, {}}), "needs the source f");
+    for (double scale : {0.0, -1.0, std::nan("")})
+        CHECK_THROWS(std::invalid_argument, TrajectoryEstimator({.scale = scale}), "TrajectoryEstimator::Settings::scale");
+    CHECK_THROWS(std::invalid_argument, TrajectoryEstimator({.face_degree = -1}), "TrajectoryEstimator::Settings::face_degree");
+}
+
+// One tet, (0,0,0), (1,0,0), (0,1,0), (0,0,1), with Dirichlet faces opposite nodes 0 and 1:
+// only the bubble of edge (0, 1) is free. Face (0,1,2) (z = 0) has `bottom` (Robin unless
+// replaced), face (0,1,3) (y = 0) is natural.
+MeshProperties one_bubble_tet(const Bc& bottom) {
+    MeshProperties mesh;
+    mesh.nodes = {{0, 0, 0}, {1, 0, 0}, {0, 1, 0}, {0, 0, 1}};
+    mesh.elements = {{{0, 1, 2, 3}, 0}};
+    mesh.boundary_conditions = {{BcType::Dirichlet, 0, {}}, bottom};
+    mesh.boundary_elements = {{{1, 3, 2}, 0}, {{0, 2, 3}, 0}, {{0, 2, 1}, 1}};
+    mesh.materials = {{"one", 1, 0, false, {}}};
+    return mesh;
+}
+
+// The analytic values of the one free bubble phi = 4 lambda_0 lambda_1 (|K| = 1/6,
+// grad lambda_0 = (-1,-1,-1), grad lambda_1 = (1,0,0)):
+//   integral of |grad phi|^2 = 16 |K| ((3 + 1) / 10 + 2 (-1) / 20) = 0.8,
+//   integral over the bottom (area 1/2) of phi^2 = area 8/45, of phi = area / 3,
+//   integral of grad phi = |K| (0, -1, -1), so eta = sqrt(2)/6 |a|.
+void test_trajectory_one_bubble() {
+    const std::vector<double> zero(4, 0.0);
+    // Robin alpha = 2, g = 3 with u = 0, f = 0: load 3 * area / 3 = 0.5, matrix 0.8 + 2 * 8/90.
+    const MeshProperties robin = one_bubble_tet({BcType::Robin, 3, 2.0});
+    const double a_robin = 0.5 / (0.8 + 2 * 0.5 * 8 / 45);
+    CHECK_NEAR(TrajectoryEstimator().estimate(robin, input_for(zero)).total, std::sqrt(2.0) / 6 * a_robin, 1e-12);
+    // Neumann g = 3: no mass term.
+    const MeshProperties neumann = one_bubble_tet({BcType::Neumann, 3, {}});
+    CHECK_NEAR(TrajectoryEstimator().estimate(neumann, input_for(zero)).total, std::sqrt(2.0) / 6 * 0.5 / 0.8, 1e-12);
+    // f = 1, natural bottom: load integral of phi = 4 |K| / 20 = 1/30.
+    MeshProperties natural = one_bubble_tet({BcType::Neumann, 0, {}});
+    const auto one = [](const std::array<double, 3>&, uint32_t) { return 1.0; };
+    const double eta_one = TrajectoryEstimator().estimate(natural, input_for(zero, one)).total;
+    CHECK_NEAR(eta_one, std::sqrt(2.0) / 6 * (1.0 / 30) / 0.8, 1e-12);
+    // Huge and tiny sources: eta scales with f, no overflow or underflow in |integral|.
+    const auto huge = [](const std::array<double, 3>&, uint32_t) { return 1e200; };
+    const auto tiny = [](const std::array<double, 3>&, uint32_t) { return 1e-200; };
+    CHECK_NEAR(TrajectoryEstimator().estimate(natural, input_for(zero, huge)).total / 1e200, eta_one, 1e-12);
+    CHECK_NEAR(TrajectoryEstimator().estimate(natural, input_for(zero, tiny)).total * 1e200, eta_one, 1e-12);
+    // A negative Robin alpha is rejected (the local problem could be singular).
+    CHECK_THROWS(std::invalid_argument, TrajectoryEstimator().estimate(one_bubble_tet({BcType::Robin, 3, -9.0}), input_for(zero)),
+                 "negative Robin alpha");
+
+    // A metal tet below the bottom face instead of the boundary element: at a prescribed
+    // voltage the face is Dirichlet for the dielectric (the free bubble is dropped, eta = 0);
+    // a floating metal is skipped (natural, the f = 1 value above).
+    for (const bool fixed : {true, false}) {
+        MeshProperties mesh = one_bubble_tet({BcType::Neumann, 0, {}});
+        mesh.boundary_elements.pop_back();
+        mesh.nodes.push_back({0.2, 0.2, -1});
+        std::array<uint32_t, 4> metal{0, 1, 2, 4};
+        if (signed_volume(mesh, metal) < 0) std::swap(metal[1], metal[2]);
+        mesh.elements.push_back({metal, 1});
+        mesh.materials.push_back({"gate", 1, 0, true, fixed ? std::optional(1.0) : std::nullopt});
+        const std::vector<double> u(5, 0.0);
+        const ErrorEstimate e = TrajectoryEstimator().estimate(mesh, input_for(u, one));
+        CHECK(e.eta[1] == 0);
+        if (fixed) CHECK(e.eta[0] == 0);
+        else CHECK_NEAR(e.eta[0], eta_one, 1e-12);
+    }
+}
+
+// Two tets sharing face (1, 2, 3), permittivities 1 and 4, a piecewise-linear u with a nonzero
+// weighted flux jump. Checks the face-to-edge mapping (eta must not depend on the local node
+// order) and an interior Dirichlet tag (it decouples the two local problems).
+void test_trajectory_two_tets() {
+    const auto two_tets = [](double eps_b, bool permuted, bool interior_dirichlet) {
+        MeshProperties mesh;
+        mesh.nodes = {{0, 0, 0}, {1, 0, 0}, {0, 1, 0}, {0, 0, 1}, {1, 1, 1}};
+        std::array<uint32_t, 4> a{0, 1, 2, 3}, b{1, 2, 3, 4};
+        if (signed_volume(mesh, a) < 0) std::swap(a[2], a[3]);
+        if (signed_volume(mesh, b) < 0) std::swap(b[2], b[3]);
+        if (permuted) {   // 3-cycles keep the orientation
+            a = {a[1], a[2], a[0], a[3]};
+            b = {b[0], b[2], b[3], b[1]};
+        }
+        mesh.elements = {{a, 0}, {b, 1}};
+        mesh.materials = {{"a", 1, 0, false, {}}, {"b", eps_b, 0, false, {}}};
+        if (interior_dirichlet) {
+            mesh.boundary_conditions = {{BcType::Dirichlet, 0, {}}};
+            mesh.boundary_elements = {{{1, 2, 3}, 0}};
+        }
+        return mesh;
+    };
+    const std::vector<double> u{0.3, -1, 2, 0.5, 1.7}, u_moved{0.3, -1, 2, 0.5, -5};
+    const TrajectoryEstimator trajectory;
+    const ErrorEstimate plain = trajectory.estimate(two_tets(4, false, false), input_for(u));
+    const ErrorEstimate permuted = trajectory.estimate(two_tets(4, true, false), input_for(u));
+    CHECK(plain.eta[0] > 0 && plain.eta[1] > 0);
+    for (int k = 0; k < 2; ++k) CHECK_NEAR(permuted.eta[k], plain.eta[k], 1e-12 * plain.eta[k]);
+    // Without the tag, tet 0 sees tet 1 through the jump; with it, it does not.
+    CHECK(std::abs(trajectory.estimate(two_tets(10, false, false), input_for(u_moved)).eta[0] - plain.eta[0]) >
+          1e-6 * plain.eta[0]);
+    const double tagged = trajectory.estimate(two_tets(4, false, true), input_for(u)).eta[0];
+    CHECK(std::abs(tagged - plain.eta[0]) > 1e-6 * plain.eta[0]);
+    CHECK_NEAR(trajectory.estimate(two_tets(10, true, true), input_for(u_moved)).eta[0], tagged, 1e-12 * tagged);
+}
+
 int main() {
     test_linear_is_exact();
     test_natural_conditions();
@@ -271,5 +476,8 @@ int main() {
     test_point_sources();
     test_large_scale_and_many_materials();
     test_bad_input();
+    test_trajectory();
+    test_trajectory_one_bubble();
+    test_trajectory_two_tets();
     return finish("estimator");
 }

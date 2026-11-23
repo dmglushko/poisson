@@ -39,6 +39,13 @@ void test_dorfler() {
     CHECK(mark(DorflerMarking({.theta = 0.5}), {2, 2, 2, 2}) == (Marked{0, 1}));
     CHECK(mark(DorflerMarking({.theta = 0.5}), {1e200, 1e300, 1e300}) == (Marked{1}));   // no overflow
     CHECK(mark(DorflerMarking({.theta = 1}), {1e-4, 1e-13}) == (Marked{0, 1}));
+    // IndicatorSum::values: the indicators themselves add up, total 9.
+    const auto mark_values = [](const MarkingStrategy& strategy, const std::vector<double>& values) {
+        return strategy.mark(mesh_with(values.size()), values, IndicatorSum::values);
+    };
+    CHECK(mark_values(DorflerMarking({.theta = 0.3}), eta) == (Marked{1}));       // 2.7
+    CHECK(mark_values(DorflerMarking({.theta = 0.67}), eta) == (Marked{1, 2, 3}));   // 6 < 6.03 needs a third
+    CHECK(mark(DorflerMarking({.theta = 0.67}), eta) == (Marked{1, 3}));             // squares: 18 >= 15.41
     check_bad_indicators(DorflerMarking());
     for (double theta : {-1e-9, 1.5, std::nan("")})
         CHECK_THROWS(std::invalid_argument, DorflerMarking({.theta = theta}), "DorflerMarking::Settings::theta must be in [0, 1]");
@@ -69,6 +76,9 @@ void test_fixed_fraction() {
 void test_equidistribution() {
     // Bound 2 / sqrt(4) = 1.
     CHECK(mark(EquidistributionMarking({.tolerance = 2}), {0.5, 1, 2, 0.99}) == (Marked{1, 2}));
+    // IndicatorSum::values: bound 2 / 4 = 0.5.
+    CHECK(EquidistributionMarking({.tolerance = 2}).mark(mesh_with(4), std::vector<double>{0.4, 1, 2, 0.5},
+                                                         IndicatorSum::values) == (Marked{1, 2, 3}));
     check_bad_indicators(EquidistributionMarking({.tolerance = 1}));
     for (double tolerance : {0.0, -1.0, std::nan(""), std::numeric_limits<double>::infinity()})
         CHECK_THROWS(std::invalid_argument, EquidistributionMarking({.tolerance = tolerance}),

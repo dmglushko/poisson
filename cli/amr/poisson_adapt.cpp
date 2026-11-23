@@ -5,6 +5,7 @@
 #include "amr/recovery_estimator.h"
 #include "amr/red_green_refinement.h"
 #include "amr/residual_estimator.h"
+#include "amr/trajectory_estimator.h"
 #include "cli/common/cli_utils.h"
 #include "cli/common/simple_json.h"
 #include "io/amr_io.h"
@@ -133,6 +134,18 @@ ParsedConfig parse_config(const JsonValue& root) {
             if (auto p = eo.find("constant_source"); p != eo.end() && !p->second.is_null())
                 cfg.constant_source = p->second.as_double("constant_source");
             cfg.estimator = std::make_shared<ResidualEstimator>(s);
+        } else if (type == "trajectory") {
+            reject_unknown_keys(eo, {"type", "scale", "tet_degree", "face_degree", "point_sources", "constant_source"},
+                                "config.estimator");
+            TrajectoryEstimator::Settings s;
+            if (auto p = eo.find("scale"); p != eo.end()) s.scale = p->second.as_double("scale");
+            if (auto p = eo.find("tet_degree"); p != eo.end()) s.tet_degree = p->second.as_int("tet_degree");
+            if (auto p = eo.find("face_degree"); p != eo.end()) s.face_degree = p->second.as_int("face_degree");
+            if (auto p = eo.find("point_sources"); p != eo.end())
+                s.point_sources = parse_point_source_rule(p->second, "point_sources");
+            if (auto p = eo.find("constant_source"); p != eo.end() && !p->second.is_null())
+                cfg.constant_source = p->second.as_double("constant_source");
+            cfg.estimator = std::make_shared<TrajectoryEstimator>(s);
         } else {
             throw std::runtime_error("config.estimator.type: unknown estimator '" + type + "'");
         }

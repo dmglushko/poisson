@@ -31,8 +31,8 @@ flowchart LR
 | Step | Interface | Methods | Header |
 |---|---|---|---|
 | adapt (top-level) | `MeshAdapter::start()` → `Session::adapt(mesh, input)` → `AdaptationResult` | `ErrorBasedAdapter` (extensible to metric-based, etc.) | `include/amr/mesh_adapter.h`, `include/amr/error_based_adapter.h` |
-| estimate | `ErrorEstimator::estimate(mesh, input)` → `ErrorEstimate` | `ResidualEstimator`, `KellyEstimator`, `RecoveryEstimator` | `include/amr/error_estimator.h` and one header per method |
-| mark | `MarkingStrategy::mark(mesh, eta)` → sorted tet indices | `DorflerMarking`, `MaximumMarking`, `FixedFractionMarking`, `EquidistributionMarking` | `include/amr/marking.h` |
+| estimate | `ErrorEstimator::estimate(mesh, input)` → `ErrorEstimate` | `ResidualEstimator`, `KellyEstimator`, `RecoveryEstimator`, `TrajectoryEstimator` | `include/amr/error_estimator.h` and one header per method |
+| mark | `MarkingStrategy::mark(mesh, eta, sum)` → sorted tet indices | `DorflerMarking`, `MaximumMarking`, `FixedFractionMarking`, `EquidistributionMarking` | `include/amr/marking.h` |
 | refine | `Refiner::refine(mesh, marked, history)` → `RefinementResult` | `LongestEdgeBisection`, `RedGreenRefinement` | `include/amr/refiner.h` and one header per method |
 
 The top-level solver loop (`PoissonDriver`) is sketched as a placeholder in
@@ -71,7 +71,7 @@ struct AdaptationResult {
 Adapter-specific per-cycle data goes in the `extras` variant so top-level `AdaptationResult`
 fields stay strictly common across all adapters. For `ErrorBasedAdapter`, `extras` holds
 `ErrorBasedExtras{eta}` (computed on the input mesh before any refinement; its norm
-$\sqrt{\sum_K \eta_K^2}$ is the `total` metric of the `estimate` entry in `info.stages`) on every outcome where the estimator ran (`adapted`,
+$\sqrt{\sum_K \eta_K^2}$, or $\sum_K \eta_K$ for an estimator with `IndicatorSum::values`, is the `total` metric of the `estimate` entry in `info.stages`) on every outcome where the estimator ran (`adapted`,
 `converged`, `unchanged`, and `limit_reached` with `estimate_at_limit = true`), and
 `std::monostate` when estimation was skipped. Mesh-sized arrays (`mesh`, `parents`, `eta`)
 are result data, never `Info`, so CLIs write them as `.h5` and `Info` as `.info.json`.
@@ -133,6 +133,7 @@ The equation they assume, per tet with its material's `eps_r` and `screening_len
 | residual | `h_K^2/eps_K ‖f − c u_h‖²` | `h_F/(2 eps_F) ‖J_F‖²` | `h_F/eps_K ‖R_F‖²` | yes |
 | Kelly | — | same | same | no |
 | recovery | `∫ eps |G − ∇u_h|²` (or the flux form) | — | — | no |
+| trajectory | `|∫_K ∇e_K|`, `e_K` from a local problem (below) | load `−J_F/2` | load `R_F` | yes |
 
 Shared rules (in `ErrorEstimator::estimate`):
 
@@ -146,6 +147,29 @@ Shared rules (in `ErrorEstimator::estimate`):
 Recovery averages per material by default (`per_material = true`): neither `grad u` nor
 `eps grad u` is continuous across an interface, so averaging across it would report error
 on every interface tet forever.
+
+### Indicator sum
+
+Each estimator declares how its indicators add up (`IndicatorSum`, `include/amr/indicator_sum.h`):
+`squares` ($\text{total}^2 = \sum_K \eta_K^2$, the norm estimators) or `values`
+($\text{total} = \sum_K \eta_K$). `ErrorEstimate::sum` carries it, `ErrorBasedAdapter` passes it to
+`MarkingStrategy::mark`, and the strategies that compare sums follow it: Dörfler accumulates
+$\eta_K$ instead of $\eta_K^2$, equidistribution uses the bound `tolerance / N` instead of
+`tolerance / sqrt(N)`. Maximum and fixed-fraction marking only rank, so they ignore it.
+
+### Trajectory estimator
+
+Mitchell and Villarrubia, *SEM simulation with adaptive mesh refinement*, Secs. 3.3–3.4. It
+estimates each tet's contribution to an electron's landing-position error, which is linear in
+the field error, so it uses `IndicatorSum::values`. On every tet the Bank–Weiser local problem
+is solved in the six quadratic edge bubbles (a 6×6 system, no global solve): element load
+`f − c u_h`, half the flux mismatch on interior faces, the full residual on Neumann/Robin faces,
+`e_K = 0` on Dirichlet faces. Then $\eta_K = \text{scale}\,|\int_K \nabla e_K|$, the paper's
+$h_K^3 |\langle\nabla e\rangle_K|$ with $h_K = |K|^{1/3}$. `scale` is the paper's $eR/(4TV)$. It
+does not change what the relative rules do (Dörfler, maximum, fixed fraction,
+`relative_tolerance`); with it, `total` estimates the relative landing-position error, so
+`absolute_tolerance` and equidistribution's `tolerance` get a meaning. A face to a metal with
+a prescribed voltage is a Dirichlet face for the local problem. The paper validates the indicator only without screening.
 
 Quadrature comes from `include/common/quadrature.h` (collapsed Gauss rules on tets and
 triangles, any degree up to 20, positive weights); it lives in `common/` because Assembly

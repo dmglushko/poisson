@@ -57,6 +57,9 @@ ErrorEstimate ErrorEstimator::estimate(const MeshProperties& mesh, const Refinem
         const auto& bc = mesh.boundary_conditions[c];
         if (!std::isfinite(bc.value) || (bc.alpha && !std::isfinite(*bc.alpha)))
             throw std::invalid_argument(who + ": boundary condition " + std::to_string(c) + " is not finite");
+        if (bc.type == MeshProperties::BcType::Robin && bc.alpha && *bc.alpha < 0)
+            throw std::invalid_argument(who + ": boundary condition " + std::to_string(c) +
+                                        " has a negative Robin alpha");
     }
     if (needs_source() && !input.source)
         throw std::invalid_argument(who + ": needs the source f, but input.source is empty");
@@ -113,7 +116,7 @@ ErrorEstimate ErrorEstimator::estimate(const MeshProperties& mesh, const Refinem
     for (std::size_t k = 0; k < result.eta.size(); ++k)
         if (excluded_mask[k]) result.eta[k] = 0;
 
-    // Scaled Euclidean norm so large finite indicators (e.g. 1e200) do not overflow when squared.
+    // Scaled sums so large finite indicators (e.g. 1e200) do not overflow when squared.
     double largest = 0;
     for (std::size_t k = 0; k < result.eta.size(); ++k) {
         if (!(std::isfinite(result.eta[k]) && result.eta[k] >= 0))
@@ -125,10 +128,11 @@ ErrorEstimate ErrorEstimator::estimate(const MeshProperties& mesh, const Refinem
     if (largest > 0) {
         for (double v : result.eta) {
             const double r = v / largest;
-            scaled_sum += r * r;
+            scaled_sum += sum_ == IndicatorSum::squares ? r * r : r;
         }
     }
-    result.total = largest * std::sqrt(scaled_sum);
+    result.sum = sum_;
+    result.total = largest * (sum_ == IndicatorSum::squares ? std::sqrt(scaled_sum) : scaled_sum);
 
     result.info.elements = static_cast<uint32_t>(mesh.elements.size());
     result.info.max_indicator = largest;

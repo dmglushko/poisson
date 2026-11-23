@@ -83,6 +83,7 @@ add_library(poisson_amr STATIC
     src/amr/error_estimator.cpp
     src/amr/residual_estimators.cpp
     src/amr/recovery_estimator.cpp
+    src/amr/trajectory_estimator.cpp
     src/amr/marking.cpp
     src/amr/refinement_common.cpp
     src/amr/refiner.cpp

@@ -5,6 +5,7 @@
 #include "amr/longest_edge_bisection.h"
 #include "amr/red_green_refinement.h"
 #include "amr/residual_estimator.h"
+#include "amr/trajectory_estimator.h"
 #include "poisson_driver.h"
 #include "test_support.h"
 
@@ -370,6 +371,47 @@ void test_eta_returned() {
           unchanged_eb->eta.size() == mesh.elements.size());
 }
 
+// An estimator whose indicators add up linearly (IndicatorSum::values): the adapter's total
+// is their sum and Dörfler marking accumulates them, not their squares.
+void test_linear_indicator_sum() {
+    class Ramp final : public ErrorEstimator {
+    public:
+        Ramp() : ErrorEstimator(PointSourceRule::ignore, IndicatorSum::values) {}
+        std::string name() const override { return "ramp"; }
+
+    private:
+        std::vector<double> indicators(const MeshProperties& mesh, const RefinementInput&, std::span<const uint8_t>,
+                                       ErrorEstimate::Info&) const override {
+            std::vector<double> eta(mesh.elements.size());
+            for (std::size_t k = 0; k < eta.size(); ++k) eta[k] = double(k + 1);
+            return eta;
+        }
+        bool needs_source() const override { return false; }
+    };
+    const MeshProperties mesh = cube_mesh(2);   // 48 tets
+    const std::vector<double> u(mesh.nodes.size(), 0.0);
+    const ErrorBasedAdapter adapter(std::make_shared<Ramp>(), std::make_shared<DorflerMarking>(),
+                                    std::make_shared<LongestEdgeBisection>());
+    const AdaptationResult r = adapter.start()->adapt(mesh, RefinementInput{u, {}, {}});
+    CHECK(r.status == AdaptationStatus::adapted);
+    CHECK_NEAR(estimated_total(r).value(), 48.0 * 49.0 / 2, 1e-9);
+    const auto& eta = std::get<ErrorBasedExtras>(r.extras).eta;
+    const double by_values = double(DorflerMarking().mark(mesh, eta, IndicatorSum::values).size());
+    const double by_squares = double(DorflerMarking().mark(mesh, eta).size());
+    CHECK(by_values != by_squares);
+    CHECK(r.info.stages[1].stage == "mark" && r.info.stages[1].metrics.at("marked") == by_values);
+
+    // The trajectory estimator runs in the adapter like any other.
+    const auto smooth = smooth_u(mesh);
+    const ErrorBasedAdapter trajectory(std::make_shared<TrajectoryEstimator>(), std::make_shared<DorflerMarking>(),
+                                       std::make_shared<RedGreenRefinement>());
+    const AdaptationResult t = trajectory.start()->adapt(mesh, smooth_input(smooth));
+    CHECK(t.status == AdaptationStatus::adapted);
+    double sum = 0;
+    for (double e : std::get<ErrorBasedExtras>(t.extras).eta) sum += e;
+    CHECK_NEAR(estimated_total(t).value(), sum, 1e-12 * sum);
+}
+
 int main() {
     test_multi_cycle_and_session_history();
     test_absolute_and_combined_tolerance();
@@ -379,5 +421,6 @@ int main() {
     test_bad_inputs();
     test_state_resume_matches_one_session();
     test_eta_returned();
+    test_linear_indicator_sum();
     return finish("adapter");
 }

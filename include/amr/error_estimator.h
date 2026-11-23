@@ -1,5 +1,6 @@
 #pragma once
 
+#include "amr/indicator_sum.h"
 #include "amr/refinement_input.h"
 #include "mesh_properties.h"
 
@@ -35,31 +36,35 @@ struct ErrorEstimate {
     };
 
     std::vector<double> eta;                      // eta_K per tet, same index as MeshProperties::elements
-    double              total = 0;                // sqrt(sum of eta_K^2)
+    double              total = 0;                // sqrt(sum of eta_K^2), or sum of eta_K (see sum)
     Info                info;
+    IndicatorSum        sum = IndicatorSum::squares;   // the estimator's indicator_sum()
 };
 
 // The common interface of the error estimators. Each estimator has its own Settings, given
 // to its constructor and checked there (std::invalid_argument).
 //
 // estimate() is not virtual: it checks the input, times the work, applies the point source
-// rule, adds the total and the shared metrics, and asks the estimator for the indicators
+// rule, adds the total (as indicator_sum() says) and the shared metrics, and asks the estimator for the indicators
 // (indicators()). So the checks are written once and no estimator can skip them.
 class ErrorEstimator {
 public:
     virtual ~ErrorEstimator() = default;
     virtual std::string name() const = 0;
+    // How the indicators add up to the total; marking follows it.
+    IndicatorSum indicator_sum() const { return sum_; }
 
     // The error indicators of the solution input.u of the problem on `mesh`. Throws
     // std::invalid_argument for a bad input, naming it: u not one finite value per node; no
     // source for an estimator that needs one; a point source that is not finite or names
     // an element out of range; a tet with a volume that is not positive; a source value
-    // that is not finite. A metal tet (Material::is_metal) has eta_K = 0: u is one constant
+    // that is not finite; a negative Robin alpha. A metal tet (Material::is_metal) has eta_K = 0: u is one constant
     // there.
     ErrorEstimate estimate(const MeshProperties& mesh, const RefinementInput& input) const;
 
 protected:
-    explicit ErrorEstimator(PointSourceRule point_sources) : point_sources_(point_sources) {}
+    explicit ErrorEstimator(PointSourceRule point_sources, IndicatorSum sum = IndicatorSum::squares)
+        : point_sources_(point_sources), sum_(sum) {}
 
 private:
     // Called by estimate() with a checked input and the point-source exclusion mask
@@ -71,4 +76,5 @@ private:
     virtual bool needs_source() const = 0;
 
     PointSourceRule point_sources_;
+    IndicatorSum    sum_;
 };

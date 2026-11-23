@@ -1,5 +1,6 @@
 #pragma once
 
+#include "amr/indicator_sum.h"
 #include "mesh_properties.h"
 
 #include <cstdint>
@@ -22,19 +23,21 @@ public:
     // one indicator per tet (eta[k] belongs to mesh.elements[k]), each finite and
     // non-negative; otherwise std::invalid_argument, naming the tet. A tet with eta_K = 0 is
     // never marked, so all zeros mark nothing. Deterministic: equal indicators are ordered
-    // by tet index.
-    std::vector<uint32_t> mark(const MeshProperties& mesh, std::span<const double> eta) const;
+    // by tet index. `sum` says how the indicators add up (ErrorEstimate::sum); only the
+    // strategies that compare sums of indicators (Dörfler, equidistribution) use it.
+    std::vector<uint32_t> mark(const MeshProperties& mesh, std::span<const double> eta,
+                               IndicatorSum sum = IndicatorSum::squares) const;
 
 private:
     // Called by mark() with valid indicators, at least one of them positive. Returns the
     // tets the strategy picks, in any order and possibly with zero indicators; mark() drops
     // those and sorts.
-    virtual std::vector<uint32_t> select(std::span<const double> eta) const = 0;
+    virtual std::vector<uint32_t> select(std::span<const double> eta, IndicatorSum sum) const = 0;
 };
 
 // Dörfler (bulk) marking: the smallest set M of tets with
 //   sum over M of eta_K^2 >= theta * sum over all K of eta_K^2,
-// taken largest indicator first.
+// taken largest indicator first. With IndicatorSum::values, eta_K in place of eta_K^2.
 class DorflerMarking final : public MarkingStrategy {
 public:
     struct Settings {
@@ -46,7 +49,7 @@ public:
     std::string name() const override { return "dorfler"; }
 
 private:
-    std::vector<uint32_t> select(std::span<const double> eta) const override;
+    std::vector<uint32_t> select(std::span<const double> eta, IndicatorSum sum) const override;
     Settings settings_;
 };
 
@@ -62,7 +65,7 @@ public:
     std::string name() const override { return "maximum"; }
 
 private:
-    std::vector<uint32_t> select(std::span<const double> eta) const override;
+    std::vector<uint32_t> select(std::span<const double> eta, IndicatorSum sum) const override;
     Settings settings_;
 };
 
@@ -79,12 +82,13 @@ public:
     std::string name() const override { return "fixed_fraction"; }
 
 private:
-    std::vector<uint32_t> select(std::span<const double> eta) const override;
+    std::vector<uint32_t> select(std::span<const double> eta, IndicatorSum sum) const override;
     Settings settings_;
 };
 
-// Equidistribution marking: every tet with eta_K >= tolerance / sqrt(N). If every indicator
-// were exactly at that bound, the total would be the tolerance.
+// Equidistribution marking: every tet with eta_K >= tolerance / sqrt(N), or tolerance / N
+// with IndicatorSum::values. If every indicator were exactly at that bound, the total would
+// be the tolerance.
 class EquidistributionMarking final : public MarkingStrategy {
 public:
     struct Settings {
@@ -95,6 +99,6 @@ public:
     std::string name() const override { return "equidistribution"; }
 
 private:
-    std::vector<uint32_t> select(std::span<const double> eta) const override;
+    std::vector<uint32_t> select(std::span<const double> eta, IndicatorSum sum) const override;
     Settings settings_;
 };
