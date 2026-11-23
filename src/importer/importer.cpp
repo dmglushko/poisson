@@ -839,7 +839,14 @@ std::optional<MatProperty> read_mat_property(const fs::path& file, hid_t h5, con
 MaterialFile read_mat_file(const fs::path& file) {
     if (!fs::is_regular_file(file)) fail(file, "file not found");
     H5Eset_auto2(H5E_DEFAULT, nullptr, nullptr);   // errors are reported by exceptions here
-    const H5Handle h5(H5Fopen(file.string().c_str(), H5F_ACC_RDONLY, H5P_DEFAULT), H5Fclose);
+    // HDF5's own file locking is off: the file is only read, and on cluster filesystems without
+    // flock support the lock makes H5Fopen fail.
+    const H5Handle fapl(H5Pcreate(H5P_FILE_ACCESS), H5Pclose);
+    if (fapl.id < 0) fail(file, "failed to create HDF5 file access property list");
+#if H5_VERSION_GE(1, 12, 1) || (H5_VERSION_GE(1, 10, 7) && !H5_VERSION_GE(1, 12, 0))
+    if (H5Pset_file_locking(fapl.id, false, true) < 0) fail(file, "failed to disable HDF5 file locking");
+#endif
+    const H5Handle h5(H5Fopen(file.string().c_str(), H5F_ACC_RDONLY, fapl.id), H5Fclose);
     if (h5.id < 0) fail(file, "not a Nebula material file (HDF5)");
 
     MaterialFile result;

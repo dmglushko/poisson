@@ -20,11 +20,20 @@ void H5Handle::close_file_checked(const fs::path& file) {
     if (flush_err < 0 || close_err < 0) fail(file, "failed to flush or close HDF5 file");
 }
 
+H5Handle unlocked_file_access(const fs::path& file) {
+    H5Handle fapl(H5Pcreate(H5P_FILE_ACCESS), H5Pclose);
+    if (fapl.id < 0) fail(file, "failed to create HDF5 file access property list");
+#if H5_VERSION_GE(1, 12, 1) || (H5_VERSION_GE(1, 10, 7) && !H5_VERSION_GE(1, 12, 0))
+    if (H5Pset_file_locking(fapl.id, false, true) < 0) fail(file, "failed to disable HDF5 file locking");
+#endif
+    return fapl;
+}
+
 H5Handle create_deterministic_h5(const fs::path& file) {
     H5Eset_auto2(H5E_DEFAULT, nullptr, nullptr);
     const H5Handle fcpl(H5Pcreate(H5P_FILE_CREATE), H5Pclose);
-    const H5Handle fapl(H5Pcreate(H5P_FILE_ACCESS), H5Pclose);
-    if (fcpl.id < 0 || fapl.id < 0) fail(file, "failed to create HDF5 property lists");
+    const H5Handle fapl = unlocked_file_access(file);
+    if (fcpl.id < 0) fail(file, "failed to create HDF5 property lists");
     if (H5Pset_obj_track_times(fcpl.id, false) < 0) fail(file, "failed to disable root timestamp tracking");
     if (H5Pset_libver_bounds(fapl.id, H5F_LIBVER_V18, H5F_LIBVER_V18) < 0)
         fail(file, "failed to set HDF5 library version bounds");
@@ -37,7 +46,8 @@ H5Handle create_deterministic_h5(const fs::path& file) {
 H5Handle open_readonly_h5(const fs::path& file) {
     if (!fs::is_regular_file(file)) fail(file, "file not found");
     H5Eset_auto2(H5E_DEFAULT, nullptr, nullptr);
-    H5Handle h5(H5Fopen(file.string().c_str(), H5F_ACC_RDONLY, H5P_DEFAULT), H5Fclose);
+    const H5Handle fapl = unlocked_file_access(file);
+    H5Handle h5(H5Fopen(file.string().c_str(), H5F_ACC_RDONLY, fapl.id), H5Fclose);
     if (h5.id < 0) fail(file, "cannot open HDF5 file");
     return h5;
 }

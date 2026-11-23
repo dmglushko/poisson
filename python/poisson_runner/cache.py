@@ -10,6 +10,8 @@ import fcntl
 import json
 import os
 import re
+import shutil
+import signal
 import socket
 import threading
 import time
@@ -85,6 +87,60 @@ def normalize_cache_mode(value: CacheMode | str | bool) -> CacheMode:
 
 _HEX64_RE = re.compile(r"^[0-9a-f]{64}$")
 _SAFE_EXT_RE = re.compile(r"^\.[A-Za-z0-9._-]{1,32}$")
+_SAFE_TOKEN_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
+_LINK_UNSUPPORTED_ERRNOS = frozenset({errno.EPERM, errno.EOPNOTSUPP, errno.EXDEV, errno.EMLINK, errno.ENOSYS})
+
+
+@contextlib.contextmanager
+def _defer_sigterm() -> Iterator[None]:
+    """Block SIGTERM across a brief syscall+state-flag transition so finally cleanup is always armed."""
+    if not hasattr(signal, "pthread_sigmask"):
+        yield
+        return
+    prev = signal.pthread_sigmask(signal.SIG_BLOCK, {signal.SIGTERM})
+    try:
+        yield
+    finally:
+        if signal.SIGTERM not in prev:
+            signal.pthread_sigmask(signal.SIG_UNBLOCK, {signal.SIGTERM})
+
+
+def _entry_latest_mtime(path: Path) -> float:
+    """Latest mtime of a file, or of a directory and any files inside it."""
+    latest = path.stat().st_mtime
+    if path.is_dir():
+        for root, _, files in os.walk(path):
+            root_path = Path(root)
+            try:
+                mt = root_path.stat().st_mtime
+                if mt > latest:
+                    latest = mt
+            except OSError:
+                pass
+            for name in files:
+                try:
+                    mt = (root_path / name).stat().st_mtime
+                    if mt > latest:
+                        latest = mt
+                except OSError:
+                    pass
+    return latest
+
+
+def _count_files_in_entry(path: Path) -> int:
+    if path.is_dir():
+        count = 0
+        for _, _, files in os.walk(path):
+            count += len(files)
+        return max(1, count)
+    return 1
+
+
+def _remove_entry(path: Path) -> None:
+    if path.is_dir() and not path.is_symlink():
+        shutil.rmtree(path, ignore_errors=True)
+    else:
+        path.unlink(missing_ok=True)
 
 
 def _validate_ext(ext: str) -> str:
@@ -157,6 +213,7 @@ class CacheLease:
         self._active = False
         self._uses_flock = False
         self._object_names: set[str] = set()
+        self._replace_on_next_pin = False
         self._stop_heartbeat: threading.Event | None = None
         self._heartbeat_thread: threading.Thread | None = None
 
@@ -180,35 +237,47 @@ class CacheLease:
     def __enter__(self) -> CacheLease:
         if self._cache.lock_mode == LockMode.NONE:
             return self
-        with self._cache._locked():
-            self._cache.leases_dir.mkdir(parents=True, exist_ok=True)
-            self._fp = open(self._path, "w+", encoding="utf-8")
-            if self._cache.lock_mode == LockMode.FLOCK:
-                try:
-                    fcntl.flock(self._fp.fileno(), fcntl.LOCK_EX)
-                    self._uses_flock = True
-                except OSError as exc:
-                    if exc.errno not in _FLOCK_UNSUPPORTED_ERRNOS:
-                        self._fp.close()
-                        self._fp = None
-                        self._path.unlink(missing_ok=True)
-                        raise
-                    self._uses_flock = False
-            self._active = True
-            self._sync()
-        if not self._uses_flock:
-            self._start_heartbeat()
+        try:
+            with self._cache._locked():
+                self._cache.leases_dir.mkdir(parents=True, exist_ok=True)
+                with _defer_sigterm():
+                    self._fp = open(self._path, "w+", encoding="utf-8")
+                if self._cache.lock_mode == LockMode.FLOCK:
+                    try:
+                        fcntl.flock(self._fp.fileno(), fcntl.LOCK_EX)
+                        self._uses_flock = True
+                    except OSError as exc:
+                        if exc.errno not in _FLOCK_UNSUPPORTED_ERRNOS:
+                            raise
+                        self._uses_flock = False
+                self._active = True
+                self._sync()
+            if not self._uses_flock:
+                self._start_heartbeat()
+        except BaseException:
+            self.close()
+            raise
         return self
 
     def __exit__(self, exc_type: Any, exc: Any, tb: Any) -> None:
         self.close()
 
+    def begin_ephemeral_scope(self) -> None:
+        """Replace pinned objects on the next `pin()` call instead of accumulating across branches."""
+        self._replace_on_next_pin = True
+
     def pin(self, object_names: Iterable[str], *, _locked: bool = False) -> None:
-        changed = False
-        for name in object_names:
-            if name not in self._object_names:
-                self._object_names.add(name)
-                changed = True
+        if self._replace_on_next_pin:
+            self._replace_on_next_pin = False
+            new_names = set(object_names)
+            changed = new_names != self._object_names
+            self._object_names = new_names
+        else:
+            changed = False
+            for name in object_names:
+                if name not in self._object_names:
+                    self._object_names.add(name)
+                    changed = True
         if changed and self._active and self._fp is not None:
             if _locked:
                 self._sync()
@@ -275,9 +344,21 @@ class Cache:
         *,
         verify_hashes: bool = False,
         lock_mode: LockMode | str | None = None,
-        lock_timeout_s: float = 60.0,
-        lock_stale_s: float = 300.0,
+        lock_timeout_s: float = 300.0,
+        lock_stale_s: float = 60.0,
     ) -> None:
+        """Open (creating if needed) the cache at `root` (default: `POISSON_CACHE_DIR` or `.poisson_cache`).
+
+        Lock mode is fixed when a cache is initialized and recorded in `.lock_mode`. For a new
+        cache, precedence is: `lock_mode=` > `POISSON_CACHE_LOCK_MODE` > `"lockfile"` inside a
+        SLURM job (`SLURM_JOB_ID` set) > `"flock"`. Reopening an existing cache adopts its
+        `.lock_mode` and refuses a conflicting mode so concurrent processes never split locking.
+
+        `lock_stale_s` is the age after which a lockfile or lease whose owner can't be checked
+        (another host) counts as abandoned; owners refresh theirs every `lock_stale_s / 3`.
+        `lock_timeout_s` is how long to wait for the lockfile and must exceed `lock_stale_s`, so a
+        waiter outlives a lock left behind by a killed job and can reclaim it.
+        """
         if root is None:
             root = os.environ.get("POISSON_CACHE_DIR", ".poisson_cache")
         self.root = Path(root).resolve()
@@ -292,21 +373,32 @@ class Cache:
         self.verify_hashes = verify_hashes
 
         self._lock_mode_marker = self.root / ".lock_mode"
-        explicit_lock_mode = lock_mode is not None
-        if lock_mode is None:
+        requested_lock_mode: LockMode | None = None
+        if lock_mode is not None:
+            requested_lock_mode = normalize_lock_mode(lock_mode)
+        else:
             env_lock = os.environ.get("POISSON_CACHE_LOCK_MODE")
             if env_lock:
-                self.lock_mode = normalize_lock_mode(env_lock)
-                explicit_lock_mode = True
-            elif self._lock_mode_marker.is_file():
-                try:
-                    self.lock_mode = normalize_lock_mode(self._lock_mode_marker.read_text(encoding="utf-8"))
-                except (OSError, ValueError):
-                    self.lock_mode = LockMode.FLOCK
-            else:
-                self.lock_mode = LockMode.FLOCK
+                requested_lock_mode = normalize_lock_mode(env_lock)
+
+        self.objects_dir = self.root / "objects"
+        self.requests_dir = self.root / "requests"
+        self.tmp_dir = self.root / "tmp"
+        self.ephemeral_dir = self.root / "ephemeral"
+        self.leases_dir = self.root / "leases"
+        self._lock_path = self.root / ".cache.lock"
+        self._excl_lock_path = self.root / ".cache.lock.excl"
+
+        existing_mode = self._read_lock_mode_marker()
+        if existing_mode is not None:
+            self.lock_mode = self._validate_existing_lock_mode(existing_mode, requested_lock_mode)
         else:
-            self.lock_mode = normalize_lock_mode(lock_mode)
+            desired_mode = (
+                requested_lock_mode
+                if requested_lock_mode is not None
+                else (LockMode.LOCKFILE if os.environ.get("SLURM_JOB_ID") else LockMode.FLOCK)
+            )
+            self.lock_mode = desired_mode
 
         if self.lock_mode == LockMode.NONE and self.max_bytes is not None:
             raise ValueError(
@@ -317,32 +409,104 @@ class Cache:
             raise ValueError("lock_timeout_s must be positive")
         if lock_stale_s <= 0:
             raise ValueError("lock_stale_s must be positive")
+        if lock_timeout_s <= lock_stale_s:
+            raise ValueError(
+                f"lock_timeout_s ({lock_timeout_s}) must exceed lock_stale_s ({lock_stale_s}); otherwise "
+                "waiters give up before a lock left by a killed process counts as abandoned"
+            )
         self.lock_timeout_s = float(lock_timeout_s)
         self.lock_stale_s = float(lock_stale_s)
 
-        self.objects_dir = self.root / "objects"
-        self.requests_dir = self.root / "requests"
-        self.tmp_dir = self.root / "tmp"
-        self.ephemeral_dir = self.root / "ephemeral"
-        self.leases_dir = self.root / "leases"
-        self._lock_path = self.root / ".cache.lock"
-        self._excl_lock_path = self.root / ".cache.lock.excl"
         for d in (self.objects_dir, self.requests_dir, self.tmp_dir, self.ephemeral_dir, self.leases_dir):
             d.mkdir(parents=True, exist_ok=True)
 
-        if explicit_lock_mode or not self._lock_mode_marker.is_file():
-            try:
-                tmp_marker = self.make_temp_path(".lock_mode")
-                tmp_marker.write_text(self.lock_mode.value + "\n", encoding="utf-8")
-                os.replace(tmp_marker, self._lock_mode_marker)
-            except OSError:
-                pass
+        if existing_mode is None:
+            marker_bytes = (self.lock_mode.value + "\n").encode("utf-8")
+            if not self._publish_exclusive_file(self._lock_mode_marker, marker_bytes):
+                winner = self._read_lock_mode_marker()
+                if winner is not None:
+                    self.lock_mode = self._validate_existing_lock_mode(winner, requested_lock_mode)
+                    if self.lock_mode == LockMode.NONE and self.max_bytes is not None:
+                        raise ValueError(
+                            "max_bytes auto-eviction cannot be combined with lock_mode='none'; "
+                            "use lock_mode='lockfile' (or 'flock') or run `cache clean --max-gb` between sweeps"
+                        )
 
         # In-process memoization keyed by (resolved_path, st_ino, st_size, st_mtime_ns, st_ctime_ns).
         self._stat_hash_memo: dict[tuple[str, int, int, int, int], str] = {}
 
+    def _read_lock_mode_marker(self) -> LockMode | None:
+        if not self._lock_mode_marker.is_file():
+            return None
+        try:
+            return normalize_lock_mode(self._lock_mode_marker.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return None
+
+    def _validate_existing_lock_mode(self, existing: LockMode, requested: LockMode | None) -> LockMode:
+        if requested is not None and requested != existing:
+            raise ValueError(
+                f"Cache at {self.root} is already initialized with lock_mode={existing.value!r}, "
+                f"which conflicts with requested lock_mode={requested.value!r}. Switching lock modes "
+                f"while a cache is in use breaks mutual exclusion; drain all processes using this cache "
+                f"and remove {self._lock_mode_marker} (or use a separate cache directory) before switching."
+            )
+        if requested is None and existing == LockMode.FLOCK and os.environ.get("SLURM_JOB_ID"):
+            raise ValueError(
+                f"Cache at {self.root} is initialized with lock_mode='flock', which is not safe across "
+                f"SLURM nodes. Drain any processes using this cache and remove {self._lock_mode_marker} "
+                f"(or use a new cache directory initialized with lock_mode='lockfile') before running SLURM jobs."
+            )
+        return existing
+
+    def _publish_exclusive_file(self, target: Path, payload: bytes) -> bool:
+        """Atomically publish `payload` at `target` iff `target` does not yet exist."""
+        tmp = self.root / f".cache.lock.tmp.{uuid.uuid4().hex}"
+        try:
+            tmp.write_bytes(payload)
+            try:
+                os.link(tmp, target)
+                return True
+            except FileExistsError:
+                return False
+            except OSError as exc:
+                if exc.errno not in _LINK_UNSUPPORTED_ERRNOS:
+                    raise
+                try:
+                    fd = os.open(str(target), os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o644)
+                except FileExistsError:
+                    return False
+                try:
+                    os.write(fd, payload)
+                finally:
+                    os.close(fd)
+                return True
+        finally:
+            tmp.unlink(missing_ok=True)
+
+    @staticmethod
+    def _read_lock_meta(path: Path) -> dict[str, Any] | None:
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+            return data if isinstance(data, dict) else None
+        except (OSError, json.JSONDecodeError):
+            return None
+
+    def _is_lockfile_stale(self, path: Path, st: os.stat_result, meta: dict[str, Any] | None) -> bool:
+        if (time.time() - st.st_mtime) >= self.lock_stale_s:
+            return True
+        local_host = socket.gethostname().replace("/", "_")
+        if (
+            meta is not None
+            and meta.get("host") == local_host
+            and isinstance(meta.get("pid"), int)
+            and not _pid_is_alive(meta["pid"])
+        ):
+            return True
+        return False
+
     def _try_break_stale_lockfile(self) -> bool:
-        """Atomically reclaim an abandoned `.cache.lock.excl` if its owner is dead (same host) or older than `lock_stale_s`."""
+        """Fenced reclamation of an abandoned `.cache.lock.excl` without risking a live owner's lock."""
         try:
             st = self._excl_lock_path.stat()
         except FileNotFoundError:
@@ -350,23 +514,82 @@ class Cache:
         except OSError:
             return False
 
-        now = time.time()
-        local_host = socket.gethostname().replace("/", "_")
-        stale = (now - st.st_mtime) >= self.lock_stale_s
-        if not stale:
+        meta = self._read_lock_meta(self._excl_lock_path)
+        if not self._is_lockfile_stale(self._excl_lock_path, st, meta):
+            return False
+
+        inspected_ino = st.st_ino
+        inspected_token = meta.get("token") if meta is not None and isinstance(meta.get("token"), str) else None
+        if inspected_token is not None and _SAFE_TOKEN_RE.match(inspected_token):
+            reclaim_key = f"tok_{inspected_token}"
+        else:
+            reclaim_key = f"ino_{st.st_ino}_{st.st_ctime_ns}"
+
+        fence_path = self.root / f".cache.lock.reclaim.{reclaim_key}"
+        fence_token = uuid.uuid4().hex
+        fence_payload = json.dumps(
+            {
+                "host": socket.gethostname().replace("/", "_"),
+                "pid": os.getpid(),
+                "token": fence_token,
+            }
+        ).encode("utf-8")
+
+        fence_acquired = False
+        tmp_fence = self.root / f".cache.lock.tmp.{fence_token}"
+        try:
+            tmp_fence.write_bytes(fence_payload)
+            with _defer_sigterm():
+                try:
+                    os.link(tmp_fence, fence_path)
+                    fence_acquired = True
+                except FileExistsError:
+                    pass
+                except OSError as exc:
+                    if exc.errno in _LINK_UNSUPPORTED_ERRNOS:
+                        try:
+                            fd = os.open(str(fence_path), os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o644)
+                        except FileExistsError:
+                            pass
+                        else:
+                            fence_acquired = True
+                            try:
+                                os.write(fd, fence_payload)
+                            finally:
+                                os.close(fd)
+                    else:
+                        raise
+            tmp_fence.unlink(missing_ok=True)
+
+            if not fence_acquired:
+                # Another waiter is reclaiming this exact victim; clean up the fence only if abandoned.
+                try:
+                    fst = fence_path.stat()
+                except OSError:
+                    return False
+                fmeta = self._read_lock_meta(fence_path)
+                if self._is_lockfile_stale(fence_path, fst, fmeta):
+                    stale_fence = self.root / f".cache.lock.stale.{uuid.uuid4().hex}"
+                    try:
+                        os.rename(fence_path, stale_fence)
+                    except OSError:
+                        pass
+                    else:
+                        stale_fence.unlink(missing_ok=True)
+                return False
+
+            # Re-verify the lockfile is still the exact stale instance we inspected before renaming.
             try:
-                meta = json.loads(self._excl_lock_path.read_text(encoding="utf-8"))
-                if (
-                    isinstance(meta, dict)
-                    and meta.get("host") == local_host
-                    and isinstance(meta.get("pid"), int)
-                    and not _pid_is_alive(meta["pid"])
-                ):
-                    stale = True
-            except (OSError, json.JSONDecodeError):
-                pass
-        if stale:
-            # Rename to a unique path first so only one waiter reclaims this stale lockfile.
+                st2 = self._excl_lock_path.stat()
+            except FileNotFoundError:
+                return True
+            except OSError:
+                return False
+            meta2 = self._read_lock_meta(self._excl_lock_path)
+            token2 = meta2.get("token") if meta2 is not None and isinstance(meta2.get("token"), str) else None
+            if st2.st_ino != inspected_ino or token2 != inspected_token:
+                return False
+
             reclaim_path = self.root / f".cache.lock.stale.{uuid.uuid4().hex}"
             try:
                 os.rename(self._excl_lock_path, reclaim_path)
@@ -376,7 +599,15 @@ class Cache:
                 return False
             reclaim_path.unlink(missing_ok=True)
             return True
-        return False
+        finally:
+            tmp_fence.unlink(missing_ok=True)
+            if fence_acquired:
+                self._release_owned_file(fence_path, fence_token)
+
+    def _release_owned_file(self, path: Path, token: str) -> None:
+        meta = self._read_lock_meta(path)
+        if meta is not None and meta.get("token") == token:
+            path.unlink(missing_ok=True)
 
     @contextlib.contextmanager
     def _locked_lockfile(self) -> Iterator[None]:
@@ -393,10 +624,55 @@ class Cache:
         deadline = time.monotonic() + self.lock_timeout_s
         backoff = 0.005
         acquired = False
-        while True:
-            try:
-                fd = os.open(str(self._excl_lock_path), os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o644)
-            except FileExistsError:
+        lock_ino: int | None = None
+        tmp_lock = self.root / f".cache.lock.tmp.{token}"
+        stop_beat = threading.Event()
+        beat_thread: threading.Thread | None = None
+        beat_interval = max(0.05, self.lock_stale_s / 3.0)
+
+        def _beat_lock() -> None:
+            while not stop_beat.wait(beat_interval):
+                try:
+                    st = self._excl_lock_path.stat()
+                    if lock_ino is not None and st.st_ino != lock_ino:
+                        break
+                    now = time.time()
+                    os.utime(self._excl_lock_path, (now, now))
+                except OSError:
+                    break
+
+        try:
+            tmp_lock.write_bytes(payload)
+            while True:
+                with _defer_sigterm():
+                    try:
+                        os.link(tmp_lock, self._excl_lock_path)
+                        acquired = True
+                    except FileExistsError:
+                        pass
+                    except OSError as exc:
+                        if exc.errno in _LINK_UNSUPPORTED_ERRNOS:
+                            try:
+                                fd = os.open(
+                                    str(self._excl_lock_path), os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o644
+                                )
+                            except FileExistsError:
+                                pass
+                            else:
+                                acquired = True
+                                try:
+                                    os.write(fd, payload)
+                                finally:
+                                    os.close(fd)
+                        else:
+                            raise
+                if acquired:
+                    try:
+                        lock_ino = self._excl_lock_path.stat().st_ino
+                    except OSError:
+                        lock_ino = None
+                    tmp_lock.unlink(missing_ok=True)
+                    break
                 if self._try_break_stale_lockfile():
                     continue
                 if time.monotonic() >= deadline:
@@ -405,39 +681,18 @@ class Cache:
                     )
                 time.sleep(backoff)
                 backoff = min(backoff * 1.5, 0.2)
-            else:
-                try:
-                    os.write(fd, payload)
-                finally:
-                    os.close(fd)
-                acquired = True
-                break
 
-        stop_beat = threading.Event()
-        beat_interval = max(0.05, self.lock_stale_s / 3.0)
-
-        def _beat_lock() -> None:
-            while not stop_beat.wait(beat_interval):
-                try:
-                    now = time.time()
-                    os.utime(self._excl_lock_path, (now, now))
-                except OSError:
-                    break
-
-        beat_thread = threading.Thread(target=_beat_lock, name="poisson-cache-lock-heartbeat", daemon=True)
-        beat_thread.start()
-        try:
+            beat_thread = threading.Thread(target=_beat_lock, name="poisson-cache-lock-heartbeat", daemon=True)
+            beat_thread.start()
             yield
         finally:
             stop_beat.set()
-            beat_thread.join(timeout=1.0)
+            if beat_thread is not None:
+                beat_thread.join(timeout=1.0)
+            tmp_lock.unlink(missing_ok=True)
             if acquired:
-                try:
-                    meta = json.loads(self._excl_lock_path.read_text(encoding="utf-8"))
-                    if isinstance(meta, dict) and meta.get("token") == token:
-                        self._excl_lock_path.unlink(missing_ok=True)
-                except (OSError, json.JSONDecodeError):
-                    pass
+                with _defer_sigterm():
+                    self._release_owned_file(self._excl_lock_path, token)
 
     @contextlib.contextmanager
     def _locked(self) -> Iterator[None]:
@@ -502,10 +757,23 @@ class Cache:
         host = socket.gethostname().replace("/", "_")
         return self.tmp_dir / f"{host}_{os.getpid()}_{uuid.uuid4().hex}{suffix}"
 
+    def make_temp_dir(self, suffix: str = "") -> Path:
+        """Create a runner-owned staging directory inside `<root>/tmp` for one stage execution."""
+        path = self.make_temp_path(suffix)
+        path.mkdir(parents=True, exist_ok=False)
+        return path
+
     def make_ephemeral_path(self, suffix: str = "") -> Path:
         """Allocate an untracked output path inside `<root>/ephemeral` (for `use_cache=False`)."""
         self.ephemeral_dir.mkdir(parents=True, exist_ok=True)
-        return self.ephemeral_dir / f"{os.getpid()}_{uuid.uuid4().hex}{suffix}"
+        host = socket.gethostname().replace("/", "_")
+        return self.ephemeral_dir / f"{host}_{os.getpid()}_{uuid.uuid4().hex}{suffix}"
+
+    def make_ephemeral_dir(self, suffix: str = "") -> Path:
+        """Create a per-execution directory inside `<root>/ephemeral` (for `use_cache=False`)."""
+        path = self.make_ephemeral_path(suffix)
+        path.mkdir(parents=True, exist_ok=False)
+        return path
 
     @staticmethod
     def compute_request_key(
@@ -546,18 +814,31 @@ class Cache:
         except OSError:
             pass
 
-    def _active_leased_objects(self) -> tuple[set[str], bool]:
-        """Inspect `<root>/leases` and collect object filenames held by live leases.
+    def _active_leases_unlocked(self) -> tuple[set[str], set[tuple[str, int]], bool]:
+        """Inspect `<root>/leases` and collect pinned objects plus `(host, pid)` of live leases.
 
-        Returns `(leased_names, all_readable)`. If any live lease cannot be parsed,
-        `all_readable` is False so callers can conservatively skip eviction.
+        Returns `(leased_names, live_owners, all_readable)`. If any live lease cannot be parsed,
+        `all_readable` is False so callers can conservatively skip eviction and remote cleanup.
         """
         leased: set[str] = set()
+        live_owners: set[tuple[str, int]] = set()
         all_readable = True
         if not self.leases_dir.is_dir():
-            return leased, all_readable
+            return leased, live_owners, all_readable
         local_host = socket.gethostname().replace("/", "_")
         now = time.time()
+
+        def _record_live(data: Any) -> None:
+            nonlocal all_readable
+            if isinstance(data, dict) and isinstance(data.get("objects"), list):
+                for item in data["objects"]:
+                    if isinstance(item, str):
+                        leased.add(item)
+                if isinstance(data.get("host"), str) and isinstance(data.get("pid"), int):
+                    live_owners.add((data["host"], data["pid"]))
+            else:
+                all_readable = False
+
         for lease_path in list(self.leases_dir.glob("*.lease")):
             try:
                 fp = open(lease_path, "r+", encoding="utf-8")
@@ -578,12 +859,7 @@ class Cache:
                         fcntl.flock(fp.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
                     except BlockingIOError:
                         # Live flock lease held by an active process.
-                        if isinstance(data, dict) and isinstance(data.get("objects"), list):
-                            for item in data["objects"]:
-                                if isinstance(item, str):
-                                    leased.add(item)
-                        else:
-                            all_readable = False
+                        _record_live(data)
                         continue
                     except OSError as exc:
                         if exc.errno in _FLOCK_UNSUPPORTED_ERRNOS:
@@ -610,16 +886,15 @@ class Cache:
                         is_live = True
 
                     if is_live:
-                        if isinstance(data, dict) and isinstance(data.get("objects"), list):
-                            for item in data["objects"]:
-                                if isinstance(item, str):
-                                    leased.add(item)
-                        else:
-                            all_readable = False
+                        _record_live(data)
                     else:
                         lease_path.unlink(missing_ok=True)
             finally:
                 fp.close()
+        return leased, live_owners, all_readable
+
+    def _active_leased_objects(self) -> tuple[set[str], bool]:
+        leased, _, all_readable = self._active_leases_unlocked()
         return leased, all_readable
 
     def lookup(
@@ -914,51 +1189,95 @@ class Cache:
                 removed += 1
         return removed
 
-    def _clean_abandoned_tmp_unlocked(self, *, force: bool = False) -> int:
-        removed = 0
+    def _clean_owned_dir_unlocked(
+        self,
+        directory: Path,
+        *,
+        force: bool = False,
+        live_owners: set[tuple[str, int]] | None = None,
+        all_readable: bool = True,
+        count_files: bool = False,
+    ) -> int:
+        if not directory.is_dir():
+            return 0
+        if not force and live_owners is None:
+            _, live_owners, all_readable = self._active_leases_unlocked()
+        owners = live_owners if live_owners is not None else set()
         local_host = socket.gethostname().replace("/", "_")
         now = time.time()
-        for p in self.tmp_dir.iterdir():
-            if not p.is_file():
+        removed = 0
+        for p in list(directory.iterdir()):
+            if not (p.is_file() or p.is_dir()):
                 continue
             if not force:
                 parts = p.name.split("_", 2)
-                if len(parts) >= 2 and parts[0] == local_host and parts[1].isdigit():
-                    if _pid_is_alive(int(parts[1])):
+                if len(parts) >= 2 and parts[1].isdigit():
+                    owner = (parts[0], int(parts[1]))
+                    if owner[0] == local_host and _pid_is_alive(owner[1]):
                         continue
+                    if owner in owners:
+                        continue
+                    if owner[0] != local_host:
+                        if not all_readable:
+                            continue
+                        try:
+                            if now - _entry_latest_mtime(p) < 3600:
+                                continue
+                        except OSError:
+                            continue
                 else:
-                    # Unknown host or naming: only prune temp files older than 1 hour.
+                    if not all_readable:
+                        continue
                     try:
-                        if now - p.stat().st_mtime < 3600:
+                        if now - _entry_latest_mtime(p) < 3600:
                             continue
                     except OSError:
                         continue
-            p.unlink(missing_ok=True)
-            removed += 1
+            delta = _count_files_in_entry(p) if count_files else 1
+            _remove_entry(p)
+            removed += delta
         return removed
 
-    def _clean_ephemeral_unlocked(self, *, force: bool = False) -> int:
-        removed = 0
-        now = time.time()
-        if not self.ephemeral_dir.is_dir():
-            return 0
-        for p in self.ephemeral_dir.iterdir():
-            if not p.is_file():
-                continue
-            if not force:
-                parts = p.name.split("_", 1)
-                if parts and parts[0].isdigit():
-                    if _pid_is_alive(int(parts[0])):
-                        continue
-                else:
-                    try:
-                        if now - p.stat().st_mtime < 3600:
-                            continue
-                    except OSError:
-                        continue
-            p.unlink(missing_ok=True)
-            removed += 1
-        return removed
+    def _clean_abandoned_tmp_unlocked(
+        self,
+        *,
+        force: bool = False,
+        live_owners: set[tuple[str, int]] | None = None,
+        all_readable: bool = True,
+    ) -> int:
+        return self._clean_owned_dir_unlocked(
+            self.tmp_dir,
+            force=force,
+            live_owners=live_owners,
+            all_readable=all_readable,
+            count_files=False,
+        )
+
+    def _clean_ephemeral_unlocked(
+        self,
+        *,
+        force: bool = False,
+        live_owners: set[tuple[str, int]] | None = None,
+        all_readable: bool = True,
+    ) -> int:
+        return self._clean_owned_dir_unlocked(
+            self.ephemeral_dir,
+            force=force,
+            live_owners=live_owners,
+            all_readable=all_readable,
+            count_files=True,
+        )
+
+    def _clean_stale_lock_helpers_unlocked(self) -> None:
+        for pattern in (".cache.lock.tmp.*", ".cache.lock.stale.*", ".cache.lock.reclaim.*"):
+            for p in self.root.glob(pattern):
+                try:
+                    st = p.stat()
+                except OSError:
+                    continue
+                meta = self._read_lock_meta(p)
+                if self._is_lockfile_stale(p, st, meta):
+                    p.unlink(missing_ok=True)
 
     def stats(self) -> CacheStats:
         object_count = 0
@@ -985,19 +1304,22 @@ class Cache:
             request_count += 1
             metadata_bytes += sz
 
-        temp_count = sum(1 for p in self.tmp_dir.iterdir() if p.is_file())
+        temp_count = 0
+        if self.tmp_dir.is_dir():
+            for _, _, files in os.walk(self.tmp_dir):
+                temp_count += len(files)
         ephemeral_count = 0
         ephemeral_bytes = 0
         if self.ephemeral_dir.is_dir():
-            for p in self.ephemeral_dir.iterdir():
-                if not p.is_file():
-                    continue
-                try:
-                    sz = p.stat().st_size
-                except OSError:
-                    continue
-                ephemeral_count += 1
-                ephemeral_bytes += sz
+            for root, _, files in os.walk(self.ephemeral_dir):
+                root_path = Path(root)
+                for name in files:
+                    try:
+                        sz = (root_path / name).stat().st_size
+                    except OSError:
+                        continue
+                    ephemeral_count += 1
+                    ephemeral_bytes += sz
         return CacheStats(
             root=self.root,
             object_count=object_count,
@@ -1015,11 +1337,16 @@ class Cache:
         if max_bytes is not None and max_bytes < 0:
             raise ValueError(f"max_bytes must be non-negative, got {max_bytes}")
         with self._locked():
-            removed_tmp = self._clean_abandoned_tmp_unlocked(force=all_entries)
-            removed_ephemeral = self._clean_ephemeral_unlocked(force=all_entries)
+            self._clean_stale_lock_helpers_unlocked()
+            protected, live_owners, all_readable = self._active_leases_unlocked()
+            removed_tmp = self._clean_abandoned_tmp_unlocked(
+                force=all_entries, live_owners=live_owners, all_readable=all_readable
+            )
+            removed_ephemeral = self._clean_ephemeral_unlocked(
+                force=all_entries, live_owners=live_owners, all_readable=all_readable
+            )
 
             if all_entries:
-                protected, all_readable = self._active_leased_objects()
                 removed_objects = 0
                 if all_readable:
                     for p in self.objects_dir.iterdir():

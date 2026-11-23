@@ -12,6 +12,7 @@ from .cache import (
 )
 from .driver import (
     BranchResult,
+    CacheMissError,
     Compare,
     ExperimentReport,
     RunContext,
@@ -28,6 +29,7 @@ from .executor import (
     collect_host_environment,
     detect_cpu_model,
 )
+from .experiment_cli import experiment_main
 from .records import RecordError, UnresolvedRecord, Unserializable, register_record
 from .cases import Case, dirichlet, neumann, robin
 from .report import info_scalars
@@ -68,6 +70,7 @@ __all__ = [
     "BranchResult",
     "Cache",
     "CacheLease",
+    "CacheMissError",
     "CacheMode",
     "CacheStats",
     "Case",
@@ -84,6 +87,7 @@ __all__ = [
     "ExecutionResult",
     "Executor",
     "ExperimentReport",
+    "experiment_main",
     "gmsh_mesh",
     "import_free_charges",
     "import_mesh",

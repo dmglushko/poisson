@@ -97,6 +97,10 @@ def convergence(run):
 run_experiment(convergence).save_csv("convergence.csv")   # columns verify.l2_error, ...
 ```
 
+To run an experiment on the DelftBlue cluster as parallel Slurm jobs, end the script with
+`raise SystemExit(experiment_main(pipeline))` and use the scripts in
+[scripts/delftblue/](scripts/delftblue/README.md).
+
 Manage the scratch cache from the command line:
 
 ```bash

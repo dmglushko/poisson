@@ -2,12 +2,17 @@
 
 from __future__ import annotations
 
+import contextlib
 import contextvars
 import dataclasses
 import inspect
 import os
+import re
+import shutil
+import signal
+import threading
 import time
-from collections.abc import Hashable, Mapping, Sequence
+from collections.abc import Hashable, Iterator, Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Generic, Literal, Optional, TypeVar, Union
@@ -22,6 +27,7 @@ from .stages import Stage, StageCall
 
 __all__ = [
     "BranchResult",
+    "CacheMissError",
     "Compare",
     "ExperimentReport",
     "RunContext",
@@ -30,6 +36,20 @@ __all__ = [
     "resolve_slurm_shard",
     "run_experiment",
 ]
+
+
+class CacheMissError(RuntimeError):
+    """Raised when `require_cached=True` and a stage output is not found in the cache."""
+
+    def __init__(self, stage_name: str, request_key: str) -> None:
+        self.stage_name = stage_name
+        self.request_key = request_key
+        super().__init__(
+            f"Stage '{stage_name}' (request {request_key[:12]}) is not in the cache and execution is disabled"
+        )
+
+
+_SAFE_OUT_NAME_RE = re.compile(r"[^A-Za-z0-9._-]+")
 
 T = TypeVar("T")
 
@@ -99,6 +119,7 @@ class _BranchConfig:
     stage_repeats: Mapping[str, int]
     stage_warmup: Mapping[str, int]
     dry_run: bool
+    require_cached: bool = False
 
 
 @dataclass(frozen=True)
@@ -143,6 +164,7 @@ class RunContext:
         stage_repeats: Mapping[str, int] | None = None,
         stage_warmup: Mapping[str, int] | None = None,
         dry_run: bool = False,
+        require_cached: bool = False,
         state: _ExperimentState | None = None,
     ) -> None:
         self.cache = cache
@@ -160,6 +182,7 @@ class RunContext:
         self._stage_repeats: dict[str, int] = dict(stage_repeats) if stage_repeats else {}
         self._stage_warmup: dict[str, int] = dict(stage_warmup) if stage_warmup else {}
         self.dry_run = dry_run
+        self._require_cached = require_cached
         self._state = state if state is not None else _ExperimentState()
         self.choices: dict[str, Any] = {}
         self.choice_labels: dict[str, str] = {}
@@ -189,6 +212,7 @@ class RunContext:
             stage_repeats=config.stage_repeats,
             stage_warmup=config.stage_warmup,
             dry_run=config.dry_run,
+            require_cached=config.require_cached,
             state=state,
         )
 
@@ -439,6 +463,9 @@ class RunContext:
             self._state.executed[request_key] = artifacts
             return self._record(stage, artifacts, request_key=request_key, settings=settings_dict)
 
+        if self._require_cached:
+            raise CacheMissError(stage.name, request_key)
+
         artifacts = self._execute(
             stage,
             mode=mode,
@@ -500,15 +527,26 @@ class RunContext:
         pre_signatures: Mapping[Path, tuple[str, int, int, int, int]],
     ) -> dict[str, Artifact]:
         """Run warmup + measured repeats, then publish to the cache (or keep as ephemeral outputs)."""
-        allocate = self.cache.make_temp_path if mode.writes else self.cache.make_ephemeral_path
-        temp_outputs = {name: (allocate(ext), ext) for name, ext in stage.output_specs.items()}
-        info_tmp = self.cache.make_temp_path(".info.json")
-        config_tmp: Path | None = None
-        if stage.uses_config_file:
-            config_tmp = self.cache.make_temp_path(".config.json")
-            config_tmp.write_text(canonical_json(settings) + "\n", encoding="utf-8")
-
+        # Runner-owned staging directory ensures sibling temp files created by stage binaries
+        # (e.g. poisson_adapt's *.tmp.* files) are wiped together if the stage fails or gets SIGTERM.
+        stage_dir = self.cache.make_temp_path()
+        ephemeral_dir: Path | None = None if mode.writes else self.cache.make_ephemeral_path()
         try:
+            stage_dir.mkdir(parents=True, exist_ok=False)
+            if ephemeral_dir is not None:
+                ephemeral_dir.mkdir(parents=True, exist_ok=False)
+            out_root = stage_dir if mode.writes else ephemeral_dir
+            assert out_root is not None
+            temp_outputs: dict[str, tuple[Path, str]] = {}
+            for idx, (name, ext) in enumerate(stage.output_specs.items()):
+                safe_name = _SAFE_OUT_NAME_RE.sub("_", name).strip("._") or "out"
+                temp_outputs[name] = (out_root / f"{idx}_{safe_name}{ext}", ext)
+            info_tmp = stage_dir / "info.json"
+            config_tmp: Path | None = None
+            if stage.uses_config_file:
+                config_tmp = stage_dir / "config.json"
+                config_tmp.write_text(canonical_json(settings) + "\n", encoding="utf-8")
+
             output_paths = {name: p for name, (p, _) in temp_outputs.items()}
             call = StageCall(
                 executable=stage.executable,
@@ -535,6 +573,14 @@ class RunContext:
             )
 
             if not mode.writes:
+                expected = {p.resolve() for p in output_paths.values()}
+                assert ephemeral_dir is not None
+                for stray in list(ephemeral_dir.iterdir()):
+                    if stray.resolve() not in expected:
+                        if stray.is_dir() and not stray.is_symlink():
+                            shutil.rmtree(stray, ignore_errors=True)
+                        else:
+                            stray.unlink(missing_ok=True)
                 return self._ephemeral_artifacts(stage, output_paths, m.info, m.execution)
 
             # Refuse to publish under a stale key if an input or the binary changed mid-run.
@@ -555,14 +601,12 @@ class RunContext:
                 execution=m.execution,
                 lease=self._lease,
             )
-        except Exception:
-            for tmp_path, _ in temp_outputs.values():
-                tmp_path.unlink(missing_ok=True)
+        except BaseException:  # also SystemExit from SIGTERM: don't leave staged/ephemeral outputs behind
+            if ephemeral_dir is not None:
+                shutil.rmtree(ephemeral_dir, ignore_errors=True)
             raise
         finally:
-            info_tmp.unlink(missing_ok=True)
-            if config_tmp is not None:
-                config_tmp.unlink(missing_ok=True)
+            shutil.rmtree(stage_dir, ignore_errors=True)
 
     def _ephemeral_artifacts(
         self,
@@ -733,18 +777,47 @@ def _discover_branch_paths(
     takes_ctx: bool,
     config: _BranchConfig,
 ) -> list[tuple[_ChoiceStep, ...]]:
-    """Discover all branch choice paths via a zero-execution dry-run pass."""
-    discovery = dataclasses.replace(config, cache_mode=CacheMode.READ_ONLY, dry_run=True)
+    """Discover all branch choice paths via a zero-execution dry-run pass.
+
+    Uses a single short-lived lease whose pin set resets on each branch so discovery never
+    accumulates quadratic lease writes or pins other shards' objects for the shard's lifetime.
+    """
+    discovery = dataclasses.replace(config, cache_mode=CacheMode.READ_ONLY, dry_run=True, require_cached=False)
     state = _ExperimentState()
     todo_stack: list[tuple[_ChoiceStep, ...]] = [()]
     discovered: list[tuple[_ChoiceStep, ...]] = []
-    while todo_stack:
-        path = todo_stack.pop()
-        with config.cache.lease() as lease:
-            ctx = RunContext._for_branch(discovery, path=path, todo_stack=todo_stack, lease=lease, state=state)
+    with config.cache.lease() as discovery_lease:
+        while todo_stack:
+            discovery_lease.begin_ephemeral_scope()
+            path = todo_stack.pop()
+            ctx = RunContext._for_branch(discovery, path=path, todo_stack=todo_stack, lease=discovery_lease, state=state)
             _call_pipeline(pipeline_fn, ctx, takes_ctx, path)
-        discovered.append(tuple(ctx._prefix))
+            discovered.append(tuple(ctx._prefix))
     return discovered
+
+
+@contextlib.contextmanager
+def _sigterm_as_exit() -> Iterator[None]:
+    """Turn SIGTERM into `SystemExit` while the block runs, so `finally:` cleanup still happens.
+
+    SLURM sends SIGTERM when a job hits its time limit or is cancelled (SIGKILL follows after a
+    grace period). Python's default action kills the process at once, leaving the cache lockfile,
+    leases and temp files behind for other jobs to wait out. Only installed from the main thread
+    and only when no other handler is set; out-of-memory kills (SIGKILL) can't be caught.
+    """
+    if threading.current_thread() is not threading.main_thread() or signal.getsignal(signal.SIGTERM) != signal.SIG_DFL:
+        yield
+        return
+
+    def _handler(signum: int, _frame: Any) -> None:
+        signal.signal(signal.SIGTERM, signal.SIG_DFL)  # a second SIGTERM kills outright
+        raise SystemExit(128 + signum)
+
+    signal.signal(signal.SIGTERM, _handler)
+    try:
+        yield
+    finally:
+        signal.signal(signal.SIGTERM, signal.SIG_DFL)
 
 
 def _run_branch(
@@ -801,6 +874,7 @@ def run_experiment(
     stage_repeats: Mapping[str, int] | None = None,
     stage_warmup: Mapping[str, int] | None = None,
     dry_run: bool = False,
+    require_cached: bool = False,
     shard: tuple[int, int] | Literal["slurm"] | None = None,
     continue_on_error: bool = False,
     max_branches: int | None = None,
@@ -815,6 +889,7 @@ def run_experiment(
     A stage request executed once in this call is reused by every later branch that makes the
     same request, even under `refresh`/`off`. Pass `shard=(index, total)` or `shard="slurm"` to
     execute only branches where `branch_index % total == index` against a shared cache.
+    Pass `require_cached=True` to raise `CacheMissError` instead of executing any stage on miss.
     """
     _validate_repeats(repeats, warmup)
     stage_repeats = dict(stage_repeats) if stage_repeats else {}
@@ -837,41 +912,46 @@ def run_experiment(
         stage_repeats=stage_repeats,
         stage_warmup=stage_warmup,
         dry_run=dry_run,
+        require_cached=require_cached,
     )
     takes_ctx = len(inspect.signature(pipeline_fn).parameters) > 0
     state = _ExperimentState()
     branches: list[BranchResult] = []
     overall_start = time.perf_counter()
 
-    with cache.lease() as experiment_lease:
-        common = dict(
-            takes_ctx=takes_ctx,
-            config=config,
-            lease=experiment_lease,
-            state=state,
-            continue_on_error=continue_on_error,
-        )
+    with _sigterm_as_exit():
+        selected: list[tuple[int, tuple[_ChoiceStep, ...]]] | None = None
         if resolved_shard is not None and resolved_shard[1] > 1:
             shard_idx, shard_total = resolved_shard
             all_paths = _discover_branch_paths(pipeline_fn, takes_ctx=takes_ctx, config=config)
             selected = [(i, p) for i, p in enumerate(all_paths) if i % shard_total == shard_idx]
             if max_branches is not None:
                 selected = selected[:max_branches]
-            for global_idx, path in selected:
-                branches.append(
-                    _run_branch(pipeline_fn, index=global_idx, path=path, todo_stack=[], planned=True, **common)  # type: ignore[arg-type]
-                )
-        else:
-            todo_stack: list[tuple[_ChoiceStep, ...]] = [()]
-            while todo_stack:
-                if max_branches is not None and len(branches) >= max_branches:
-                    break
-                path = todo_stack.pop()
-                branches.append(
-                    _run_branch(
-                        pipeline_fn, index=len(branches), path=path, todo_stack=todo_stack, planned=False, **common  # type: ignore[arg-type]
+
+        with cache.lease() as experiment_lease:
+            common = dict(
+                takes_ctx=takes_ctx,
+                config=config,
+                lease=experiment_lease,
+                state=state,
+                continue_on_error=continue_on_error,
+            )
+            if selected is not None:
+                for global_idx, path in selected:
+                    branches.append(
+                        _run_branch(pipeline_fn, index=global_idx, path=path, todo_stack=[], planned=True, **common)  # type: ignore[arg-type]
                     )
-                )
+            else:
+                todo_stack: list[tuple[_ChoiceStep, ...]] = [()]
+                while todo_stack:
+                    if max_branches is not None and len(branches) >= max_branches:
+                        break
+                    path = todo_stack.pop()
+                    branches.append(
+                        _run_branch(
+                            pipeline_fn, index=len(branches), path=path, todo_stack=todo_stack, planned=False, **common  # type: ignore[arg-type]
+                        )
+                    )
 
     return ExperimentReport(
         branches=branches,

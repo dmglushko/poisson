@@ -2,3 +2,6 @@ build/
 .poisson_cache/
 **/__pycache__/
 *.pyc
+build-delftblue/
+logs/
+results/
