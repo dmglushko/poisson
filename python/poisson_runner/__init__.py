@@ -29,13 +29,18 @@ from .executor import (
     detect_cpu_model,
 )
 from .hashing import blake3_bytes, blake3_file, blake3_json, blake3_version
+from .benchmark import Measurement, measure, summarize_numbers
 from .stages import (
     Stage,
     StageCall,
+    adapt_mesh,
+    import_free_charges,
+    import_mesh,
     make_adapt_stage,
     make_import_free_charges_stage,
     make_import_mesh_stage,
     resolve_binary,
+    shared_library_deps,
 )
 
 __all__ = [
@@ -52,10 +57,12 @@ __all__ = [
     "ExperimentReport",
     "LocalExecutor",
     "LockMode",
+    "Measurement",
     "RunContext",
     "Stage",
     "StageCall",
     "StageTrace",
+    "adapt_mesh",
     "blake3_bytes",
     "blake3_file",
     "blake3_json",
@@ -63,12 +70,17 @@ __all__ = [
     "collect_host_environment",
     "compare",
     "detect_cpu_model",
+    "import_free_charges",
+    "import_mesh",
     "make_adapt_stage",
     "make_import_free_charges_stage",
     "make_import_mesh_stage",
+    "measure",
     "normalize_cache_mode",
     "normalize_lock_mode",
     "resolve_binary",
     "resolve_slurm_shard",
     "run_experiment",
+    "shared_library_deps",
+    "summarize_numbers",
 ]

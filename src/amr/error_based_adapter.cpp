@@ -38,91 +38,6 @@ StageInfo refine_stage(const RefinementResult::Info& info) {
     return stage;
 }
 
-class ErrorBasedSession final : public MeshAdapter::Session {
-public:
-    ErrorBasedSession(std::string adapter_name, std::shared_ptr<const ErrorEstimator> estimator,
-                      std::shared_ptr<const MarkingStrategy> marking, std::shared_ptr<const Refiner> refiner,
-                      ErrorBasedAdapter::Settings settings, RefinementHistory history = {},
-                      std::optional<double> initial_error = std::nullopt)
-        : Session(std::move(adapter_name)), estimator_(std::move(estimator)), marking_(std::move(marking)),
-          refiner_(std::move(refiner)), settings_(settings), history_(std::move(history)),
-          initial_error_(initial_error) {}
-
-    RefinementHistory take_history() { return std::move(history_); }
-
-private:
-    AdaptationResult adapt_step(const MeshProperties& mesh, const RefinementInput& input) override {
-        AdaptationResult result;
-        const bool over_limit = settings_.max_elements && mesh.elements.size() > *settings_.max_elements;
-        if (over_limit && !settings_.estimate_at_limit) {
-            result.status = AdaptationStatus::limit_reached;
-            return result;
-        }
-
-        // 1. Estimate
-        ErrorEstimate est = estimator_->estimate(mesh, input);
-        if (!std::isfinite(est.total))
-            throw std::runtime_error("error_based adapter: estimated total error is not finite (" +
-                                     std::to_string(est.total) + ")");
-        result.info.error_estimate = est.total;
-        result.info.stages.push_back(estimate_stage(est.info));
-
-        // Keep the baseline local until this step succeeds so a failing refinement does not
-        // poison relative_tolerance on a subsequent retry.
-        const double baseline = initial_error_.value_or(est.total);
-        std::optional<double> bound = settings_.absolute_tolerance;
-        if (settings_.relative_tolerance) {
-            const double rel = *settings_.relative_tolerance * baseline;
-            bound = bound ? std::min(*bound, rel) : rel;
-        }
-        if (bound && est.total <= *bound) {
-            initial_error_ = baseline;
-            result.status = AdaptationStatus::converged;
-            return result;
-        }
-        if (over_limit) {
-            initial_error_ = baseline;
-            result.status = AdaptationStatus::limit_reached;
-            return result;
-        }
-
-        // 2. Mark
-        const auto mark_start = std::chrono::steady_clock::now();
-        const std::vector<uint32_t> marked = marking_->mark(mesh, est.eta);
-        const double mark_time = std::chrono::duration<double>(std::chrono::steady_clock::now() - mark_start).count();
-        result.info.stages.push_back(StageInfo{
-            .stage = "mark",
-            .method = marking_->name(),
-            .time = mark_time,
-            .metrics = {{"elements", static_cast<double>(mesh.elements.size())},
-                        {"marked", static_cast<double>(marked.size())}},
-            .warnings = {},
-        });
-        if (marked.empty()) {
-            initial_error_ = baseline;
-            result.status = AdaptationStatus::unchanged;
-            return result;
-        }
-
-        // 3. Refine
-        RefinementResult refined = refiner_->refine(mesh, marked, history_);
-        result.info.stages.push_back(refine_stage(refined.info));
-        initial_error_ = baseline;
-        history_ = std::move(refined.history);
-        result.status = AdaptationStatus::adapted;
-        result.mesh = std::move(refined.mesh);
-        result.parents = std::move(refined.parents);
-        return result;
-    }
-
-    std::shared_ptr<const ErrorEstimator>  estimator_;
-    std::shared_ptr<const MarkingStrategy> marking_;
-    std::shared_ptr<const Refiner>         refiner_;
-    ErrorBasedAdapter::Settings            settings_;
-    RefinementHistory                      history_;
-    std::optional<double>                  initial_error_;
-};
-
 } // namespace
 
 ErrorBasedAdapter::ErrorBasedAdapter(std::shared_ptr<const ErrorEstimator> estimator,
@@ -149,17 +64,85 @@ ErrorBasedAdapter::ErrorBasedAdapter(std::shared_ptr<const ErrorEstimator> estim
         throw std::invalid_argument("ErrorBasedAdapter::Settings::max_elements must be positive");
 }
 
-std::unique_ptr<MeshAdapter::Session> ErrorBasedAdapter::start() const {
-    return std::make_unique<ErrorBasedSession>(name(), estimator_, marking_, refiner_, settings_);
+std::unique_ptr<MeshAdapter::Session> ErrorBasedAdapter::start() const { return start(State{}); }
+
+std::unique_ptr<ErrorBasedAdapter::Session> ErrorBasedAdapter::start(State initial) const {
+    if (initial.initial_error && !(std::isfinite(*initial.initial_error) && *initial.initial_error >= 0))
+        throw std::invalid_argument("ErrorBasedAdapter::State::initial_error must be finite and >= 0, got " +
+                                    std::to_string(*initial.initial_error));
+    // Not make_unique: the Session constructor is private to this class.
+    return std::unique_ptr<Session>(new Session(*this, std::move(initial)));
 }
 
-ErrorBasedAdapter::StepResult ErrorBasedAdapter::adapt_once(const MeshProperties& mesh, const RefinementInput& input,
-                                                            RefinementHistory history,
-                                                            std::optional<double> initial_error) const {
-    if (initial_error && !(std::isfinite(*initial_error) && *initial_error >= 0.0))
-        throw std::invalid_argument("ErrorBasedAdapter::adapt_once: initial_error must be finite and non-negative, got " +
-                                    std::to_string(*initial_error));
-    ErrorBasedSession session(name(), estimator_, marking_, refiner_, settings_, std::move(history), initial_error);
-    AdaptationResult adaptation = session.adapt(mesh, input);
-    return StepResult{std::move(adaptation), session.take_history()};
+ErrorBasedAdapter::Session::Session(const ErrorBasedAdapter& adapter, State initial)
+    : MeshAdapter::Session(adapter.name()), estimator_(adapter.estimator_), marking_(adapter.marking_),
+      refiner_(adapter.refiner_), settings_(adapter.settings_), state_(std::move(initial)) {}
+
+AdaptationResult ErrorBasedAdapter::Session::adapt_step(const MeshProperties& mesh, const RefinementInput& input) {
+    AdaptationResult result;
+    const bool over_limit = settings_.max_elements && mesh.elements.size() > *settings_.max_elements;
+    if (over_limit && !settings_.estimate_at_limit) {
+        result.status = AdaptationStatus::limit_reached;
+        return result;
+    }
+
+    // 1. Estimate
+    ErrorEstimate est = estimator_->estimate(mesh, input);
+    if (!std::isfinite(est.total))
+        throw std::runtime_error("error_based adapter: estimated total error is not finite (" +
+                                 std::to_string(est.total) + ")");
+    result.info.error_estimate = est.total;
+    result.info.stages.push_back(estimate_stage(est.info));
+
+    // Keep the baseline local until this step succeeds so a failing refinement does not
+    // poison relative_tolerance on a subsequent retry. The estimate is returned on every
+    // outcome after this point, including the ones that stop early.
+    const double baseline = state_.initial_error.value_or(est.total);
+    std::optional<double> bound = settings_.absolute_tolerance;
+    if (settings_.relative_tolerance) {
+        const double rel = *settings_.relative_tolerance * baseline;
+        bound = bound ? std::min(*bound, rel) : rel;
+    }
+    if (bound && est.total <= *bound) {
+        state_.initial_error = baseline;
+        result.status = AdaptationStatus::converged;
+        result.extras = ErrorBasedExtras{std::move(est.eta)};
+        return result;
+    }
+    if (over_limit) {
+        state_.initial_error = baseline;
+        result.status = AdaptationStatus::limit_reached;
+        result.extras = ErrorBasedExtras{std::move(est.eta)};
+        return result;
+    }
+
+    // 2. Mark
+    const auto mark_start = std::chrono::steady_clock::now();
+    const std::vector<uint32_t> marked = marking_->mark(mesh, est.eta);
+    const double mark_time = std::chrono::duration<double>(std::chrono::steady_clock::now() - mark_start).count();
+    result.info.stages.push_back(StageInfo{
+        .stage = "mark",
+        .method = marking_->name(),
+        .time = mark_time,
+        .metrics = {{"elements", static_cast<double>(mesh.elements.size())},
+                    {"marked", static_cast<double>(marked.size())}},
+        .warnings = {},
+    });
+    if (marked.empty()) {
+        state_.initial_error = baseline;
+        result.status = AdaptationStatus::unchanged;
+        result.extras = ErrorBasedExtras{std::move(est.eta)};
+        return result;
+    }
+
+    // 3. Refine
+    RefinementResult refined = refiner_->refine(mesh, marked, state_.history);
+    result.info.stages.push_back(refine_stage(refined.info));
+    state_.initial_error = baseline;
+    state_.history = std::move(refined.history);
+    result.status = AdaptationStatus::adapted;
+    result.mesh = std::move(refined.mesh);
+    result.parents = std::move(refined.parents);
+    result.extras = ErrorBasedExtras{std::move(est.eta)};
+    return result;
 }

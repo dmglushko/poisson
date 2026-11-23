@@ -18,7 +18,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Iterable, Iterator, Mapping
 
-from .hashing import blake3_file, blake3_json
+from .hashing import blake3_file, blake3_json, normalize_integral_floats
 
 
 class LockMode(str, Enum):
@@ -516,13 +516,13 @@ class Cache:
         output_specs: Mapping[str, str] | None = None,
         env: Mapping[str, str] | None = None,
     ) -> str:
-        """Compute the BLAKE3 request key for a stage invocation."""
+        """Compute the BLAKE3 request key for a stage invocation (integral floats in `settings` hash as ints)."""
         payload: dict[str, Any] = {
             "v": 2,
             "stage": stage_name,
             "code_hash": code_hash,
             "inputs": inputs,
-            "settings": settings,
+            "settings": normalize_integral_floats(settings),
             "output_specs": dict(output_specs) if output_specs is not None else {"out": ".h5"},
         }
         if env:

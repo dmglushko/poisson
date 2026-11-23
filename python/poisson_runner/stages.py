@@ -2,14 +2,65 @@
 
 from __future__ import annotations
 
+import functools
 import os
-from collections.abc import Mapping
+import re
+import shutil
+import subprocess
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Callable
+from typing import TYPE_CHECKING, Any, Callable
 
-from .cache import Artifact, Cache, CacheMode, normalize_cache_mode
+from .cache import Artifact, Cache, CacheMode, file_signature, normalize_cache_mode
 from .hashing import blake3_json
+
+if TYPE_CHECKING:
+    from .driver import RunContext
+
+_LDD_LINE_RE = re.compile(r"^\s*(\S+)\s+=>\s+(\S+)\s+\(0x[0-9a-fA-F]+\)\s*$")
+_NEEDED_RE = re.compile(r"\(NEEDED\)\s+Shared library:\s+\[([^\]]+)\]")
+
+
+@functools.lru_cache(maxsize=256)
+def _shared_library_deps_for(path: str, _signature: tuple[str, int, int, int, int]) -> tuple[tuple[str, str], ...]:
+    ldd = shutil.which("ldd")
+    if ldd is None:
+        return ()
+    try:
+        proc = subprocess.run([ldd, path], capture_output=True, text=True, timeout=30, check=False)
+    except (OSError, subprocess.SubprocessError):
+        return ()
+    if proc.returncode != 0:
+        return ()  # Static binary or interpreted script: nothing to track.
+    resolved: dict[str, str] = {}
+    for line in proc.stdout.splitlines():
+        m = _LDD_LINE_RE.match(line)
+        if m:
+            resolved[m.group(1)] = m.group(2)
+
+    needed: list[str] | None = None
+    readelf = shutil.which("readelf")
+    if readelf is not None:
+        try:
+            dyn = subprocess.run([readelf, "-d", path], capture_output=True, text=True, timeout=30, check=False)
+            if dyn.returncode == 0:
+                needed = _NEEDED_RE.findall(dyn.stdout)
+        except (OSError, subprocess.SubprocessError):
+            needed = None
+    names = needed if needed is not None else sorted(resolved)
+    return tuple((name, resolved[name]) for name in sorted(set(names)) if name in resolved)
+
+
+def shared_library_deps(path: Path | str) -> list[tuple[str, Path]]:
+    """Return `(soname, resolved_path)` for the shared libraries an ELF executable links directly.
+
+    Uses `readelf -d` (direct `NEEDED` entries) resolved through `ldd`; falls back to every library
+    `ldd` lists if `readelf` is unavailable. Returns `[]` for scripts, static binaries, or non-Linux
+    hosts without `ldd`. Memoized per file signature, so rebuilding the binary re-scans it.
+    """
+    p = Path(path).resolve()
+    return [(name, Path(lib)) for name, lib in _shared_library_deps_for(str(p), file_signature(p))]
 
 
 def resolve_binary(name: str, build_dir: Path | str | None = None) -> Path:
@@ -65,6 +116,7 @@ class Stage:
     ignore_binary_hash: bool = False
     default_cache: CacheMode | str | bool = CacheMode.USE
     uses_config_file: bool = False
+    track_shared_libs: bool = True
 
     def __post_init__(self) -> None:
         self.default_cache = normalize_cache_mode(self.default_cache)
@@ -87,6 +139,7 @@ class Stage:
         version: str | None = None,
         ignore_binary_hash: bool = False,
         default_cache: CacheMode | str | bool = CacheMode.USE,
+        track_shared_libs: bool = True,
     ) -> Stage:
         """Declaratively register a CLI stage without writing a custom `build_command` lambda.
 
@@ -95,6 +148,8 @@ class Stage:
         - `config_flag`: if set (e.g. `"--config"`), writes the entire nested `settings` dict
           to a temporary JSON file and passes `[config_flag, <path>]` — ideal for stages with
           many nested component options like AMR or `PoissonDriver`.
+        - `track_shared_libs`: also hash the shared libraries the binary links directly (HDF5,
+          libstdc++, ...) into the code hash, so a library upgrade invalidates this stage.
         """
         exe = resolve_binary(str(binary), build_dir=build_dir)
         in_map = dict(input_flags)
@@ -157,6 +212,7 @@ class Stage:
             ignore_binary_hash=ignore_binary_hash,
             default_cache=default_cache,
             uses_config_file=config_flag is not None,
+            track_shared_libs=track_shared_libs,
             build_command=build_cmd,
         )
 
@@ -177,13 +233,23 @@ class Stage:
                 unique.append(rp)
         return unique
 
+    def tracked_shared_libs(self) -> list[tuple[str, Path]]:
+        """Shared libraries linked directly by the stage executable (empty if not tracked)."""
+        if self.ignore_binary_hash or not self.track_shared_libs or self.executable is None:
+            return []
+        return shared_library_deps(self.executable)
+
     def compute_code_hash(self, cache: Cache) -> str:
-        """Hash the stage's compiled binary (and any extra code_files / manual version)."""
+        """Hash the stage's binary, its directly linked shared libraries, code_files, and version."""
         parts: dict[str, Any] = {}
         if self.version is not None:
             parts["version"] = self.version
         if not self.ignore_binary_hash:
             parts["files"] = [cache.hash_file(f) for f in self.tracked_code_files()]
+            libs = self.tracked_shared_libs()
+            if libs:
+                # Keyed by soname (not install path) so identical libraries in different prefixes match.
+                parts["shared_libs"] = [[name, cache.hash_file(lib)] for name, lib in libs]
         return blake3_json(parts)
 
 
@@ -215,30 +281,97 @@ def make_import_free_charges_stage(build_dir: Path | str | None = None) -> Stage
     )
 
 
-def make_adapt_stage(
-    build_dir: Path | str | None = None,
-    *,
-    with_parents: bool = False,
-    with_history: bool = False,
-) -> Stage:
-    """Create the Stage for `poisson_adapt --mesh ... --solution ... --config ...`."""
-    out_specs: dict[str, str] = {"out": ".h5"}
-    out_flags: dict[str, str] = {"out": "--out"}
-    if with_parents:
-        out_specs["parents"] = ".h5"
-        out_flags["parents"] = "--parents-out"
-    if with_history:
-        out_specs["history"] = ".h5"
-        out_flags["history"] = "--history-out"
+def make_adapt_stage(build_dir: Path | str | None = None) -> Stage:
+    """Create the Stage for one `poisson_adapt` cycle.
 
+    Inputs `mesh`, `solution`, optional `state` (the previous cycle's state); outputs `mesh`
+    (refined, or the input mesh when not adapted), `parents` (identity when not adapted),
+    `state` (for the next cycle), and `eta` (per-tet indicators of the input mesh).
+    """
     return Stage.from_cli(
         name="adapt_mesh",
         binary="poisson_adapt",
-        input_flags={"mesh": "--mesh", "solution": "--solution", "history": "--history"},
+        input_flags={"mesh": "--mesh", "solution": "--solution", "state": "--state"},
         config_flag="--config",
-        output_flags=out_flags,
-        output_specs=out_specs,
+        output_flags={"mesh": "--out", "parents": "--parents-out", "state": "--state-out", "eta": "--eta-out"},
+        output_specs={"mesh": ".h5", "parents": ".h5", "state": ".h5", "eta": ".h5"},
         info_flag="--info-out",
         build_dir=build_dir,
-        version=f"adapt_mesh_v1_p{int(with_parents)}_h{int(with_history)}",
+        version="adapt_mesh_v2",
     )
+
+
+# ---------------------------------------------------------------------------------------------
+# Project stage helpers. Each takes the active `RunContext` and forwards any extra keyword
+# options (`cache`, `use_cache`, `repeats`, `warmup`, `env`, `resources`) to `run.run_stage`.
+# Adding a new pipeline stage means adding a `make_*_stage` factory and a helper here; the
+# generic driver does not need to change.
+# ---------------------------------------------------------------------------------------------
+
+
+def import_mesh(
+    run: RunContext,
+    mesh_file: Artifact | str | os.PathLike[str],
+    *,
+    materials: Sequence[Artifact | str | os.PathLike[str]] = (),
+    charges: Artifact | str | os.PathLike[str] | None = None,
+    **options: Any,
+) -> Artifact:
+    """Run the cached `poisson_import --mesh` stage and return the `MeshProperties` Artifact."""
+    stage = run.get_stage("import_mesh", make_import_mesh_stage)
+
+    mat_pairs = []
+    for m in materials:
+        art = m if isinstance(m, Artifact) else run.raw_file(m, name="material")
+        parser_mode = "mat" if art.path.suffix == ".mat" else "yaml"
+        mat_pairs.append((art.content_id, parser_mode, art.path.name, art))
+    # Order-independent request key: the importer treats materials as a set.
+    mat_pairs.sort(key=lambda item: (item[0], item[1], item[2]))
+
+    inputs: dict[str, Any] = {"mesh": mesh_file}
+    settings: dict[str, Any] = {}
+    if mat_pairs:
+        inputs["materials"] = [item[3] for item in mat_pairs]
+        settings["material_formats"] = [item[1] for item in mat_pairs]
+    if charges is not None:
+        inputs["charges"] = charges
+
+    result = run.run_stage(stage, inputs=inputs, settings=settings, **options)
+    assert isinstance(result, Artifact)
+    return result
+
+
+def import_free_charges(
+    run: RunContext,
+    primaries_file: Artifact | str | os.PathLike[str],
+    **options: Any,
+) -> Artifact:
+    """Run the cached `poisson_import --primaries` stage and return the `FreeCharges` Artifact."""
+    stage = run.get_stage("import_free_charges", make_import_free_charges_stage)
+    result = run.run_stage(stage, inputs={"primaries": primaries_file}, **options)
+    assert isinstance(result, Artifact)
+    return result
+
+
+def adapt_mesh(
+    run: RunContext,
+    mesh: Artifact | str | os.PathLike[str],
+    solution: Artifact | str | os.PathLike[str],
+    *,
+    config: Mapping[str, Any],
+    state: Artifact | str | os.PathLike[str] | None = None,
+    **options: Any,
+) -> dict[str, Artifact]:
+    """Run one cached `poisson_adapt` cycle.
+
+    Returns `{"mesh", "parents", "state", "eta"}` (see `make_adapt_stage`). Chain cycles by
+    passing the previous result's `mesh` and `state`; omit `state` for an imported mesh. The
+    status (`adapted` / `converged` / `limit_reached` / `unchanged`) is `result["mesh"].info["status"]`.
+    """
+    stage = run.get_stage("adapt_mesh", make_adapt_stage)
+    inputs: dict[str, Any] = {"mesh": mesh, "solution": solution}
+    if state is not None:
+        inputs["state"] = state
+    result = run.run_stage(stage, inputs=inputs, settings=config, **options)
+    assert isinstance(result, dict)
+    return result

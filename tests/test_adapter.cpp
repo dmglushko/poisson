@@ -8,6 +8,7 @@
 #include "poisson_driver.h"
 #include "test_support.h"
 
+#include <algorithm>
 #include <cmath>
 #include <memory>
 #include <numbers>
@@ -73,24 +74,6 @@ void test_multi_cycle_and_session_history() {
     const std::size_t n1 = run_once();
     const std::size_t n2 = run_once();
     CHECK(n1 == n2);
-
-    // adapt_once() with explicit RefinementHistory + initial_error matches Session::adapt() identically.
-    MeshProperties mesh = cube_mesh(2);
-    RefinementHistory history;
-    std::optional<double> baseline;
-    uint32_t step_cycles = 0;
-    AdaptationStatus final_status = AdaptationStatus::unchanged;
-    for (; step_cycles < 10; ++step_cycles) {
-        const auto u = smooth_u(mesh);
-        auto step = adapter.adapt_once(mesh, smooth_input(u), std::move(history), baseline);
-        if (!baseline && step.adaptation.info.error_estimate) baseline = *step.adaptation.info.error_estimate;
-        history = std::move(step.history);
-        final_status = step.adaptation.status;
-        if (final_status != AdaptationStatus::adapted) break;
-        mesh = std::move(*step.adaptation.mesh);
-    }
-    CHECK(final_status == AdaptationStatus::converged);
-    CHECK(mesh.elements.size() == n1);
 }
 
 void test_absolute_and_combined_tolerance() {
@@ -239,6 +222,145 @@ void test_bad_inputs() {
     CHECK_THROWS(std::invalid_argument, ErrorBasedAdapter(est, mark, ref, {.max_elements = 0}), "max_elements");
 }
 
+// Resuming each cycle from the previous cycle's State (as poisson_adapt does across processes)
+// must give exactly the same sequence as one long session: same meshes, statuses, estimates,
+// red-green reopenings, and relative_tolerance convergence point.
+void test_state_resume_matches_one_session() {
+    const ErrorBasedAdapter adapter(std::make_shared<ResidualEstimator>(),
+                                    std::make_shared<DorflerMarking>(DorflerMarking::Settings{.theta = 0.5}),
+                                    std::make_shared<RedGreenRefinement>(),
+                                    ErrorBasedAdapter::Settings{.relative_tolerance = 0.6});
+
+    struct Cycle {
+        AdaptationStatus status;
+        double           error;
+        std::size_t      elements_after;
+        double           reopened;
+    };
+    const auto record = [](const AdaptationResult& r) {
+        const double reopened =
+            r.info.stages.size() == 3 ? r.info.stages[2].metrics.at("reopened_green_families") : 0.0;
+        return Cycle{r.status, *r.info.error_estimate, r.info.elements_after, reopened};
+    };
+
+    std::vector<Cycle> continuous;
+    {
+        MeshProperties mesh = cube_mesh(2);
+        auto session = adapter.start();
+        for (int c = 0; c < 10; ++c) {
+            const auto u = smooth_u(mesh);
+            AdaptationResult r = session->adapt(mesh, smooth_input(u));
+            continuous.push_back(record(r));
+            if (r.status != AdaptationStatus::adapted) break;
+            mesh = std::move(*r.mesh);
+        }
+    }
+
+    std::vector<Cycle> resumed;
+    double reopened_total = 0;
+    {
+        MeshProperties mesh = cube_mesh(2);
+        ErrorBasedAdapter::State state;   // imported mesh: empty history, no baseline yet
+        CHECK(!state.initial_error && state.history.family.empty());
+        for (int c = 0; c < 10; ++c) {
+            auto session = adapter.start(state);   // a fresh session per cycle, like a new process
+            const auto u = smooth_u(mesh);
+            AdaptationResult r = session->adapt(mesh, smooth_input(u));
+            resumed.push_back(record(r));
+            reopened_total += resumed.back().reopened;
+            state = session->state();
+            CHECK(state.initial_error.has_value());
+            CHECK_NEAR(*state.initial_error, resumed.front().error, 0.0);   // baseline = first cycle's total
+            if (r.status != AdaptationStatus::adapted) break;
+            CHECK(state.history.family.size() == r.mesh->elements.size());  // history belongs to the new mesh
+            mesh = std::move(*r.mesh);
+        }
+    }
+
+    CHECK(continuous.size() == resumed.size());
+    for (std::size_t i = 0; i < std::min(continuous.size(), resumed.size()); ++i) {
+        CHECK(continuous[i].status == resumed[i].status);
+        CHECK(continuous[i].elements_after == resumed[i].elements_after);
+        CHECK(continuous[i].reopened == resumed[i].reopened);
+        CHECK_NEAR(continuous[i].error, resumed[i].error, 0.0);
+    }
+    CHECK(resumed.back().status == AdaptationStatus::converged);   // relative_tolerance works across "processes"
+    CHECK(reopened_total >= 1);                                      // history carried across "processes"
+
+    // Without the state, every cycle is its own first cycle: relative_tolerance can never fire.
+    {
+        MeshProperties mesh = cube_mesh(2);
+        for (int c = 0; c < 4; ++c) {
+            const auto u = smooth_u(mesh);
+            AdaptationResult r = adapter.start()->adapt(mesh, smooth_input(u));
+            CHECK(r.status == AdaptationStatus::adapted);
+            mesh = std::move(*r.mesh);
+        }
+    }
+
+    CHECK_THROWS(std::invalid_argument, adapter.start(ErrorBasedAdapter::State{.history = {}, .initial_error = -1.0}),
+                 "initial_error");
+    CHECK_THROWS(std::invalid_argument,
+                 adapter.start(ErrorBasedAdapter::State{.history = {}, .initial_error = std::nan("")}), "initial_error");
+}
+
+// eta in ErrorBasedExtras: one indicator per INPUT tet whenever the estimator ran; its norm is
+// info.error_estimate. When nothing was estimated, extras holds std::monostate.
+void test_eta_returned() {
+    const MeshProperties mesh = cube_mesh(2);   // 48 tets
+    const auto u = smooth_u(mesh);
+    const RefinementInput input = smooth_input(u);
+    const auto norm = [](const std::vector<double>& eta) {
+        double s = 0;
+        for (const double e : eta) s += e * e;
+        return std::sqrt(s);
+    };
+
+    const ErrorBasedAdapter plain(std::make_shared<KellyEstimator>(), std::make_shared<DorflerMarking>(),
+                                  std::make_shared<LongestEdgeBisection>());
+    const AdaptationResult adapted = plain.start()->adapt(mesh, input);
+    CHECK(adapted.status == AdaptationStatus::adapted);
+    const auto* adapted_eb = std::get_if<ErrorBasedExtras>(&adapted.extras);
+    CHECK(adapted_eb != nullptr);
+    if (adapted_eb) {
+        CHECK(adapted_eb->eta.size() == mesh.elements.size());   // input mesh, not the refined one
+        CHECK(adapted.mesh->elements.size() != adapted_eb->eta.size());
+        CHECK_NEAR(norm(adapted_eb->eta), *adapted.info.error_estimate, 1e-12 * *adapted.info.error_estimate);
+        CHECK(*std::max_element(adapted_eb->eta.begin(), adapted_eb->eta.end()) ==
+              adapted.info.stages[0].metrics.at("max_indicator"));
+    }
+
+    const ErrorBasedAdapter generous(std::make_shared<KellyEstimator>(), std::make_shared<DorflerMarking>(),
+                                     std::make_shared<LongestEdgeBisection>(),
+                                     ErrorBasedAdapter::Settings{.absolute_tolerance = 1e9});
+    const AdaptationResult converged = generous.start()->adapt(mesh, input);
+    const auto* converged_eb = std::get_if<ErrorBasedExtras>(&converged.extras);
+    CHECK(converged.status == AdaptationStatus::converged && converged_eb &&
+          converged_eb->eta.size() == mesh.elements.size());
+
+    const ErrorBasedAdapter at_limit(std::make_shared<KellyEstimator>(), std::make_shared<DorflerMarking>(),
+                                     std::make_shared<LongestEdgeBisection>(),
+                                     ErrorBasedAdapter::Settings{.max_elements = 40});
+    const AdaptationResult limited = at_limit.start()->adapt(mesh, input);
+    const auto* limited_eb = std::get_if<ErrorBasedExtras>(&limited.extras);
+    CHECK(limited.status == AdaptationStatus::limit_reached && limited_eb &&
+          limited_eb->eta.size() == mesh.elements.size());
+
+    const ErrorBasedAdapter skip(std::make_shared<KellyEstimator>(), std::make_shared<DorflerMarking>(),
+                                 std::make_shared<LongestEdgeBisection>(),
+                                 ErrorBasedAdapter::Settings{.max_elements = 40, .estimate_at_limit = false});
+    const AdaptationResult skipped = skip.start()->adapt(mesh, input);
+    CHECK(skipped.status == AdaptationStatus::limit_reached);
+    CHECK(std::holds_alternative<std::monostate>(skipped.extras));   // estimator never ran
+
+    std::vector<double> linear_u;
+    for (const auto& p : mesh.nodes) linear_u.push_back(2 * p[0] - p[1] + 3 * p[2]);
+    const AdaptationResult unchanged = plain.start()->adapt(mesh, RefinementInput{linear_u, {}, {}});
+    const auto* unchanged_eb = std::get_if<ErrorBasedExtras>(&unchanged.extras);
+    CHECK(unchanged.status == AdaptationStatus::unchanged && unchanged_eb &&
+          unchanged_eb->eta.size() == mesh.elements.size());
+}
+
 int main() {
     test_multi_cycle_and_session_history();
     test_absolute_and_combined_tolerance();
@@ -246,5 +368,7 @@ int main() {
     test_unchanged_and_driver_placeholder();
     test_overflow_and_failed_first_call();
     test_bad_inputs();
+    test_state_resume_matches_one_session();
+    test_eta_returned();
     return finish("adapter");
 }

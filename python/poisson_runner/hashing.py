@@ -118,6 +118,21 @@ def _canonicalize(value: Any) -> Any:
     raise TypeError(f"Value of type {type(value).__name__} is not canonical JSON-serializable: {value!r}")
 
 
+def normalize_integral_floats(value: Any) -> Any:
+    """Recursively replace integral finite floats (`1.0`) with ints (`1`).
+
+    Used only when computing cache keys, so `{"cycles": 1}` and `{"cycles": 1.0}` share an entry;
+    the settings passed to the stage binary are left untouched.
+    """
+    if isinstance(value, float) and math.isfinite(value) and value.is_integer():
+        return int(value)
+    if isinstance(value, (list, tuple)):
+        return [normalize_integral_floats(v) for v in value]
+    if isinstance(value, dict):
+        return {k: normalize_integral_floats(v) for k, v in value.items()}
+    return value
+
+
 def canonical_json(value: Any) -> str:
     """Serialize `value` to canonical deterministic JSON."""
     return json.dumps(_canonicalize(value), sort_keys=True, separators=(",", ":"), ensure_ascii=False)

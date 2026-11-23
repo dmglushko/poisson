@@ -10,8 +10,8 @@
 #include "io/amr_io.h"
 #include "io/mesh_io.h"
 
-#include <cmath>
 #include <cstdlib>
+#include <deque>
 #include <filesystem>
 #include <iostream>
 #include <memory>
@@ -19,6 +19,7 @@
 #include <set>
 #include <string>
 #include <string_view>
+#include <variant>
 #include <vector>
 
 namespace {
@@ -29,20 +30,34 @@ using poisson::cli::JsonValue;
 void print_usage(std::ostream& out) {
     out << "Usage:\n"
         << "  poisson_adapt --mesh <mesh.h5> --solution <nodal_field.h5> --config <config.json>\n"
-        << "                [--history <history.h5>] [--initial-error <value>] --out <mesh_out.h5>\n"
-        << "                [--parents-out <parents.h5>] [--history-out <history.h5>]\n"
-        << "                [--info-out <info.json>]\n";
+        << "                [--state <state.h5>] --out <mesh_out.h5>\n"
+        << "                [--parents-out <parents.h5>] [--state-out <state.h5>]\n"
+        << "                [--eta-out <eta.h5>] [--info-out <info.json>]\n"
+        << "\n"
+        << "Runs one ErrorBasedAdapter cycle. --state resumes from the --state-out of the previous\n"
+        << "cycle (red-green history and the base error of relative_tolerance); omit it for an\n"
+        << "imported mesh. When the status is not 'adapted', --out is the input mesh and\n"
+        << "--parents-out is the identity map, so the outputs always describe the mesh to continue with.\n";
 }
 
+// Parents of a mesh that was not changed: every tet and node is its own parent.
 Parents identity_parents(const MeshProperties& mesh) {
     Parents parents;
     parents.elements.resize(mesh.elements.size());
-    for (uint32_t k = 0; k < mesh.elements.size(); ++k) parents.elements[k] = k;
+    for (std::size_t j = 0; j < parents.elements.size(); ++j) parents.elements[j] = static_cast<uint32_t>(j);
     parents.nodes.resize(mesh.nodes.size());
-    for (uint32_t i = 0; i < mesh.nodes.size(); ++i) parents.nodes[i] = {i, i};
+    for (std::size_t i = 0; i < parents.nodes.size(); ++i)
+        parents.nodes[i] = {static_cast<uint32_t>(i), static_cast<uint32_t>(i)};
     return parents;
 }
 
+// One output file, written to a sibling staging path and renamed into place only after
+// every output has been written successfully.
+struct StagedOutput {
+    fs::path                       target;
+    fs::path                       staged;
+    poisson::cli::TempFileCleanup  guard{{}};
+};
 void reject_unknown_keys(const JsonValue::Object& obj, const std::set<std::string>& allowed,
                          const std::string& section) {
     for (const auto& [k, _] : obj) {
@@ -207,11 +222,11 @@ int main(int argc, char** argv) {
     std::optional<fs::path> mesh_file;
     std::optional<fs::path> solution_file;
     std::optional<fs::path> config_file;
-    std::optional<fs::path> history_in_file;
-    std::optional<double> initial_error;
+    std::optional<fs::path> state_in_file;
     std::optional<fs::path> out_file;
     std::optional<fs::path> parents_out_file;
-    std::optional<fs::path> history_out_file;
+    std::optional<fs::path> state_out_file;
+    std::optional<fs::path> eta_out_file;
     std::optional<fs::path> info_out_file;
 
     auto require_value = [&](int& i, std::string_view flag) -> fs::path {
@@ -233,23 +248,16 @@ int main(int argc, char** argv) {
             solution_file = require_value(i, arg);
         } else if (arg == "--config") {
             config_file = require_value(i, arg);
-        } else if (arg == "--history") {
-            history_in_file = require_value(i, arg);
-        } else if (arg == "--initial-error") {
-            const std::string raw = require_value(i, arg).string();
-            char* end = nullptr;
-            const double val = std::strtod(raw.c_str(), &end);
-            if (end != raw.c_str() + raw.size() || !std::isfinite(val) || val < 0.0) {
-                std::cerr << "error: --initial-error must be a finite non-negative number, got '" << raw << "'\n";
-                return EXIT_FAILURE;
-            }
-            initial_error = val;
+        } else if (arg == "--state") {
+            state_in_file = require_value(i, arg);
         } else if (arg == "--out") {
             out_file = require_value(i, arg);
         } else if (arg == "--parents-out") {
             parents_out_file = require_value(i, arg);
-        } else if (arg == "--history-out") {
-            history_out_file = require_value(i, arg);
+        } else if (arg == "--state-out") {
+            state_out_file = require_value(i, arg);
+        } else if (arg == "--eta-out") {
+            eta_out_file = require_value(i, arg);
         } else if (arg == "--info-out") {
             info_out_file = require_value(i, arg);
         } else {
@@ -266,10 +274,11 @@ int main(int argc, char** argv) {
     }
 
     std::vector<fs::path> inputs = {*mesh_file, *solution_file, *config_file};
-    if (history_in_file) inputs.push_back(*history_in_file);
+    if (state_in_file) inputs.push_back(*state_in_file);
     std::vector<std::pair<std::string, fs::path>> outputs = {{"--out", *out_file}};
     if (parents_out_file) outputs.emplace_back("--parents-out", *parents_out_file);
-    if (history_out_file) outputs.emplace_back("--history-out", *history_out_file);
+    if (state_out_file) outputs.emplace_back("--state-out", *state_out_file);
+    if (eta_out_file) outputs.emplace_back("--eta-out", *eta_out_file);
     if (info_out_file) outputs.emplace_back("--info-out", *info_out_file);
 
     for (std::size_t i = 0; i < outputs.size(); ++i) {
@@ -291,6 +300,8 @@ int main(int argc, char** argv) {
         const ParsedConfig cfg = parse_config(poisson::cli::parse_json_file(*config_file));
         const MeshProperties mesh = poisson::io::read_mesh_properties(*mesh_file);
         const poisson::io::NodalField field = poisson::io::read_nodal_field(*solution_file);
+        ErrorBasedAdapter::State state_in;
+        if (state_in_file) state_in = poisson::io::read_adaptation_state(*state_in_file);
 
         RefinementInput ref_input;
         ref_input.u = field.u;
@@ -300,65 +311,46 @@ int main(int argc, char** argv) {
             ref_input.source = [f_val](const std::array<double, 3>&, uint32_t) { return f_val; };
         }
 
-        if (cfg.adapter_settings.relative_tolerance && !initial_error) {
-            throw std::runtime_error(
-                "config.adapter.relative_tolerance requires --initial-error in single-step CLI mode");
-        }
-
+        // One cycle of the standard driver, resumed from the previous cycle's state.
         const ErrorBasedAdapter adapter(cfg.estimator, cfg.marking, cfg.refiner, cfg.adapter_settings);
-        RefinementHistory in_history;
-        if (history_in_file) in_history = poisson::io::read_refinement_history(*history_in_file);
+        auto session = adapter.start(std::move(state_in));
+        AdaptationResult result = session->adapt(mesh, ref_input);
+        const bool adapted = result.status == AdaptationStatus::adapted;
+        const MeshProperties& out_mesh = adapted ? *result.mesh : mesh;
 
-        ErrorBasedAdapter::StepResult step =
-            adapter.adapt_once(mesh, ref_input, std::move(in_history), initial_error);
-        const AdaptationStatus status = step.adaptation.status;
-        const AdaptationResult::Info info = std::move(step.adaptation.info);
-        const MeshProperties out_mesh = step.adaptation.mesh ? std::move(*step.adaptation.mesh) : mesh;
-        const Parents out_parents =
-            step.adaptation.parents ? std::move(*step.adaptation.parents) : identity_parents(out_mesh);
-        const RefinementHistory out_history = std::move(step.history);
+        std::deque<StagedOutput> staged;   // deque: emplace_back never moves (and so never deletes) earlier entries
+        auto stage_output = [&](const fs::path& target, const char* tag, const auto& write) {
+            StagedOutput& o = staged.emplace_back();
+            o.target = target;
+            o.staged = poisson::cli::make_staging_path(target, tag);
+            o.guard.path = o.staged;
+            write(o.staged);
+        };
 
-        const fs::path staged_out = poisson::cli::make_staging_path(*out_file, "out");
-        poisson::cli::TempFileCleanup out_guard{staged_out};
-        poisson::io::write_mesh_properties(staged_out, out_mesh);
-
-        fs::path staged_parents;
-        poisson::cli::TempFileCleanup parents_guard{{}};
+        stage_output(*out_file, "out", [&](const fs::path& p) { poisson::io::write_mesh_properties(p, out_mesh); });
         if (parents_out_file) {
-            staged_parents = poisson::cli::make_staging_path(*parents_out_file, "parents");
-            parents_guard.path = staged_parents;
-            poisson::io::write_parents(staged_parents, out_parents);
+            stage_output(*parents_out_file, "parents", [&](const fs::path& p) {
+                poisson::io::write_parents(p, result.parents ? *result.parents : identity_parents(mesh));
+            });
         }
-
-        fs::path staged_history;
-        poisson::cli::TempFileCleanup history_guard{{}};
-        if (history_out_file) {
-            staged_history = poisson::cli::make_staging_path(*history_out_file, "history");
-            history_guard.path = staged_history;
-            poisson::io::write_refinement_history(staged_history, out_history);
+        if (state_out_file) {
+            stage_output(*state_out_file, "state",
+                         [&](const fs::path& p) { poisson::io::write_adaptation_state(p, session->state()); });
         }
-
-        fs::path staged_info;
-        poisson::cli::TempFileCleanup info_guard{{}};
-        if (info_out_file) {
-            staged_info = poisson::cli::make_staging_path(*info_out_file, "info");
-            info_guard.path = staged_info;
-            poisson::io::write_info_json(staged_info, status, info);
-        }
-
-        fs::rename(staged_out, *out_file);
-        out_guard.release();
-        if (parents_out_file) {
-            fs::rename(staged_parents, *parents_out_file);
-            parents_guard.release();
-        }
-        if (history_out_file) {
-            fs::rename(staged_history, *history_out_file);
-            history_guard.release();
+        if (eta_out_file) {
+            const auto* eb = std::get_if<ErrorBasedExtras>(&result.extras);
+            const std::vector<double> empty_eta;
+            const std::vector<double>& eta = eb ? eb->eta : empty_eta;
+            stage_output(*eta_out_file, "eta", [&](const fs::path& p) { poisson::io::write_error_indicators(p, eta); });
         }
         if (info_out_file) {
-            fs::rename(staged_info, *info_out_file);
-            info_guard.release();
+            stage_output(*info_out_file, "info",
+                         [&](const fs::path& p) { poisson::io::write_info_json(p, result.status, result.info); });
+        }
+
+        for (StagedOutput& o : staged) {
+            fs::rename(o.staged, o.target);
+            o.guard.release();
         }
     } catch (const std::exception& error) {
         std::cerr << "error: " << error.what() << "\n";

@@ -9,6 +9,7 @@
 #include <memory>
 #include <optional>
 #include <string>
+#include <variant>
 #include <vector>
 
 // Top-level mesh adaptation interface. A MeshAdapter represents a complete mesh adaptation
@@ -18,7 +19,8 @@
 // A configured MeshAdapter is immutable and reusable. Call start() to open a Session for
 // one adaptive sequence; the Session holds any cross-cycle state (such as red-green
 // RefinementHistory or the first cycle's error for relative tolerances) and releases it
-// when destroyed.
+// when destroyed. Adapters whose state must survive a process boundary (one CLI call per
+// cycle) expose it as a value; see ErrorBasedAdapter::State.
 
 struct StageInfo {
     std::string                   stage;    // e.g. "estimate", "mark", "refine"
@@ -35,6 +37,17 @@ enum class AdaptationStatus {
     unchanged,     // nothing to change (e.g. no elements marked)
 };
 
+// Adapter-specific per-cycle data carried in AdaptationResult::extras. Each adapter fills its
+// own alternative (or leaves std::monostate when it produces none), keeping the top-level
+// AdaptationResult fields strictly common across all adapters.
+struct ErrorBasedExtras {
+    // Per tet of the INPUT mesh (indexed like mesh.elements): the local error indicator eta_K
+    // the decision was based on, estimated before any refinement. Info::error_estimate is its norm.
+    std::vector<double> eta;
+};
+
+using AdaptationExtras = std::variant<std::monostate, ErrorBasedExtras>;
+
 struct AdaptationResult {
     struct Info {
         std::string              adapter;          // the adapter's name()
@@ -49,6 +62,7 @@ struct AdaptationResult {
     AdaptationStatus              status = AdaptationStatus::unchanged;
     std::optional<MeshProperties> mesh;            // populated iff status == adapted
     std::optional<Parents>        parents;         // populated when the method tracks parents
+    AdaptationExtras              extras;          // adapter-specific per-cycle outputs, if any
     Info                          info;
 };
 

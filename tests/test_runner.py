@@ -12,6 +12,7 @@ import tempfile
 import time
 import unittest
 from pathlib import Path
+from typing import Any
 
 import h5py
 
@@ -26,6 +27,7 @@ from poisson_runner import (  # noqa: E402
     RunContext,
     Stage,
     StageCall,
+    StageTrace,
     blake3_bytes,
     blake3_file,
     blake3_version,
@@ -735,12 +737,15 @@ pathlib.Path(a.info_out).write_text(json.dumps({{"time": 0.015}}))
                 )  # type: ignore[assignment]
             return cur
 
-        # #7: dry_run on cold cache executes NOTHING and reports WOULD_RUN for all 6 stage calls.
+        # #7: dry_run on cold cache executes NOTHING: 5 WOULD_RUN stage calls, plus the shared
+        # import on the 2nd branch which is REUSED from the 1st branch's planned run.
         dry_cold = run_experiment(loop_pipeline, cache=cache, dry_run=True)
         self.assertTrue(dry_cold.dry_run)
         self.assertEqual(len(dry_cold.branches), 2)
         self.assertEqual(dry_cold.cache_hits, 0)
-        self.assertEqual(dry_cold.cache_misses, 6)
+        self.assertEqual(dry_cold.cache_misses, 5)
+        self.assertEqual(dry_cold.reused, 1)
+        self.assertEqual(dry_cold.branches[1].stages[0].status, "REUSED")
         self.assertFalse(exec_log.exists())
         self.assertIn("WOULD_RUN", dry_cold.format_table())
 
@@ -812,80 +817,92 @@ pathlib.Path(a.info_out).write_text(json.dumps({{"time": 0.015}}))
                 g.create_dataset("element", data=np.zeros((0,), dtype="<u4"), dtype="<u4")
             return path
 
+        config_for = lambda est, ref, **adapter: {  # noqa: E731
+            "estimator": {"type": est},
+            "marker": {"type": "dorfler", "theta": 0.5},
+            "refiner": {"type": ref},
+            **({"adapter": adapter} if adapter else {}),
+        }
+
         # 1. Run 2x2 Compare across estimators & refiners on real poisson_import + poisson_adapt!
-        def amr_compare(run: RunContext) -> Artifact:
+        def amr_compare(run: RunContext) -> dict[str, Artifact]:
             mesh = run.import_mesh(self.mesh_file, materials=[self.mat_file])
             with h5py.File(mesh.path, "r") as h5:
                 nodes = h5["nodes"][:]
             sol_path = write_nodal_field_h5(self.tmp / "u_init.h5", nodes)
             est = compare("estimator", ["kelly", "recovery"])
             ref = compare("refiner", ["red_green", "longest_edge_bisection"])
-            adapted = run.adapt_mesh(
-                mesh,
-                sol_path,
-                config={
-                    "estimator": {"type": est},
-                    "marker": {"type": "dorfler", "theta": 0.5},
-                    "refiner": {"type": ref},
-                },
-            )
-            assert isinstance(adapted, Artifact)
-            return adapted
+            return run.adapt_mesh(mesh, sol_path, config=config_for(est, ref))
 
         report = run_experiment(amr_compare, cache=cache)
         self.assertEqual(len(report.branches), 4)
         self.assertEqual(report.cache_misses, 5)   # 1 import + 4 adapt combinations
         self.assertEqual(report.cache_hits, 3)     # import cached on branches 1..3
         for br in report.branches:
-            adapted_art: Artifact = br.result
-            self.assertEqual(adapted_art.info["status"], "adapted")
-            self.assertGreater(adapted_art.info["elements_after"], adapted_art.info["elements_before"])
-            self.assertEqual(len(adapted_art.info["stages"]), 3)
+            res: dict[str, Artifact] = br.result
+            self.assertEqual(set(res), {"mesh", "parents", "state", "eta"})
+            info = res["mesh"].info
+            self.assertEqual(info["status"], "adapted")
+            self.assertGreater(info["elements_after"], info["elements_before"])
+            self.assertEqual(len(info["stages"]), 3)
+            with h5py.File(res["eta"].path, "r") as h5:
+                self.assertEqual(h5.attrs["schema"], b"ErrorIndicators")
+                eta = h5["eta"][:]
+            self.assertEqual(len(eta), info["elements_before"])   # per tet of the INPUT mesh
+            self.assertAlmostEqual(float(np.sqrt(np.sum(eta**2))), info["error_estimate"], places=12)
+            with h5py.File(res["parents"].path, "r") as h5:
+                self.assertEqual(len(h5["elements"][:]), info["elements_after"])
+            with h5py.File(res["state"].path, "r") as h5:
+                self.assertEqual(h5.attrs["schema"], b"AdaptationState")
+                self.assertAlmostEqual(float(h5["initial_error"][0]), info["error_estimate"], places=12)
+                if br.choice_labels["refiner"] == "red_green":
+                    self.assertEqual(len(h5["history/family"][:]), info["elements_after"])
 
-        # 2. 2-cycle RedGreenRefinement passing RefinementHistory + Parents across CLI invocations.
-        def two_cycle_rg(run: RunContext) -> dict[str, Artifact]:
-            mesh = run.import_mesh(self.mesh_file, materials=[self.mat_file])
-            hist: Artifact | None = None
-            out: dict[str, Artifact] = {}
-            for cycle in range(2):
+        # 2. Multi-cycle red-green chained through `state` across separate CLI processes.
+        def cycles(run: RunContext, n: int, **adapter: Any) -> list[dict[str, Artifact]]:
+            mesh: Artifact = run.import_mesh(self.mesh_file, materials=[self.mat_file])
+            state: Artifact | None = None
+            results: list[dict[str, Artifact]] = []
+            for cycle in range(n):
                 with h5py.File(mesh.path, "r") as h5:
                     nodes = h5["nodes"][:]
-                sol_path = write_nodal_field_h5(self.tmp / f"u_c{cycle}.h5", nodes)
-                res = run.adapt_mesh(
-                    mesh,
-                    sol_path,
-                    history=hist,
-                    with_parents=True,
-                    with_history=True,
-                    config={
-                        "estimator": {"type": "kelly"},
-                        "marker": {"type": "dorfler", "theta": 0.5},
-                        "refiner": {"type": "red_green"},
-                    },
-                )
-                assert isinstance(res, dict)
-                mesh = res["out"]
-                hist = res["history"]
-                out = res
-            return out
+                sol_path = write_nodal_field_h5(self.tmp / f"u_c{cycle}_{nodes.shape[0]}.h5", nodes)
+                res = run.adapt_mesh(mesh, sol_path, state=state, config=config_for("kelly", "red_green", **adapter))
+                results.append(res)
+                mesh, state = res["mesh"], res["state"]
+            return results
 
-        r_cyc = run_experiment(two_cycle_rg, cache=cache)
-        self.assertEqual(len(r_cyc.branches), 1)
-        final_dict = r_cyc.branches[0].result
-        self.assertEqual(final_dict["out"].info["status"], "adapted")
-        self.assertGreater(final_dict["out"].info["elements_after"], 2)
-        self.assertTrue(final_dict["parents"].path.is_file())
-        self.assertTrue(final_dict["history"].path.is_file())
-        # History path uses the exact same ErrorBasedAdapter metrics as non-history path.
-        est_metrics = final_dict["out"].info["stages"][0]["metrics"]
+        r_cyc = run_experiment(lambda run: cycles(run, 2), cache=cache)
+        two = r_cyc.branches[0].result
+        self.assertEqual([r["mesh"].info["status"] for r in two], ["adapted", "adapted"])
+        self.assertGreater(two[1]["mesh"].info["elements_after"], two[0]["mesh"].info["elements_after"])
+        est_metrics = two[1]["mesh"].info["stages"][0]["metrics"]
         self.assertIn("elements", est_metrics)
         self.assertIn("point_sources", est_metrics)
-        ref_metrics = final_dict["out"].info["stages"][2]["metrics"]
+        ref_metrics = two[1]["mesh"].info["stages"][2]["metrics"]
         self.assertIn("elements_before", ref_metrics)
         self.assertIn("elements_after", ref_metrics)
+        with h5py.File(two[1]["state"].path, "r") as h5:
+            # The baseline stays the FIRST cycle's error, not the second's.
+            self.assertAlmostEqual(float(h5["initial_error"][0]), two[0]["mesh"].info["error_estimate"], places=12)
 
-        # 3. CLI validation checks: relative_tolerance requires --initial-error, invalid settings rejected
-        #    even with --history-out, simple_json rejects out-of-range ints, and converged emits identity parents.
+        # 3. relative_tolerance works across processes via `state`: a huge tolerance converges on
+        #    cycle 2 (cycle 1 sets the baseline), and converged cycles pass the mesh through
+        #    unchanged with identity parents.
+        r_rel = run_experiment(lambda run: cycles(run, 2, relative_tolerance=0.999999), cache=cache)
+        first, second = r_rel.branches[0].result
+        self.assertEqual(first["mesh"].info["status"], "adapted")
+        self.assertEqual(second["mesh"].info["status"], "converged")
+        self.assertEqual(second["mesh"].content_id, first["mesh"].content_id)   # same mesh passed through
+        with h5py.File(second["parents"].path, "r") as h5:
+            n_el = second["mesh"].info["elements_before"]
+            self.assertEqual(h5["elements"][:].tolist(), list(range(n_el)))
+            node_pairs = h5["nodes"][:]
+            self.assertTrue(np.array_equal(node_pairs[:, 0], node_pairs[:, 1]))
+        self.assertEqual(second["state"].content_id, first["state"].content_id)   # state unchanged too
+
+        # 4. CLI validation checks: invalid settings rejected even with --state-out, and
+        #    simple_json rejects out-of-range ints cleanly (no UB).
         from poisson_runner.stages import resolve_binary
 
         adapt_bin = resolve_binary("poisson_adapt")
@@ -907,7 +924,6 @@ pathlib.Path(a.info_out).write_text(json.dumps({{"time": 0.015}}))
             ]
             return subprocess.run(cmd, capture_output=True, text=True)
 
-        # Invalid max_elements=0 must be rejected even when --history-out is passed.
         bad_max = run_adapt_raw(
             {
                 "estimator": {"type": "kelly"},
@@ -915,12 +931,11 @@ pathlib.Path(a.info_out).write_text(json.dumps({{"time": 0.015}}))
                 "refiner": {"type": "red_green"},
                 "adapter": {"max_elements": 0},
             },
-            ["--history-out", str(self.tmp / "bad_hist.h5")],
+            ["--state-out", str(self.tmp / "bad_state.h5")],
         )
         self.assertNotEqual(bad_max.returncode, 0)
         self.assertIn("max_elements", bad_max.stderr)
 
-        # Out-of-range integer in JSON must fail cleanly (no UB).
         bad_int = run_adapt_raw(
             {
                 "estimator": {"type": "kelly", "face_degree": 1e10},
@@ -930,36 +945,6 @@ pathlib.Path(a.info_out).write_text(json.dumps({{"time": 0.015}}))
         )
         self.assertNotEqual(bad_int.returncode, 0)
         self.assertIn("32-bit integer", bad_int.stderr)
-
-        # relative_tolerance without --initial-error must be rejected.
-        bad_rel = run_adapt_raw(
-            {
-                "estimator": {"type": "kelly"},
-                "marker": {"type": "dorfler"},
-                "refiner": {"type": "red_green"},
-                "adapter": {"relative_tolerance": 0.5},
-            }
-        )
-        self.assertNotEqual(bad_rel.returncode, 0)
-        self.assertIn("--initial-error", bad_rel.stderr)
-
-        # relative_tolerance WITH huge --initial-error converges and writes valid identity parents.
-        par_out = self.tmp / "conv_parents.h5"
-        info_out = self.tmp / "conv_info.json"
-        ok_rel = run_adapt_raw(
-            {
-                "estimator": {"type": "kelly"},
-                "marker": {"type": "dorfler"},
-                "refiner": {"type": "red_green"},
-                "adapter": {"relative_tolerance": 0.5},
-            },
-            ["--initial-error", "1e9", "--parents-out", str(par_out), "--info-out", str(info_out)],
-        )
-        self.assertEqual(ok_rel.returncode, 0, ok_rel.stderr)
-        self.assertEqual(json.loads(info_out.read_text())["status"], "converged")
-        with h5py.File(par_out, "r") as h5:
-            self.assertEqual(list(h5["elements"][:]), [0, 1])
-            self.assertEqual(h5["nodes"].shape, (5, 2))
 
     def test_consensus_runner_fixes(self) -> None:
         """Verifies experiment-wide lease, negative max_bytes rejection, ephemeral cleanup, and spec_hash+version."""
@@ -1231,6 +1216,239 @@ pathlib.Path(a.info_out).write_text(json.dumps({{"time": 0.01, "threads": thread
             col_rows = list(reader)
         self.assertEqual(col_rows[0]["choice_omp_num_threads"], "fast")
         self.assertEqual(col_rows[0]["omp_num_threads"], "2")
+
+    def _counting_stage(self, name: str, *, random_output: bool = False, info_time: float | None = 0.25) -> tuple[Stage, Path]:
+        """A stage that appends one line per execution to a log and optionally writes random bytes."""
+        log = self.tmp / f"{name}.log"
+        info_line = (
+            f"pathlib.Path(a.info_out).write_text(json.dumps({{'time': {info_time!r}}}))"
+            if info_time is not None
+            else "pathlib.Path(a.info_out).write_text('{}')"
+        )
+        payload = "os.urandom(16).hex()" if random_output else "a.tag"
+        stage_bin = write_executable(
+            self.tmp / f"{name}_bin",
+            f"""
+import argparse, json, os, pathlib
+p = argparse.ArgumentParser()
+p.add_argument("--tag", required=True)
+p.add_argument("--in", dest="inp", default=None)
+p.add_argument("--out", required=True)
+p.add_argument("--info-out", required=True)
+a = p.parse_args()
+with open({str(log)!r}, "a") as f:
+    f.write(a.tag + "\\n")
+pathlib.Path(a.out).write_text(str({payload}))
+{info_line}
+""",
+        )
+        stage = Stage.from_cli(
+            name,
+            binary=stage_bin,
+            input_flags={"inp": "--in"},
+            setting_flags={"tag": "--tag"},
+            output_flags={"out": "--out"},
+            output_specs={"out": ".txt"},
+            info_flag="--info-out",
+        )
+        return stage, log
+
+    @staticmethod
+    def _count_lines(log: Path) -> int:
+        return len(log.read_text().splitlines()) if log.exists() else 0
+
+    def test_shared_prefix_runs_once_per_experiment_under_refresh_and_off(self) -> None:
+        prefix, prefix_log = self._counting_stage("prefix")
+        leaf, leaf_log = self._counting_stage("leaf")
+        cache = Cache(self.tmp / "reuse_cache")
+
+        def pipe(run: RunContext) -> Artifact:
+            shared = run.run_stage(prefix, settings={"tag": "shared"})
+            theta = compare("theta", [0.3, 0.5, 0.7, 0.9])
+            out = run.run_stage(leaf, inputs={"inp": shared}, settings={"tag": f"leaf_{theta}"})
+            assert isinstance(out, Artifact)
+            return out
+
+        # read_only on an empty cache: the miss runs once and is not written, later branches reuse it.
+        ro_cache = Cache(self.tmp / "reuse_ro_cache")
+        r_ro = run_experiment(pipe, cache=ro_cache, stage_cache_modes={"prefix": "read_only"})
+        self.assertEqual(self._count_lines(prefix_log), 1)
+        self.assertEqual([b.stages[0].status for b in r_ro.branches], ["MISS"] + ["REUSED"] * 3)
+        self.assertIsNone(r_ro.branches[1].stages[0].request_key)  # never published to the cache
+
+        for mode in ("refresh", "off"):
+            before = self._count_lines(prefix_log)
+            report = run_experiment(pipe, cache=cache, stage_cache_modes={"prefix": mode})
+            self.assertEqual(self._count_lines(prefix_log) - before, 1, f"prefix must run exactly once under {mode}")
+            self.assertEqual([b.stages[0].status for b in report.branches], ["MISS"] + ["REUSED"] * 3)
+            self.assertEqual(report.reused, 3)
+            self.assertIn("3 reused in this run", report.format_table())
+            # Every branch sees the same upstream content.
+            self.assertEqual(len({b.stages[0].content_ids["out"] for b in report.branches}), 1)
+
+        # Leaves were cached on the first `use`-mode experiment and are plain HITs afterwards.
+        self.assertEqual(self._count_lines(leaf_log), 8)  # 4 in ro_cache + 4 in cache
+
+        # A new run_experiment call starts fresh: refresh re-runs the prefix exactly once again.
+        before = self._count_lines(prefix_log)
+        run_experiment(pipe, cache=cache, stage_cache_modes={"prefix": "refresh"})
+        self.assertEqual(self._count_lines(prefix_log) - before, 1)
+
+    def test_repeats_determinism_check(self) -> None:
+        det, _ = self._counting_stage("det")
+        rnd, _ = self._counting_stage("rnd", random_output=True)
+        cache = Cache(self.tmp / "det_cache")
+
+        r_det = run_experiment(lambda run: run.run_stage(det, settings={"tag": "a"}), cache=cache, repeats=3)
+        st = r_det.branches[0].stages[0]
+        self.assertEqual(st.warnings, [])
+        self.assertEqual(st.execution["nondeterministic_outputs"], [])
+
+        r_rnd = run_experiment(lambda run: run.run_stage(rnd, settings={"tag": "a"}), cache=cache, repeats=2, warmup=1)
+        st = r_rnd.branches[0].stages[0]
+        self.assertEqual(st.execution["nondeterministic_outputs"], ["out"])
+        self.assertEqual(len(st.warnings), 1)
+        self.assertIn("different output bytes", st.warnings[0])
+        self.assertIn("Warning:", r_rnd.format_table())
+        self.assertIn("!", r_rnd.format_table())
+
+        # The warning is persisted with the cache entry and survives a later HIT.
+        r_hit = run_experiment(lambda run: run.run_stage(rnd, settings={"tag": "a"}), cache=cache)
+        self.assertTrue(r_hit.branches[0].stages[0].cached)
+        self.assertEqual(len(r_hit.branches[0].stages[0].warnings), 1)
+
+        # A single run cannot be checked, so no determinism field is recorded.
+        r_one = run_experiment(lambda run: run.run_stage(rnd, settings={"tag": "single"}), cache=cache)
+        self.assertNotIn("nondeterministic_outputs", r_one.branches[0].stages[0].execution)
+
+    def test_per_stage_repeats_precedence_and_hits_ignore_repeats(self) -> None:
+        a, a_log = self._counting_stage("stage_a")
+        b, b_log = self._counting_stage("stage_b")
+        cache = Cache(self.tmp / "rep_cache")
+
+        def bench(trace: StageTrace) -> tuple[int, int]:
+            info = trace.execution["benchmark"]
+            return info["repeats"], info["warmup"]
+
+        def pipe(run: RunContext) -> None:
+            run.run_stage(a, settings={"tag": "x"})
+            run.run_stage(b, settings={"tag": "x"})
+            run.run_stage(b, settings={"tag": "y"}, repeats=2, warmup=0)  # per-call beats per-stage
+
+        r = run_experiment(pipe, cache=cache, repeats=3, warmup=1, stage_repeats={"stage_b": 5}, stage_warmup={"stage_b": 2})
+        s_a, s_bx, s_by = r.branches[0].stages
+        self.assertEqual(bench(s_a), (3, 1))   # experiment-wide default
+        self.assertEqual(bench(s_bx), (5, 2))  # per-stage beats experiment-wide
+        self.assertEqual(bench(s_by), (2, 0))  # per-call beats per-stage
+        self.assertEqual(self._count_lines(a_log), 4)
+        self.assertEqual(self._count_lines(b_log), 7 + 2)
+
+        # Asking for more repeats later is still a cache HIT: nothing re-runs.
+        r_more = run_experiment(pipe, cache=cache, repeats=10, stage_repeats={"stage_b": 20})
+        self.assertEqual(r_more.cache_hits, 3)
+        self.assertEqual(self._count_lines(a_log), 4)
+        self.assertEqual(bench(r_more.branches[0].stages[0]), (3, 1))  # trace reports what was measured
+
+        # Re-measuring requires an explicit refresh for that stage only.
+        r_ref = run_experiment(pipe, cache=cache, repeats=10, stage_cache_modes={"stage_a": "refresh"})
+        self.assertEqual(self._count_lines(a_log), 4 + 10)
+        self.assertEqual(bench(r_ref.branches[0].stages[0]), (10, 0))
+        self.assertTrue(r_ref.branches[0].stages[1].cached)
+
+        with self.assertRaises(ValueError):
+            run_experiment(pipe, cache=cache, stage_repeats={"stage_a": 0})
+        with self.assertRaises(ValueError):
+            run_experiment(pipe, cache=cache, stage_warmup={"stage_a": -1})
+
+    def test_info_time_is_headline_timing(self) -> None:
+        timed, _ = self._counting_stage("timed", info_time=0.25)
+        untimed, _ = self._counting_stage("untimed", info_time=None)
+        cache = Cache(self.tmp / "time_cache")
+
+        def pipe(run: RunContext) -> None:
+            run.run_stage(timed, settings={"tag": "t"})
+            run.run_stage(untimed, settings={"tag": "t"})
+
+        r = run_experiment(pipe, cache=cache, repeats=2)
+        s_timed, s_untimed = r.branches[0].stages
+        self.assertAlmostEqual(s_timed.time_s or 0.0, 0.25)
+        self.assertIsNone(s_untimed.time_s)
+        table = r.format_table()
+        self.assertIn("timed(MISS 0.250s)", table)
+        self.assertRegex(table, r"untimed\(MISS \d+\.\d{3}s wall\)")
+
+        # Cached hits keep the headline time.
+        r_hit = run_experiment(pipe, cache=cache)
+        self.assertAlmostEqual(r_hit.branches[0].stages[0].time_s or 0.0, 0.25)
+
+        import csv
+
+        long_csv = self.tmp / "time_long.csv"
+        r.save_csv(long_csv, layout="long")
+        with long_csv.open(encoding="utf-8") as fp:
+            reader = csv.DictReader(fp)
+            cols = reader.fieldnames or []
+            rows = list(reader)
+        self.assertLess(cols.index("info_time_s"), cols.index("wall_s"))
+        self.assertEqual(rows[0]["info_time_s"], "0.250000")
+        wide_csv = self.tmp / "time_wide.csv"
+        r.save_csv(wide_csv, layout="wide")
+        with wide_csv.open(encoding="utf-8") as fp:
+            wcols = csv.DictReader(fp).fieldnames or []
+        self.assertLess(wcols.index("timed_info_time_s"), wcols.index("timed_wall_s"))
+
+    def test_integral_float_settings_share_cache_key(self) -> None:
+        key_int = Cache.compute_request_key("s", "c", {}, {"cycles": 1, "nested": [2, {"x": 3}]})
+        key_float = Cache.compute_request_key("s", "c", {}, {"cycles": 1.0, "nested": [2.0, {"x": 3.0}]})
+        self.assertEqual(key_int, key_float)
+        self.assertNotEqual(key_int, Cache.compute_request_key("s", "c", {}, {"cycles": 1.5, "nested": [2, {"x": 3}]}))
+        self.assertNotEqual(key_int, Cache.compute_request_key("s", "c", {}, {"cycles": True, "nested": [2, {"x": 3}]}))
+
+        # Only the key is normalized: the binary still receives the float as written.
+        cfg_seen = self.tmp / "cfg_seen.json"
+        cfg_bin = write_executable(
+            self.tmp / "cfg_echo",
+            f"""
+import argparse, pathlib, shutil
+p = argparse.ArgumentParser()
+p.add_argument("--config", required=True)
+p.add_argument("--out", required=True)
+a = p.parse_args()
+shutil.copy(a.config, {str(cfg_seen)!r})
+pathlib.Path(a.out).write_text("ok")
+""",
+        )
+        stage = Stage.from_cli(
+            "cfg_echo", binary=cfg_bin, config_flag="--config", output_specs={"out": ".txt"}, info_flag=None
+        )
+        cache = Cache(self.tmp / "float_cache")
+        r1 = run_experiment(lambda run: run.run_stage(stage, settings={"theta": 1.0}), cache=cache)
+        self.assertIn("1.0", cfg_seen.read_text())
+        r2 = run_experiment(lambda run: run.run_stage(stage, settings={"theta": 1}), cache=cache)
+        self.assertEqual(r1.cache_misses, 1)
+        self.assertEqual(r2.cache_hits, 1)
+
+    def test_shared_library_tracking(self) -> None:
+        from poisson_runner import make_import_mesh_stage, shared_library_deps
+
+        stage = make_import_mesh_stage()
+        libs = dict(stage.tracked_shared_libs())
+        if not libs:
+            self.skipTest("ldd unavailable or poisson_import is statically linked")
+        self.assertTrue(any(name.startswith("libhdf5") for name in libs), libs)
+        # Only direct NEEDED dependencies are tracked, not the whole transitive closure.
+        self.assertFalse(any(name.startswith("libcurl") for name in libs), libs)
+        for path in libs.values():
+            self.assertTrue(path.is_file())
+
+        cache = Cache(self.tmp / "libs_cache")
+        with_libs = stage.compute_code_hash(cache)
+        stage.track_shared_libs = False
+        self.assertNotEqual(with_libs, stage.compute_code_hash(cache))
+
+        script, _ = self._counting_stage("script_stage")
+        self.assertEqual(script.tracked_shared_libs(), [])
+        self.assertEqual(shared_library_deps(self.mesh_file), [])
 
 
 if __name__ == "__main__":

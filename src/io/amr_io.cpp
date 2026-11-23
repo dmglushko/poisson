@@ -1,6 +1,7 @@
 #include "h5_common.h"
 #include "io/amr_io.h"
 
+#include <cmath>
 #include <sstream>
 
 namespace poisson::io {
@@ -78,18 +79,19 @@ Parents read_parents(const fs::path& file) {
     return parents;
 }
 
-void write_refinement_history(const fs::path& file, const RefinementHistory& history) {
-    H5Handle h5 = create_deterministic_h5(file);
-    write_schema_header(file, h5.id, "RefinementHistory");
+namespace {
 
+// History datasets (families/parent, families/midpoint, family) under `parent`, shared by
+// the standalone RefinementHistory file and the history group of AdaptationState.
+void write_history_datasets(const fs::path& file, hid_t parent, const RefinementHistory& history) {
     {
-        const H5Handle g = create_group(file, h5.id, "families");
-        std::vector<std::array<uint32_t, 4>> parent;
+        const H5Handle g = create_group(file, parent, "families");
+        std::vector<std::array<uint32_t, 4>> parent_nodes;
         std::vector<std::array<uint32_t, 6>> midpoint;
-        parent.reserve(history.families.size());
+        parent_nodes.reserve(history.families.size());
         midpoint.reserve(history.families.size());
         for (const auto& fam : history.families) {
-            parent.push_back(fam.parent);
+            parent_nodes.push_back(fam.parent);
             std::array<uint32_t, 6> mp{};
             for (std::size_t k = 0; k < 6; ++k) {
                 if (fam.midpoint[k] && *fam.midpoint[k] == kNoneU32)
@@ -98,7 +100,7 @@ void write_refinement_history(const fs::path& file, const RefinementHistory& his
             }
             midpoint.push_back(mp);
         }
-        write_dataset_2d(file, g.id, "parent", parent);
+        write_dataset_2d(file, g.id, "parent", parent_nodes);
         write_dataset_2d(file, g.id, "midpoint", midpoint);
     }
 
@@ -108,24 +110,19 @@ void write_refinement_history(const fs::path& file, const RefinementHistory& his
         if (f && *f == kNoneU32) fail(file, "family index collides with sentinel UINT32_MAX");
         family_raw.push_back(f.value_or(kNoneU32));
     }
-    write_dataset_1d(file, h5.id, "family", family_raw);
-
-    h5.close_file_checked(file);
+    write_dataset_1d(file, parent, "family", family_raw);
 }
 
-RefinementHistory read_refinement_history(const fs::path& file) {
-    const H5Handle h5 = open_readonly_h5(file);
-    verify_schema_header(file, h5.id, "RefinementHistory");
-
+RefinementHistory read_history_datasets(const fs::path& file, hid_t parent) {
     RefinementHistory history;
     {
-        const H5Handle g = open_group(file, h5.id, "families");
-        const auto parent = read_dataset_2d<uint32_t, 4>(file, g.id, "parent");
+        const H5Handle g = open_group(file, parent, "families");
+        const auto parent_nodes = read_dataset_2d<uint32_t, 4>(file, g.id, "parent");
         const auto midpoint = read_dataset_2d<uint32_t, 6>(file, g.id, "midpoint");
-        if (parent.size() != midpoint.size()) fail(file, "families/parent and families/midpoint size mismatch");
-        history.families.resize(parent.size());
-        for (std::size_t i = 0; i < parent.size(); ++i) {
-            history.families[i].parent = parent[i];
+        if (parent_nodes.size() != midpoint.size()) fail(file, "families/parent and families/midpoint size mismatch");
+        history.families.resize(parent_nodes.size());
+        for (std::size_t i = 0; i < parent_nodes.size(); ++i) {
+            history.families[i].parent = parent_nodes[i];
             for (std::size_t k = 0; k < 6; ++k) {
                 history.families[i].midpoint[k] =
                     midpoint[i][k] == kNoneU32 ? std::nullopt : std::optional<uint32_t>(midpoint[i][k]);
@@ -133,7 +130,7 @@ RefinementHistory read_refinement_history(const fs::path& file) {
         }
     }
 
-    const auto family_raw = read_dataset_1d<uint32_t>(file, h5.id, "family");
+    const auto family_raw = read_dataset_1d<uint32_t>(file, parent, "family");
     history.family.resize(family_raw.size());
     for (std::size_t i = 0; i < family_raw.size(); ++i) {
         if (family_raw[i] == kNoneU32) {
@@ -145,6 +142,67 @@ RefinementHistory read_refinement_history(const fs::path& file) {
         }
     }
     return history;
+}
+
+}   // namespace
+
+void write_refinement_history(const fs::path& file, const RefinementHistory& history) {
+    H5Handle h5 = create_deterministic_h5(file);
+    write_schema_header(file, h5.id, "RefinementHistory");
+    write_history_datasets(file, h5.id, history);
+    h5.close_file_checked(file);
+}
+
+RefinementHistory read_refinement_history(const fs::path& file) {
+    const H5Handle h5 = open_readonly_h5(file);
+    verify_schema_header(file, h5.id, "RefinementHistory");
+    return read_history_datasets(file, h5.id);
+}
+
+void write_adaptation_state(const fs::path& file, const ErrorBasedAdapter::State& state) {
+    if (state.initial_error && !(std::isfinite(*state.initial_error) && *state.initial_error >= 0))
+        fail(file, "initial_error must be finite and >= 0");
+    H5Handle h5 = create_deterministic_h5(file);
+    write_schema_header(file, h5.id, "AdaptationState");
+    {
+        const H5Handle g = create_group(file, h5.id, "history");
+        write_history_datasets(file, g.id, state.history);
+    }
+    std::vector<double> initial_error;
+    if (state.initial_error) initial_error.push_back(*state.initial_error);
+    write_dataset_1d(file, h5.id, "initial_error", initial_error);
+    h5.close_file_checked(file);
+}
+
+ErrorBasedAdapter::State read_adaptation_state(const fs::path& file) {
+    const H5Handle h5 = open_readonly_h5(file);
+    verify_schema_header(file, h5.id, "AdaptationState");
+    ErrorBasedAdapter::State state;
+    {
+        const H5Handle g = open_group(file, h5.id, "history");
+        state.history = read_history_datasets(file, g.id);
+    }
+    const auto initial_error = read_dataset_1d<double>(file, h5.id, "initial_error");
+    if (initial_error.size() > 1) fail(file, "initial_error must have 0 or 1 entries");
+    if (!initial_error.empty()) {
+        if (!(std::isfinite(initial_error[0]) && initial_error[0] >= 0))
+            fail(file, "initial_error must be finite and >= 0");
+        state.initial_error = initial_error[0];
+    }
+    return state;
+}
+
+void write_error_indicators(const fs::path& file, const std::vector<double>& eta) {
+    H5Handle h5 = create_deterministic_h5(file);
+    write_schema_header(file, h5.id, "ErrorIndicators");
+    write_dataset_1d(file, h5.id, "eta", eta);
+    h5.close_file_checked(file);
+}
+
+std::vector<double> read_error_indicators(const fs::path& file) {
+    const H5Handle h5 = open_readonly_h5(file);
+    verify_schema_header(file, h5.id, "ErrorIndicators");
+    return read_dataset_1d<double>(file, h5.id, "eta");
 }
 
 void write_info_json(const fs::path& file, AdaptationStatus status, const AdaptationResult::Info& info) {

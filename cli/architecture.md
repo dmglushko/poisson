@@ -39,13 +39,36 @@ Every stage executable:
    outputs via sibling temp files + checked flush/close + atomic `std::filesystem::rename`.
 5. Returns exit code `0` on success and non-zero with a clear `stderr` message on failure.
 
+## `poisson_adapt` (`cli/amr/poisson_adapt.cpp`)
+
+One `ErrorBasedAdapter` cycle per call, always through the adapter itself (no separate code
+path):
+
+```text
+poisson_adapt --mesh <mesh.h5> --solution <nodal_field.h5> --config <config.json>
+              [--state <state.h5>] --out <mesh_out.h5>
+              [--parents-out <parents.h5>] [--state-out <state.h5>]
+              [--eta-out <eta.h5>] [--info-out <info.json>]
+```
+
+- `--state` / `--state-out` carry `ErrorBasedAdapter::State` (red-green history and the base
+  error of `relative_tolerance`) from one call to the next; omit `--state` for an imported mesh.
+- The outputs always describe the mesh to continue with: when the status is not `adapted`,
+  `--out` is the input mesh, `--parents-out` is the identity map, and `--state-out` is the
+  (possibly baseline-updated) input state. `--eta-out` holds `ErrorBasedExtras::eta` from
+  `AdaptationResult::extras` for the input mesh (empty when nothing was estimated). The status
+  is in `--info-out`.
+- The Python `adapt_mesh` helper always requests all four `.h5` outputs.
+
 ## Deterministic HDF5 Serialization (`include/io/`, `src/io/`)
 
 - Supports `MeshProperties`, `FreeCharges`, `AssembledProblem` (including compressed
   `Eigen::SparseMatrix<double>` `A`), `SolverResult`, and AMR stage artifacts (`NodalField`,
-  `Parents`, `RefinementHistory`), split into matching per-type headers/sources (`mesh_io.h/.cpp`,
-  `free_charges_io.h/.cpp`, `assembled_problem_io.h/.cpp`, `solver_result_io.h/.cpp`,
-  `amr_io.h/.cpp`).
+  `Parents`, `RefinementHistory`, `AdaptationState` — `ErrorBasedAdapter::State`: group
+  `/history` with the `RefinementHistory` layout plus `/initial_error` with 0 or 1 float64
+  entries — and `ErrorIndicators` — `/eta`, float64 per tet), split into matching per-type
+  headers/sources (`mesh_io.h/.cpp`, `free_charges_io.h/.cpp`, `assembled_problem_io.h/.cpp`,
+  `solver_result_io.h/.cpp`, `amr_io.h/.cpp`).
 - Disables HDF5 object timestamp tracking (`H5Pset_obj_track_times(..., false)`) on the root
   group, all subgroups, and all datasets, and pins HDF5 format bounds (`H5F_LIBVER_V18`).
 - Uses explicit little-endian numeric file types (`H5T_IEEE_F64LE`, `H5T_STD_U32LE`, etc.),
