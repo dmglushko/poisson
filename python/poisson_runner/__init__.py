@@ -28,6 +28,9 @@ from .executor import (
     collect_host_environment,
     detect_cpu_model,
 )
+from .records import RecordError, UnresolvedRecord, Unserializable, register_record
+from .report import info_scalars
+from .results import SOURCE_BRANCH, SavedRun, evaluate, load_run
 from .hashing import blake3_bytes, blake3_file, blake3_json, blake3_version
 from .benchmark import Measurement, measure, summarize_numbers
 from .stages import (
@@ -58,10 +61,15 @@ __all__ = [
     "LocalExecutor",
     "LockMode",
     "Measurement",
+    "RecordError",
+    "SOURCE_BRANCH",
+    "SavedRun",
     "RunContext",
     "Stage",
     "StageCall",
     "StageTrace",
+    "UnresolvedRecord",
+    "Unserializable",
     "adapt_mesh",
     "blake3_bytes",
     "blake3_file",
@@ -70,14 +78,18 @@ __all__ = [
     "collect_host_environment",
     "compare",
     "detect_cpu_model",
+    "evaluate",
     "import_free_charges",
     "import_mesh",
+    "info_scalars",
+    "load_run",
     "make_adapt_stage",
     "make_import_free_charges_stage",
     "make_import_mesh_stage",
     "measure",
     "normalize_cache_mode",
     "normalize_lock_mode",
+    "register_record",
     "resolve_binary",
     "resolve_slurm_shard",
     "run_experiment",

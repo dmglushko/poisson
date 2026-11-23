@@ -9,7 +9,9 @@
 |---|---|
 | `driver.py` | `compare(...)` replay, `RunContext.run_stage` (inputs -> request key -> lookup -> reuse -> execute -> publish), `run_experiment`, SLURM sharding |
 | `benchmark.py` | `measure(...)`: warmup + repeated executions, per-metric statistics, output determinism check |
-| `report.py` | `StageTrace`, `BranchResult`, `ExperimentReport` (table, JSON, wide/long CSV) |
+| `report.py` | `StageTrace`, `BranchResult`, `ExperimentReport` (table, JSON, wide/long CSV, DataFrame, `save`), `info_scalars` |
+| `records.py` | Tagged JSON encoding of branch outputs and choice values; explicit `register_record` registry |
+| `results.py` | `load_run` / `SavedRun` (`select`, `one`, `match`) and `evaluate` for post-hoc evaluation |
 | `stages.py` | `Stage` / `Stage.from_cli`, code hashing (binary + shared libraries), project stage factories and helpers (`import_mesh`, `import_free_charges`, `adapt_mesh`) |
 | `cache.py` | Two-layer content-addressed cache, locking, leases, eviction |
 | `executor.py` | `Executor` backends and per-process OS metrics |
@@ -126,3 +128,67 @@ SLURM shard is a separate process and keeps its own record.
   `HIT` vs `WOULD_RUN` without launching binaries. `ExperimentReport.save_csv(..., layout="long")`
   writes a loop-friendly tidy CSV (one row per `(branch, step_index, stage)` including HPC
   metadata), while `layout="wide"` disambiguates repeated stage calls (`stage#0`, `stage#1`, ...).
+
+## Results: Named Outputs, Metric Columns, Saved Runs & Evaluation (`report.py`, `records.py`, `results.py`)
+
+Running an experiment and evaluating its results are separate steps. The experiment only
+declares what it produced; what is done with the results is decided later, in another script.
+
+- **Named outputs:** the pipeline's return value is the branch's output contract. Returning a
+  dict (`{"mesh": mesh, "solution": sol, "dofs": 5200, "case": case}`) gives
+  `BranchResult.outputs`, `branch["mesh"]`, and `BranchResult.scalars` (the scalar entries).
+  `None` means no outputs; any other value is stored as `outputs["result"]`. Every
+  `StageTrace.outputs` additionally records that stage call's `Artifact`s for provenance.
+- **Metric columns:** both CSV layouts and `to_dataframe()` (pandas imported lazily) carry
+  `res.<key>` for each scalar output and `<stage>.<field>` for every scalar of a stage's
+  `.info.json` (`info_scalars`): top-level scalars except `type`, `time` (already
+  `info_time_s`) and `warnings`; top-level dicts one level deep (`details.<k>`); a composite's
+  `stages` list by step name (`adapt_mesh.estimate.total`, repeated names as `refine#0`).
+  Missing values are empty cells. Column names never collide: a second source flattening to
+  an existing name (a stage literally named `res`, or a literal `details.count` key next to a
+  `details` dict) gets `~2`, `~3`, ... appended. Metric columns are sorted by name within each
+  stage, so cold and cached runs produce identical headers. In the wide layout, repeated stage calls are `stage#i.<field>`;
+  in the long layout the column is `stage.<field>` and `step_index` separates calls. Choice names
+  that clash with any fixed or data column are renamed `choice_<name>` in both layouts. Info
+  field names therefore are an interface for analysis scripts: rename a field rather than
+  changing its meaning or units.
+- **Saving:** `report.save(dir)` writes `report.json` (`format_version`, `cache_root`, choice
+  labels and values, outputs as tagged JSON with artifact descriptors), `report.csv` (wide) and
+  `report_long.csv`. It encodes everything first, stages all three files, then publishes them
+  under a `.report.lock` flock, with `report.json` (the commit point) last; the old
+  `report.json` is removed before publishing, so a failure never leaves a mixed bundle. It
+  refuses dry runs, partial SLURM shards (unless
+  `allow_partial=True`), an existing report (unless `overwrite=True`), and returned values that
+  cannot be encoded (`RecordError`). Choice values are lenient: an unsavable one (a callable)
+  is stored as an `Unserializable` placeholder and matching uses labels. Output files are not
+  copied; they stay in the cache (protecting saved runs from eviction is a separate, open issue).
+- **Records:** `@register_record("name")` on a dataclass (or a class with `to_dict`/`from_dict`)
+  saves instances as `{"$record": "name", "data": ...}`. Loading never imports modules named in
+  the file: import the module that registers the type first, else the value comes back as an
+  `UnresolvedRecord`. Other tags: `$artifact`, `$path`, `$float` (non-finite), `$map` (dicts with
+  `$`-prefixed keys), `$unserializable`.
+- **Codec guarantees:** tuples reload as tuples (`$tuple`); returned dicts with non-string
+  keys are rejected rather than coerced; an `UnresolvedRecord` can be re-saved and loads as the
+  real type once registered; registering a name already used by a different class (module +
+  qualname) fails, as does a dataclass with `init=False` fields without `to_dict`/`from_dict`.
+  Artifact descriptors keep `info` and `execution`. Only `save()` marks a file as a saved run
+  (`saved_run`, `format_version`); `save_json()` exports are not loadable.
+- **Loading:** `load_run(dir, cache=None)` rebuilds the `ExperimentReport` as a `SavedRun`.
+  Artifacts inside the cache are re-rooted under `cache.objects_dir` when `cache=` is given (a
+  different mount of the same cache), else under the saved `cache_root`. `branch["name"]` raises
+  `FileNotFoundError` if the file is gone. `select(**labels)` returns all matches (failed
+  branches included), `one(**labels)` exactly one successful match, and `match(branch,
+  **overrides)` the branch with exactly the same set of choices except the overridden ones
+  (`key=None` ignores a choice on both sides, e.g. one that only some branches have); both raise `LookupError` on zero, several, or a failed match.
+- **Evaluation:** `evaluate(saved, fn, **run_experiment_options)` is `run_experiment` over the
+  successful saved branches: one evaluation branch per saved branch, selected by the reserved
+  choice `source_branch`, calling `fn(run, branch)`. Stages called in `fn` are cached like any
+  other, so re-running an analysis script is all hits, and the sweep never re-runs. The returned
+  report merges each saved branch's choices into its rows; evaluation choices that clash with a
+  saved choice name are renamed `eval.<name>` (`eval.<name>~2`, ... if needed), allocated once
+  per report. `cache` is where evaluation stages are cached and defaults to the saved run's
+  cache; saved outputs are always read from where `load_run` resolved them. Dry-run reports are
+  rejected. The result is an ordinary `ExperimentReport` (CSV, DataFrame, `save`).
+  As with any experiment, sharded evaluation runs a dry-run discovery pass first, where stage
+  outputs are placeholders: an `fn` that reads a file produced by a stage it just ran must
+  guard that read with `if not run.dry_run`.

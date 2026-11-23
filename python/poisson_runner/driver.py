@@ -364,6 +364,7 @@ class RunContext:
                 execution=execution,
                 warnings=[str(w) for w in warnings] if isinstance(warnings, list) else [],
                 dry_run=self.dry_run or is_placeholder,
+                outputs=dict(artifacts),
             )
         )
         return _single_or_dict(artifacts)
@@ -856,4 +857,5 @@ def run_experiment(
         total_wall_time_s=time.perf_counter() - overall_start,
         dry_run=dry_run,
         shard=resolved_shard,
+        cache_root=cache.root,
     )

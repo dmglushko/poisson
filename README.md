@@ -47,15 +47,31 @@ previews:
 from poisson_runner import Cache, compare, run_experiment
 
 def experiment(run):
-    mesh = run.import_mesh("box.msh", materials=["silicon.yaml"])
+    mesh_file = compare("mesh", ["coarse.msh", "fine.msh"])
+    mesh = run.import_mesh(mesh_file, materials=["silicon.yaml"])
     # Add downstream Stage(...) calls with compare(...) without writing loops
-    return mesh
+    return {"mesh": mesh}                     # named outputs, used by later evaluation
 
 report = run_experiment(
     experiment,
     cache=Cache(".poisson_cache", max_bytes=20 * 1024**3),
 )
 print(report.format_table())
+```
+
+Save a run and evaluate it later in a separate script, without touching the experiment
+(see [python/poisson_runner/architecture.md](python/poisson_runner/architecture.md)):
+
+```python
+report.save("results/sweep")                 # report.json, report.csv, report_long.csv
+
+from poisson_runner import evaluate, load_run
+
+saved = load_run("results/sweep")
+def analysis(run, b):                        # once per successful saved branch, cached
+    ref = saved.match(b, mesh="fine.msh")    # same choices except `mesh`
+    return {"same_mesh": b["mesh"].content_id == ref["mesh"].content_id}
+evaluate(saved, analysis).save_csv("results/sweep_analysis.csv")
 ```
 
 Manage the scratch cache from the command line:
