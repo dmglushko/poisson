@@ -165,10 +165,10 @@ AssembledProblem read_assembled_problem(const fs::path& file) {
     return problem;
 }
 
-void write_info_json(const fs::path& file, const AssembledProblem::Info& info) {
+void write_info_json(const fs::path& file, const AssemblyResult::Info& info) {
     std::ostringstream oss;
     oss << "{\n"
-        << "  \"type\": \"AssembledProblem::Info\",\n"
+        << "  \"type\": \"AssemblyResult::Info\",\n"
         << "  \"time\": " << format_double(info.time) << ",\n"
         << "  \"time_assemble_A\": " << format_double(info.time_assemble_A) << ",\n"
         << "  \"time_assemble_f\": " << format_double(info.time_assemble_f) << ",\n"

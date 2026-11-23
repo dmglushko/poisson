@@ -131,7 +131,6 @@ ErrorEstimate ErrorEstimator::estimate(const MeshProperties& mesh, const Refinem
     result.total = largest * std::sqrt(scaled_sum);
 
     result.info.elements = static_cast<uint32_t>(mesh.elements.size());
-    result.info.total = result.total;
     result.info.max_indicator = largest;
     result.info.point_sources = static_cast<uint32_t>(input.point_sources.size());
     result.info.excluded_elements = excluded;

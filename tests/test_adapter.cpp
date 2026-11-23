@@ -12,6 +12,7 @@
 #include <cmath>
 #include <memory>
 #include <numbers>
+#include <optional>
 #include <stdexcept>
 
 constexpr double pi = std::numbers::pi;
@@ -22,6 +23,14 @@ std::vector<double> smooth_u(const MeshProperties& mesh) {
     for (const auto& p : mesh.nodes)
         u.push_back(std::sin(pi * p[0]) * std::sin(pi * p[1]) * std::sin(pi * p[2]));
     return u;
+}
+
+// The total error the adapter estimated this cycle: the "total" metric of its estimate stage,
+// or empty when it did not estimate.
+std::optional<double> estimated_total(const AdaptationResult& r) {
+    for (const StageInfo& stage : r.info.stages)
+        if (stage.stage == "estimate") return stage.metrics.at("total");
+    return std::nullopt;
 }
 
 RefinementInput smooth_input(const std::vector<double>& u) {
@@ -52,7 +61,7 @@ void test_multi_cycle_and_session_history() {
             last = session->adapt(mesh, smooth_input(u));
             CHECK(last.info.adapter == "error_based");
             CHECK(last.info.elements_before == mesh.elements.size());
-            CHECK(last.info.error_estimate.has_value());
+            CHECK(estimated_total(last).has_value());
             if (last.status != AdaptationStatus::adapted) break;
             CHECK(last.mesh.has_value() && last.parents.has_value());
             CHECK(last.info.elements_after == last.mesh->elements.size());
@@ -91,7 +100,7 @@ void test_absolute_and_combined_tolerance() {
     CHECK(r.status == AdaptationStatus::converged);
     CHECK(!r.mesh.has_value());
     CHECK(r.info.stages.size() == 1);
-    CHECK_NEAR(*r.info.error_estimate, initial, 1e-12);
+    CHECK_NEAR(estimated_total(r).value(), initial, 1e-12);
 
     // Both absolute and relative set: the smaller (stricter) bound wins, so a generous
     // absolute tolerance does not stop early when relative_tolerance = 0.5 demands halving.
@@ -108,14 +117,14 @@ void test_max_elements_limit() {
     const auto u = smooth_u(mesh);
     const RefinementInput input = smooth_input(u);
 
-    // Default estimate_at_limit = true: runs estimate, reports error_estimate, then stops.
+    // Default estimate_at_limit = true: runs estimate, reports it in info.stages, then stops.
     const ErrorBasedAdapter with_estimate(std::make_shared<KellyEstimator>(), std::make_shared<DorflerMarking>(),
                                           std::make_shared<LongestEdgeBisection>(),
                                           ErrorBasedAdapter::Settings{.max_elements = 40});
     const AdaptationResult r1 = with_estimate.start()->adapt(mesh, input);
     CHECK(r1.status == AdaptationStatus::limit_reached);
     CHECK(!r1.mesh.has_value());
-    CHECK(r1.info.error_estimate.has_value() && *r1.info.error_estimate > 0);
+    CHECK(estimated_total(r1).has_value() && estimated_total(r1).value() > 0);
     CHECK(r1.info.stages.size() == 1 && r1.info.stages[0].stage == "estimate");
 
     // estimate_at_limit = false: stops immediately before running the estimator.
@@ -125,7 +134,7 @@ void test_max_elements_limit() {
     const AdaptationResult r2 = skip_estimate.start()->adapt(mesh, input);
     CHECK(r2.status == AdaptationStatus::limit_reached);
     CHECK(!r2.mesh.has_value());
-    CHECK(!r2.info.error_estimate.has_value());
+    CHECK(!estimated_total(r2).has_value());
     CHECK(r2.info.stages.empty());
 
     // Exactly at max_elements (not strictly greater) still adapts once.
@@ -149,7 +158,7 @@ void test_unchanged_and_driver_placeholder() {
     CHECK(r.status == AdaptationStatus::unchanged);
     CHECK(!r.mesh.has_value());
     CHECK(r.info.stages.size() == 2);   // estimate + mark; refine skipped
-    CHECK_NEAR(*r.info.error_estimate, 0.0, 1e-12);
+    CHECK_NEAR(estimated_total(r).value(), 0.0, 1e-12);
     CHECK(r.info.stages[1].metrics.at("marked") == 0);
 
     // Smoke-check placeholder PoissonDriver header compiles and stores the optional adapter.
@@ -184,8 +193,8 @@ void test_overflow_and_failed_first_call() {
                                  ErrorBasedAdapter::Settings{.relative_tolerance = 0.5});
     const AdaptationResult r = huge.start()->adapt(mesh, input);
     CHECK(r.status == AdaptationStatus::adapted);
-    CHECK(r.info.error_estimate.has_value() && std::isfinite(*r.info.error_estimate));
-    CHECK_NEAR(*r.info.error_estimate / (std::sqrt(6.0) * 1e200), 1.0, 1e-12);
+    CHECK(estimated_total(r).has_value() && std::isfinite(estimated_total(r).value()));
+    CHECK_NEAR(estimated_total(r).value() / (std::sqrt(6.0) * 1e200), 1.0, 1e-12);
 
     // Unrepresentable total norm (6 * (1e308)^2 overflows double) must throw rather than converge.
     const ErrorBasedAdapter unrepresentable(std::make_shared<ConstantEstimator>(1e308), std::make_shared<DorflerMarking>(),
@@ -240,7 +249,7 @@ void test_state_resume_matches_one_session() {
     const auto record = [](const AdaptationResult& r) {
         const double reopened =
             r.info.stages.size() == 3 ? r.info.stages[2].metrics.at("reopened_green_families") : 0.0;
-        return Cycle{r.status, *r.info.error_estimate, r.info.elements_after, reopened};
+        return Cycle{r.status, estimated_total(r).value(), r.info.elements_after, reopened};
     };
 
     std::vector<Cycle> continuous;
@@ -305,7 +314,7 @@ void test_state_resume_matches_one_session() {
 }
 
 // eta in ErrorBasedExtras: one indicator per INPUT tet whenever the estimator ran; its norm is
-// info.error_estimate. When nothing was estimated, extras holds std::monostate.
+// the estimate stage's "total" metric. When nothing was estimated, extras holds std::monostate.
 void test_eta_returned() {
     const MeshProperties mesh = cube_mesh(2);   // 48 tets
     const auto u = smooth_u(mesh);
@@ -325,7 +334,7 @@ void test_eta_returned() {
     if (adapted_eb) {
         CHECK(adapted_eb->eta.size() == mesh.elements.size());   // input mesh, not the refined one
         CHECK(adapted.mesh->elements.size() != adapted_eb->eta.size());
-        CHECK_NEAR(norm(adapted_eb->eta), *adapted.info.error_estimate, 1e-12 * *adapted.info.error_estimate);
+        CHECK_NEAR(norm(adapted_eb->eta), estimated_total(adapted).value(), 1e-12 * estimated_total(adapted).value());
         CHECK(*std::max_element(adapted_eb->eta.begin(), adapted_eb->eta.end()) ==
               adapted.info.stages[0].metrics.at("max_indicator"));
     }

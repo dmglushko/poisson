@@ -845,16 +845,18 @@ pathlib.Path(a.info_out).write_text(json.dumps({{"time": 0.015}}))
             self.assertEqual(info["status"], "adapted")
             self.assertGreater(info["elements_after"], info["elements_before"])
             self.assertEqual(len(info["stages"]), 3)
+            self.assertNotIn("error_estimate", info)   # the error is the estimate stage's "total"
             with h5py.File(res["eta"].path, "r") as h5:
                 self.assertEqual(h5.attrs["schema"], b"ErrorIndicators")
                 eta = h5["eta"][:]
             self.assertEqual(len(eta), info["elements_before"])   # per tet of the INPUT mesh
-            self.assertAlmostEqual(float(np.sqrt(np.sum(eta**2))), info["error_estimate"], places=12)
+            total = info["stages"][0]["metrics"]["total"]   # the estimate stage's error estimate
+            self.assertAlmostEqual(float(np.sqrt(np.sum(eta**2))), total, places=12)
             with h5py.File(res["parents"].path, "r") as h5:
                 self.assertEqual(len(h5["elements"][:]), info["elements_after"])
             with h5py.File(res["state"].path, "r") as h5:
                 self.assertEqual(h5.attrs["schema"], b"AdaptationState")
-                self.assertAlmostEqual(float(h5["initial_error"][0]), info["error_estimate"], places=12)
+                self.assertAlmostEqual(float(h5["initial_error"][0]), total, places=12)
                 if br.choice_labels["refiner"] == "red_green":
                     self.assertEqual(len(h5["history/family"][:]), info["elements_after"])
 
@@ -877,14 +879,18 @@ pathlib.Path(a.info_out).write_text(json.dumps({{"time": 0.015}}))
         self.assertEqual([r["mesh"].info["status"] for r in two], ["adapted", "adapted"])
         self.assertGreater(two[1]["mesh"].info["elements_after"], two[0]["mesh"].info["elements_after"])
         est_metrics = two[1]["mesh"].info["stages"][0]["metrics"]
-        self.assertIn("elements", est_metrics)
+        self.assertIn("total", est_metrics)
         self.assertIn("point_sources", est_metrics)
+        self.assertNotIn("elements", est_metrics)   # already Info's elements_before
         ref_metrics = two[1]["mesh"].info["stages"][2]["metrics"]
-        self.assertIn("elements_before", ref_metrics)
-        self.assertIn("elements_after", ref_metrics)
+        self.assertIn("nodes_before", ref_metrics)
+        self.assertIn("nodes_after", ref_metrics)
+        for repeated in ("elements_before", "elements_after", "marked"):   # already in Info / mark stage
+            self.assertNotIn(repeated, ref_metrics)
         with h5py.File(two[1]["state"].path, "r") as h5:
             # The baseline stays the FIRST cycle's error, not the second's.
-            self.assertAlmostEqual(float(h5["initial_error"][0]), two[0]["mesh"].info["error_estimate"], places=12)
+            self.assertAlmostEqual(float(h5["initial_error"][0]), two[0]["mesh"].info["stages"][0]["metrics"]["total"],
+                                   places=12)
 
         # 3. relative_tolerance works across processes via `state`: a huge tolerance converges on
         #    cycle 2 (cycle 1 sets the baseline), and converged cycles pass the mesh through

@@ -63,7 +63,7 @@ AMR_LIKE_INFO = {
     "time": 1.84,
     "elements_before": 120,
     "elements_after": 310,
-    "error_estimate": None,
+    "optional_metric": None,
     "warnings": ["w"],
     "details": {"passes": 3, "nested": {"skip": 1}},
     "history": [1, 2, 3],
@@ -157,7 +157,7 @@ pathlib.Path(a.info_out).write_text(json.dumps({{"time": 0.01, "abs_diff": abs(l
         flat = info_scalars(AMR_LIKE_INFO)
         self.assertEqual(flat["status"], "adapted")
         self.assertEqual(flat["elements_after"], 310)
-        for skipped in ("type", "time", "warnings", "error_estimate", "history", "details.nested"):
+        for skipped in ("type", "time", "warnings", "optional_metric", "history", "details.nested"):
             self.assertNotIn(skipped, flat)
         self.assertEqual(flat["details.passes"], 3)
         self.assertEqual(flat["estimate.method"], "residual")

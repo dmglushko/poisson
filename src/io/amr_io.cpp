@@ -224,7 +224,6 @@ void write_info_json(const fs::path& file, AdaptationStatus status, const Adapta
         << "  \"time\": " << format_double(info.time) << ",\n"
         << "  \"elements_before\": " << info.elements_before << ",\n"
         << "  \"elements_after\": " << info.elements_after << ",\n"
-        << "  \"error_estimate\": " << (info.error_estimate ? format_double(*info.error_estimate) : "null") << ",\n"
         << "  \"warnings\": " << format_warnings(info.warnings) << ",\n"
         << "  \"stages\": [";
     for (std::size_t i = 0; i < info.stages.size(); ++i) {

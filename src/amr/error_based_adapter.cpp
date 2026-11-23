@@ -7,14 +7,18 @@
 
 namespace {
 
-StageInfo estimate_stage(const ErrorEstimate::Info& info) {
+// The stage reports keep only what the adapter's own Info does not already say: the input
+// and output element counts are AdaptationResult::Info::elements_before/after, and the
+// number of marked tets is the mark stage's "marked".
+
+StageInfo estimate_stage(const ErrorEstimate& estimate) {
+    const ErrorEstimate::Info& info = estimate.info;
     StageInfo stage;
     stage.stage = "estimate";
     stage.method = info.estimator;
     stage.time = info.time;
     stage.metrics = info.details;
-    stage.metrics["elements"] = static_cast<double>(info.elements);
-    stage.metrics["total"] = info.total;
+    stage.metrics["total"] = estimate.total;
     stage.metrics["max_indicator"] = info.max_indicator;
     stage.metrics["point_sources"] = static_cast<double>(info.point_sources);
     stage.metrics["excluded_elements"] = static_cast<double>(info.excluded_elements);
@@ -28,10 +32,7 @@ StageInfo refine_stage(const RefinementResult::Info& info) {
     stage.method = info.refiner;
     stage.time = info.time;
     stage.metrics = info.details;
-    stage.metrics["marked"] = static_cast<double>(info.marked);
     stage.metrics["refined_elements"] = static_cast<double>(info.refined_elements);
-    stage.metrics["elements_before"] = static_cast<double>(info.elements_before);
-    stage.metrics["elements_after"] = static_cast<double>(info.elements_after);
     stage.metrics["nodes_before"] = static_cast<double>(info.nodes_before);
     stage.metrics["nodes_after"] = static_cast<double>(info.nodes_after);
     stage.warnings = info.warnings;
@@ -91,8 +92,7 @@ AdaptationResult ErrorBasedAdapter::Session::adapt_step(const MeshProperties& me
     if (!std::isfinite(est.total))
         throw std::runtime_error("error_based adapter: estimated total error is not finite (" +
                                  std::to_string(est.total) + ")");
-    result.info.error_estimate = est.total;
-    result.info.stages.push_back(estimate_stage(est.info));
+    result.info.stages.push_back(estimate_stage(est));
 
     // Keep the baseline local until this step succeeds so a failing refinement does not
     // poison relative_tolerance on a subsequent retry. The estimate is returned on every
@@ -124,8 +124,7 @@ AdaptationResult ErrorBasedAdapter::Session::adapt_step(const MeshProperties& me
         .stage = "mark",
         .method = marking_->name(),
         .time = mark_time,
-        .metrics = {{"elements", static_cast<double>(mesh.elements.size())},
-                    {"marked", static_cast<double>(marked.size())}},
+        .metrics = {{"marked", static_cast<double>(marked.size())}},
         .warnings = {},
     });
     if (marked.empty()) {

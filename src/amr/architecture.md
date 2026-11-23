@@ -64,14 +64,14 @@ struct AdaptationResult {
     std::optional<MeshProperties> mesh;     // iff adapted
     std::optional<Parents>        parents;  // iff adapted (new mesh -> input mesh)
     AdaptationExtras              extras;   // adapter-specific per-cycle outputs, if any
-    Info                          info;     // metadata only: time, counts, error_estimate, warnings, stages
+    Info                          info;     // metadata only: time, counts, warnings, stages
 };
 ```
 
 Adapter-specific per-cycle data goes in the `extras` variant so top-level `AdaptationResult`
 fields stay strictly common across all adapters. For `ErrorBasedAdapter`, `extras` holds
-`ErrorBasedExtras{eta}` (computed on the input mesh before any refinement; `info.error_estimate`
-is its norm $\sqrt{\sum_K \eta_K^2}$) on every outcome where the estimator ran (`adapted`,
+`ErrorBasedExtras{eta}` (computed on the input mesh before any refinement; its norm
+$\sqrt{\sum_K \eta_K^2}$ is the `total` metric of the `estimate` entry in `info.stages`) on every outcome where the estimator ran (`adapted`,
 `converged`, `unchanged`, and `limit_reached` with `estimate_at_limit = true`), and
 `std::monostate` when estimation was skipped. Mesh-sized arrays (`mesh`, `parents`, `eta`)
 are result data, never `Info`, so CLIs write them as `.h5` and `Info` as `.info.json`.
@@ -109,10 +109,13 @@ Each method has a nested `Settings` struct, given to its constructor and checked
 (`std::invalid_argument`). The default constructor (where meaningful) uses default settings.
 
 Each result has a nested `Info` with typed fields for the common numbers (`time`, element
-and node counts, `total`, `error_estimate`, `warnings`), plus a `details` map for
+and node counts, `warnings`), plus a `details` map for
 method-specific diagnostics (`element_part`, `red`, `passes`, ...). `AdaptationResult::Info`
 also carries a `std::vector<StageInfo> stages` recording every internal stage that actually
-ran (`estimate`, `mark`, `refine`, or whatever stages a future adapter uses).
+ran (`estimate`, `mark`, `refine`, or whatever stages a future adapter uses). Following the
+root convention, `Info` never repeats a result value: the error estimate is
+`ErrorEstimate::total` (not in `ErrorEstimate::Info`), and in an `AdaptationResult` it is the
+`total` metric of the `estimate` stage.
 
 ## Estimation
 

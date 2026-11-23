@@ -30,9 +30,9 @@ enum class DriverStopReason {
 //
 //   Dependencies (to be injected via constructor once their interfaces exist):
 //     - AnalyticalMaker  (optional, e.g. P3M singularity subtraction around trapped charges)
-//     - Assembler        (MeshProperties + AnalyticalSolution -> AssembledProblem)
+//     - Assembler        (MeshProperties + AnalyticalSolution -> AssemblyResult)
 //     - Solver           (AssembledProblem -> SolverResult)
-//     - SolutionBuilder  (AssembledProblem + SolverResult + AnalyticalSolution -> Solution)
+//     - SolutionBuilder  (AssembledProblem + SolverResult::x + AnalyticalSolution -> SolutionBuildResult)
 //     - MeshAdapter      (optional; nullptr => single solve with no adaptive loop)
 //
 //   Planned settings / budgets (driver-level, independent of the adaptation method):
@@ -43,14 +43,14 @@ enum class DriverStopReason {
 //     auto session = adapter ? adapter->start() : nullptr;
 //     for (uint32_t cycle = 0; cycle < max_cycles; ++cycle) {
 //         // 1. Build AnalyticalSolution on current mesh (if enabled)
-//         // 2. Assemble A x = f        -> AssembledProblem (with AssembledProblem::Info)
+//         // 2. Assemble A x = f        -> AssemblyResult   (problem + AssemblyResult::Info)
 //         // 3. Solve A x = f           -> SolverResult     (with SolverResult::Info)
-//         // 4. Build Solution          -> Solution + nodal u + RefinementInput
+//         // 4. Build Solution          -> SolutionBuildResult (Solution + Info) + RefinementInput
 //         // 5. Record per-cycle metrics (assembly info, solver info, mesh size, ...)
 //         // 6. If !session: stop (DriverStopReason::single_solve)
 //         // 7. If cycle + 1 == max_cycles: stop (DriverStopReason::max_cycles)
 //         // 8. AdaptationResult adapted = session->adapt(mesh, refinement_input);
-//         //    Record adapted.info (stages, error_estimate, time, warnings).
+//         //    Record adapted.info (stages, time, warnings; the error is the estimate stage's "total").
 //         // 9. If adapted.status != AdaptationStatus::adapted: stop accordingly.
 //         // 10. If max_nodes && adapted.mesh->nodes.size() > *max_nodes:
 //         //       discard adapted.mesh, stop (DriverStopReason::max_nodes).

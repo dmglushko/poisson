@@ -45,10 +45,28 @@ flowchart LR
 ## Conventions
 
 - Classes are CamelCase, variables are snake_case.
-- Pure domain data structs (`MeshProperties`, `FreeCharges`) hold only problem data.
-- Every step result (`MeshImportResult`, `FreeChargesImportResult`, `AssembledProblem`,
-  `SolverResult`, `ErrorEstimate`, `RefinementResult`, `AdaptationResult`) has a nested
-  `Info` describing the run that produced it, with at least `time` and `warnings`.
+- **Data classes** (`MeshProperties`, `FreeCharges`, `AssembledProblem`, and later
+  `Solution`) hold only problem data, never an `Info`. The same data class can come from
+  different stages (a `MeshProperties` from the Importer or from AMR) or from disk, so how
+  one run went cannot be part of it.
+- **Stage results** (`MeshImportResult`, `FreeChargesImportResult`, `AssemblyResult`,
+  `SolverResult`, `ErrorEstimate`, `RefinementResult`, `AdaptationResult`) are
+  `{ outputs...; Info info; }`:
+  - **outputs** are everything a later stage or the driver reads: the data classes, plain
+    arrays such as `x` or `eta`, helpers such as `parents`, and control values such as
+    `AdaptationResult::status`. CLIs write them as `.h5`.
+  - **`Info`** is only for people and logs: at least `time` and `warnings`, plus counts,
+    timings, a `details` map or `stages`. Summaries derived from outputs (`nnz`,
+    `max_indicator`, the refined mesh size) are fine, but `Info` never repeats a value that
+    is already an output, and never reports the same quantity twice (under two names, or
+    in both a composite's own fields and its `stages`). CLIs write it as `.info.json`.
+
+  A quick test: if deleting a field would break a later stage, it is an output; if only
+  the `.info.json` would change, it belongs in `Info`. One exception in the CLIs: a small
+  control output such as `AdaptationResult::status` may be written into the `.info.json`
+  next to the `Info` instead of into an `.h5`, so that an orchestrator can read it without
+  opening one. In C++ it stays an output. Such a value is then not covered by the runner's
+  `.h5` determinism check.
 - Drivers and composite stages are preferably built by composing smaller interchangeable
   module interfaces.
 - When a module or driver needs configuration, the preferred convention is a nested
@@ -156,6 +174,24 @@ nodes may share a row. Nodes whose value is known in advance have no row and are
 
 ```cpp
 struct AssembledProblem {
+    Eigen::SparseMatrix<double>              A;
+    std::vector<double>                      f;       // right-hand side, one entry per row of A
+    std::vector<std::optional<uint32_t>>     row;     // per node: its row in A, or empty if its value is known
+    std::vector<std::pair<uint32_t, double>> known;   // (node, value) for every node whose value is known
+};
+```
+
+## Stage results
+
+Results that cross a stage boundary through the root headers. The others are defined in
+their module's header (`include/importer/importer.h`, `include/amr/*.h`).
+
+### AssemblyResult
+
+What Assembly returns (`include/assembled_problem.h`).
+
+```cpp
+struct AssemblyResult {
     struct Info {
         double   time = 0;                      // total, in seconds
         double   time_assemble_A = 0;
@@ -165,17 +201,15 @@ struct AssembledProblem {
         std::vector<std::string> warnings;
     };
 
-    Eigen::SparseMatrix<double>              A;
-    std::vector<double>                      f;       // right-hand side, one entry per row of A
-    std::vector<std::optional<uint32_t>>     row;     // per node: its row in A, or empty if its value is known
-    std::vector<std::pair<uint32_t, double>> known;   // (node, value) for every node whose value is known
-    Info                                     info;
+    AssembledProblem problem;
+    Info             info;
 };
 ```
 
 ### SolverResult
 
-What the solver returns: the solution `x` of A x = f.
+What the solver returns: the solution `x` of A x = f. `x` is a plain array, so it needs no
+data class of its own.
 
 ```cpp
 struct SolverResult {
@@ -202,7 +236,8 @@ Reads the input files (`.msh`/`.msh2`, material `.yaml`/`.mat`, `.cha`, `.pri`) 
 
 ### Solver
 
-Solves A x = f. It takes `A` and `f` from `AssembledProblem` and returns a `SolverResult`.
+Solves A x = f. It takes `A` and `f` from `AssembledProblem` (Assembly's
+`AssemblyResult::problem`) and returns a `SolverResult`.
 
 ### Solution Builder
 
@@ -238,6 +273,8 @@ Assembly, AnalyticalMaker and Ray Tracing.
 
 - `Analytical Solution`: contents not decided. Planned as local singularity subtraction (P3M): a smooth cloud per charge in f, plus an analytical correction within r_c of each charge.
   analytical functions around the trapped charges.
-- `Solution`: contents not decided; it depends on the shape of `Analytical Solution`.
+- `Solution`: contents not decided; it depends on the shape of `Analytical Solution`. It
+  is a data class, so the Solution Builder returns it wrapped with its `Info`
+  (`SolutionBuildResult { solution, info }`).
 - `Output`: contents not decided.
 - `neighbours` in `MeshProperties`: proposed, not decided.

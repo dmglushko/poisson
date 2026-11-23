@@ -312,7 +312,8 @@ void test_info_json(const fs::path& dir) {
     CHECK(text.find("\\\\backslash\\\\") != std::string::npos);
 
     poisson::io::write_info_json(dir / "fc_info.json", FreeChargesImportResult::Info{0.1, {}});
-    poisson::io::write_info_json(dir / "ap_info.json", AssembledProblem::Info{1.2, 0.8, 0.3, 4200, 12, {}});
+    poisson::io::write_info_json(dir / "ap_info.json", AssemblyResult::Info{1.2, 0.8, 0.3, 4200, 12, {}});
+    CHECK(read_bytes(dir / "ap_info.json").find("\"AssemblyResult::Info\"") != std::string::npos);
     poisson::io::write_info_json(dir / "sr_info.json", SolverResult::Info{2.5, 42, 1e-10, {"slow"}});
     CHECK(read_bytes(dir / "sr_info.json").find("\"iterations\": 42") != std::string::npos);
 }

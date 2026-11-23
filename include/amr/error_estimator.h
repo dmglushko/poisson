@@ -26,7 +26,6 @@ struct ErrorEstimate {
         std::string                   estimator;              // the estimator's name()
         double                        time = 0;               // total, in seconds
         uint32_t                      elements = 0;
-        double                        total = 0;
         double                        max_indicator = 0;
         uint32_t                      point_sources = 0;
         uint32_t                      excluded_elements = 0;

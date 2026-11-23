@@ -4,7 +4,7 @@
 #include <string>
 #include <vector>
 
-// What the solver returns: the solution x of A x = f.
+// What the solver returns: the solution x of A x = f (output data) and how the run went (Info).
 struct SolverResult {
     struct Info {
         double   time = 0;                      // total, in seconds

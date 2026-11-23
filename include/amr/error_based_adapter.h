@@ -45,7 +45,7 @@ public:
         std::optional<uint64_t> max_elements = std::nullopt;         // > 0
 
         // Controls what happens when mesh.elements.size() > *max_elements:
-        //   true  (default): run the estimator first so info.error_estimate is populated
+        //   true  (default): run the estimator first so the estimate stage is reported in info.stages
         //                    (and check convergence), then stop without marking or refining.
         //   false:           stop immediately before estimation (useful for expensive
         //                    estimators such as goal-oriented / adjoint DWR).

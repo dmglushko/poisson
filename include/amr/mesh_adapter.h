@@ -42,7 +42,8 @@ enum class AdaptationStatus {
 // AdaptationResult fields strictly common across all adapters.
 struct ErrorBasedExtras {
     // Per tet of the INPUT mesh (indexed like mesh.elements): the local error indicator eta_K
-    // the decision was based on, estimated before any refinement. Info::error_estimate is its norm.
+    // the decision was based on, estimated before any refinement. Its norm is the "total" metric of
+    // the estimate stage in Info::stages.
     std::vector<double> eta;
 };
 
@@ -54,7 +55,6 @@ struct AdaptationResult {
         double                   time = 0;         // total, in seconds
         uint32_t                 elements_before = 0;
         uint32_t                 elements_after = 0;
-        std::optional<double>    error_estimate;   // filled when the adapter estimates error
         std::vector<std::string> warnings;         // adapter-level warnings
         std::vector<StageInfo>   stages;           // per-stage breakdown, in execution order
     };
