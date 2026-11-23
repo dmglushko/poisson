@@ -56,6 +56,14 @@ def detect_cpu_model() -> str | None:
     return proc or None
 
 
+def _usable_cpu_count() -> int | None:
+    """CPUs this process may run on: the SLURM/cgroup allocation, not the whole node."""
+    try:
+        return len(os.sched_getaffinity(0))
+    except (AttributeError, OSError):
+        return os.cpu_count()
+
+
 def collect_host_environment(env_override: Mapping[str, str] | None = None) -> dict[str, Any]:
     """Capture CPU, threading, and SLURM metadata for reproducible HPC benchmarking."""
     merged = os.environ.copy()
@@ -64,7 +72,7 @@ def collect_host_environment(env_override: Mapping[str, str] | None = None) -> d
 
     meta: dict[str, Any] = {
         "cpu_model": detect_cpu_model(),
-        "cpu_count": os.cpu_count(),
+        "cpu_count": _usable_cpu_count(),
     }
     threads = {k: merged[k] for k in _THREAD_ENV_KEYS if k in merged and merged[k] != ""}
     if threads:
@@ -124,6 +132,14 @@ class LocalExecutor(Executor):
             env.update(request.env)
 
         hostname = socket.gethostname()
+        max_rss_kb: int | None = None
+        cpu_user_s: float | None = None
+        cpu_sys_s: float | None = None
+        minor_page_faults: int | None = None
+        major_page_faults: int | None = None
+        voluntary_ctx_switches: int | None = None
+        involuntary_ctx_switches: int | None = None
+
         with tempfile.TemporaryFile() as out_fp, tempfile.TemporaryFile() as err_fp:
             start = time.perf_counter()
             proc = subprocess.Popen(
@@ -133,30 +149,30 @@ class LocalExecutor(Executor):
                 stdout=out_fp,
                 stderr=err_fp,
             )
-
-            max_rss_kb: int | None = None
-            cpu_user_s: float | None = None
-            cpu_sys_s: float | None = None
-            minor_page_faults: int | None = None
-            major_page_faults: int | None = None
-            voluntary_ctx_switches: int | None = None
-            involuntary_ctx_switches: int | None = None
-
-            if hasattr(os, "wait4"):
-                _, status, rusage = os.wait4(proc.pid, 0)
-                exit_code = os.waitstatus_to_exitcode(status)
-                # Prevent subprocess.Popen.__del__ from attempting a second wait on the reaped pid.
-                proc.returncode = exit_code
-                # On Linux ru_maxrss is in KiB (on macOS it is bytes).
-                max_rss_kb = int(rusage.ru_maxrss)
-                cpu_user_s = float(rusage.ru_utime)
-                cpu_sys_s = float(rusage.ru_stime)
-                minor_page_faults = int(rusage.ru_minflt)
-                major_page_faults = int(rusage.ru_majflt)
-                voluntary_ctx_switches = int(rusage.ru_nvcsw)
-                involuntary_ctx_switches = int(rusage.ru_nivcsw)
-            else:
-                exit_code = proc.wait()
+            try:
+                if hasattr(os, "wait4"):
+                    _, status, rusage = os.wait4(proc.pid, 0)
+                    exit_code = os.waitstatus_to_exitcode(status)
+                    # Prevent subprocess.Popen.__del__ from attempting a second wait on the reaped pid.
+                    proc.returncode = exit_code
+                    # On Linux ru_maxrss is in KiB (on macOS it is bytes).
+                    max_rss_kb = int(rusage.ru_maxrss)
+                    cpu_user_s = float(rusage.ru_utime)
+                    cpu_sys_s = float(rusage.ru_stime)
+                    minor_page_faults = int(rusage.ru_minflt)
+                    major_page_faults = int(rusage.ru_majflt)
+                    voluntary_ctx_switches = int(rusage.ru_nvcsw)
+                    involuntary_ctx_switches = int(rusage.ru_nivcsw)
+                else:
+                    exit_code = proc.wait()
+            except BaseException:
+                # Interrupted (e.g. SIGTERM turned into SystemExit): don't leave the child running.
+                try:
+                    proc.kill()
+                except ProcessLookupError:
+                    pass
+                proc.wait()
+                raise
 
             wall_time_s = time.perf_counter() - start
             cpu_efficiency: float | None = None

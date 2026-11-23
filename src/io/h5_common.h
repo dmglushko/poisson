@@ -44,6 +44,11 @@ struct H5Handle {
     void close_file_checked(const fs::path& file);
 };
 
+// File access property list with HDF5's own file locking switched off. Stage outputs are written
+// once to a private temp path and only read afterwards, so the lock protects nothing here, and on
+// cluster filesystems without flock support it makes H5Fopen/H5Fcreate fail.
+H5Handle unlocked_file_access(const fs::path& file);
+
 H5Handle create_deterministic_h5(const fs::path& file);
 H5Handle open_readonly_h5(const fs::path& file);
 H5Handle create_group(const fs::path& file, hid_t parent, const char* name);

@@ -88,10 +88,18 @@ because the case is saved with its parameters and rebuilt as a `Case` on load.
   (with optional full digest verification via `Cache(verify_hashes=True)`), detects mid-run
   input/binary drift before publishing, and supports three cross-process locking modes via
   `Cache(lock_mode=...)` or `POISSON_CACHE_LOCK_MODE`:
-  - `"flock"` *(default)*: POSIX `fcntl.flock` on `.cache.lock` and `leases/` (auto-falls back
-    to `"lockfile"` if the filesystem returns `ENOSYS`/`EOPNOTSUPP`/`ENOLCK`).
-  - `"lockfile"`: POSIX atomic `O_CREAT | O_EXCL` lockfile with stale-age recovery, safe across
-    multi-node Lustre/GPFS/NFSv4 shared `/scratch`.
+  - `"flock"` *(default locally)*: POSIX `fcntl.flock` on `.cache.lock` and `leases/` (auto-falls back
+    to `"lockfile"` if the filesystem returns `ENOSYS`/`EOPNOTSUPP`/`ENOLCK`). The lock mode is
+    fixed when a cache is initialized and stored in `.lock_mode`; a new cache created inside a
+    SLURM job (`SLURM_JOB_ID` set) defaults to `"lockfile"`, while opening an existing cache with
+    a conflicting mode raises `ValueError` so concurrent processes never split mutual exclusion.
+  - `"lockfile"`: POSIX atomic hard-link / `O_CREAT | O_EXCL` lockfile with fenced stale-age
+    recovery, safe across multi-node Lustre/GPFS/BeeGFS/NFSv4 shared `/scratch`. Holders refresh
+    the lockfile and their lease every `lock_stale_s / 3`; one older than `lock_stale_s`
+    (default 60 s) whose owner is on another host counts as abandoned. Waiters give up after
+    `lock_timeout_s` (default 300 s), which must exceed `lock_stale_s` so a waiter can reclaim a
+    lock left by a killed job. Routine `tmp/` and `ephemeral/` cleanup also checks active remote
+    leases so live multi-hour jobs are never pruned by age.
   - `"none"`: Lock-free reads/writes via unique temp files + atomic `os.replace` (requires
     `max_bytes=None` during sweeps; trim between sweeps with `cache clean --max-gb`).
 
@@ -130,9 +138,25 @@ SLURM shard is a separate process and keeps its own record.
   bytes in `objects/`.
 - **SLURM Job Array sharding (`shard=`):** `run_experiment(..., shard=(index, total))` or
   `shard="slurm"` (reads `SLURM_ARRAY_TASK_ID` / `SLURM_ARRAY_TASK_COUNT`, falling back to
-  `(0, 1)` locally) discovers the full `compare(...)` tree and executes only branches where
-  `branch_index % total == index` against a shared `/scratch` cache. A final
-  `cache_mode="read_only"` run collects the complete `ExperimentReport` with zero recomputation.
+  no sharding outside an array job) discovers the full `compare(...)` tree under a short-lived
+  per-branch-scoped lease, then executes only branches where `branch_index % total == index`
+  under its own shard lease against a shared `/scratch` cache. A final
+  `cache_mode="read_only", require_cached=True` run collects the complete `ExperimentReport`
+  with guaranteed zero recomputation.
+- **Termination:** while `run_experiment` runs in the main thread with no SIGTERM handler set,
+  SIGTERM (what SLURM sends at the time limit or on `scancel`) raises `SystemExit(143)`. Lockfile
+  and lease acquisition defer SIGTERM across the atomic create/arm boundary, and each stage runs
+  in a runner-owned staging directory so the running stage process is killed and all locks,
+  leases, and sibling staging files are cleaned up. SIGKILL (out-of-memory kills) can't be caught;
+  stale-age recovery covers it.
+- **Experiment command line (`experiment_cli.py`):** an experiment script ending in
+  `raise SystemExit(experiment_main(pipeline))` accepts `--count` (dry run; prints
+  `branches: N`), `--shard I/N`, `--warmup` (first branch only, to fill shared early steps) and
+  `--collect --out DIR` (read-only gather with `require_cached=True` and `save`; refuses with
+  exit code 2 if any stage misses the cache, unless `--allow-recompute`). Inside an array job
+  without `--shard` it uses `shard="slurm"`. Exit code 1 means a branch failed, so a SLURM
+  `afterok` dependency keeps the collect job from starting. `scripts/delftblue/` wraps this for
+  DelftBlue.
 - **Stage registration:** `Stage.from_cli(...)` declaratively maps input flags, flat setting
   flags, and/or `--config <settings.json>` (for deeply nested configs like AMR) with minimal
   boilerplate.
