@@ -310,6 +310,7 @@ class ExperimentReport:
     dry_run: bool = False
     shard: tuple[int, int] | None = None
     cache_root: Path | None = None
+    selection: dict[str, list[str]] | None = None
 
     @property
     def cache_hits(self) -> int:
@@ -364,6 +365,8 @@ class ExperimentReport:
         }
         if self.shard is not None:
             payload["shard"] = {"index": self.shard[0], "total": self.shard[1]}
+        if self.selection:
+            payload["selection"] = self.selection
         payload["branches"] = [
             {
                 "index": b.index,
@@ -417,7 +420,7 @@ class ExperimentReport:
 
         Writes `report.json` (everything, including named outputs as artifact descriptors),
         `report.csv` (wide) and `report_long.csv`. Refuses dry runs, partial SLURM shards
-        (unless `allow_partial=True`) and outputs that cannot be saved. Output files stay in
+        and `select=` subsets (unless `allow_partial=True`) and outputs that cannot be saved. Output files stay in
         the cache; the report references them.
         """
         if self.dry_run:
@@ -426,6 +429,11 @@ class ExperimentReport:
             raise ValueError(
                 f"Report holds only shard {self.shard[0]}/{self.shard[1]}; save the final collecting "
                 "run (cache_mode='read_only', no shard) or pass allow_partial=True"
+            )
+        if self.selection and not allow_partial:
+            raise ValueError(
+                f"Report holds only the branches selected by {self.selection!r}; save the full "
+                "collecting run or pass allow_partial=True"
             )
         payload = self.to_dict(strict=True)
         payload["saved_run"] = True

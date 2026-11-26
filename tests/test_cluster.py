@@ -392,6 +392,80 @@ time.sleep(60)
             code = experiment_main(pipe, argv=list(argv), cache=cache)
         return code, out.getvalue(), err.getvalue()
 
+    def test_shard_order_block_keeps_siblings_together(self) -> None:
+        mesh, mesh_log = self._stage("mesh")
+        leaf, _ = self._stage("leaf")
+        c = Cache(self.tmp / "order_cache")
+
+        def pipe(run: RunContext) -> dict[str, Artifact]:
+            m = compare("mesh", ["coarse", "fine"])
+            msh = run.run_stage(mesh, settings={"tag": m})
+            s = compare("solver", ["cg", "gmres", "direct"])
+            return {"out": run.run_stage(leaf, inputs={"inp": msh}, settings={"tag": f"{m}-{s}"})}
+
+        stride = [[b.index for b in run_experiment(pipe, cache=c, shard=(i, 2), dry_run=True).branches] for i in range(2)]
+        block = [
+            [b.index for b in run_experiment(pipe, cache=c, shard=(i, 2), shard_order="block", dry_run=True).branches]
+            for i in range(2)
+        ]
+        self.assertEqual(stride, [[0, 2, 4], [1, 3, 5]])
+        self.assertEqual(block, [[0, 1, 2], [3, 4, 5]])
+        uneven = [
+            [b.index for b in run_experiment(pipe, cache=c, shard=(i, 4), shard_order="block", dry_run=True).branches]
+            for i in range(4)
+        ]
+        self.assertEqual(sorted(i for part in uneven for i in part), list(range(6)))
+        self.assertTrue(all(1 <= len(part) <= 2 for part in uneven))
+
+        # Each block shard computes its one mesh once (here sequentially, so stride would hit the cache too).
+        for i in range(2):
+            run_experiment(pipe, cache=c, shard=(i, 2), shard_order="block")
+        self.assertEqual(self._runs(mesh_log), 2)
+        with self.assertRaises(ValueError):
+            run_experiment(pipe, cache=c, shard=(0, 2), shard_order="random")  # type: ignore[arg-type]
+
+    def test_select_filters_branches_and_keeps_global_indices(self) -> None:
+        leaf, leaf_log = self._stage("leaf")
+        c = Cache(self.tmp / "select_cache")
+
+        def pipe(run: RunContext) -> dict[str, Artifact]:
+            m = compare("mesh", ["coarse", "fine"])
+            if m == "fine":
+                compare("order", [1, 2])
+            s = compare("solver", {"cg": "cg", "lu": "direct"})
+            return {"out": run.run_stage(leaf, settings={"tag": f"{m}-{s}-{run.choices.get('order')}"})}
+
+        def indices(**kw):
+            return [b.index for b in run_experiment(pipe, cache=c, dry_run=True, **kw).branches]
+
+        self.assertEqual(indices(), [0, 1, 2, 3, 4, 5])
+        self.assertEqual(indices(select={"mesh": "fine"}), [2, 3, 4, 5])
+        self.assertEqual(indices(select={"mesh": "fine", "solver": "lu"}), [3, 5])
+        self.assertEqual(indices(select={"solver": ["cg", "lu"], "mesh": "coarse"}), [0, 1])
+        self.assertEqual(indices(select={"order": "2"}), [4, 5])  # coarse branches never reach `order`
+        self.assertEqual(indices(select={"mesh": "fine"}, shard=(1, 2)), [3, 5])
+        self.assertEqual(indices(select={"mesh": "fine"}, shard=(1, 2), shard_order="block"), [4, 5])
+        for bad in ({"mesh": "medium"}, {"meshes": "fine"}, {"mesh": []}):
+            with self.assertRaises(ValueError):
+                indices(select=bad)
+
+        # The CLI: --count and --warmup honour --select; a selected run saves only as a partial run.
+        code, out, _ = self._main(pipe, "--count", "--select", "mesh=fine", "--select", "solver=lu", cache=c)
+        self.assertEqual(code, 0)
+        self.assertIn("branches: 2", out.splitlines())
+        code, _, _ = self._main(pipe, "--warmup", "--select", "mesh=fine", cache=c)
+        self.assertEqual(code, 0)
+        self.assertEqual(leaf_log.read_text().splitlines(), ["fine-cg-1"])
+        code, _, _ = self._main(pipe, "--select", "mesh=coarse", "--out", str(self.tmp / "coarse"), cache=c)
+        self.assertEqual(code, 0)
+        saved = json.loads((self.tmp / "coarse" / "report.json").read_text())
+        self.assertEqual(saved["selection"], {"mesh": ["coarse"]})
+        self.assertEqual([b["index"] for b in saved["branches"]], [0, 1])
+        with self.assertRaises(SystemExit):
+            self._main(pipe, "--select", "mesh", cache=c)
+        with self.assertRaises(TypeError):
+            experiment_main(pipe, argv=["--count"], cache=c, select={"mesh": "fine"})
+
     def test_experiment_cli_count_pieces_and_collect(self) -> None:
         prefix, prefix_log = self._stage("prefix")
         leaf, leaf_log = self._stage("leaf")

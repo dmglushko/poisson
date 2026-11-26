@@ -16,6 +16,7 @@
 | `cases.py` | `Case(name, params)`: a verification case as a name and its parameters (a registered record), and `dirichlet` / `neumann` / `robin` helpers |
 | `cache.py` | Two-layer content-addressed cache, locking, leases, eviction |
 | `executor.py` | `Executor` backends and per-process OS metrics |
+| `dag.py` | DAG mode: `plan_dag` (stage calls -> tasks -> Slurm array groups, plan file) and `run_dag_task` |
 | `hashing.py` | BLAKE3 bindings and canonical JSON |
 
 Adding a pipeline stage means adding a `make_<stage>_stage` factory plus a helper function in
@@ -138,10 +139,23 @@ SLURM shard is a separate process and keeps its own record.
 - **SLURM Job Array sharding (`shard=`):** `run_experiment(..., shard=(index, total))` or
   `shard="slurm"` (reads `SLURM_ARRAY_TASK_ID` / `SLURM_ARRAY_TASK_COUNT`, falling back to
   no sharding outside an array job) discovers the full `compare(...)` tree under a short-lived
-  per-branch-scoped lease, then executes only branches where `branch_index % total == index`
-  under its own shard lease against a shared `/scratch` cache. A final
+  per-branch-scoped lease, then executes only this shard's branches under its own shard lease
+  against a shared `/scratch` cache. `shard_order="stride"` (default) takes the branches where
+  `branch_index % total == index`; `"block"` takes one contiguous run of the DFS order, so
+  siblings sharing a prefix stage land in one shard. The cache has no in-flight claim, so
+  shards that start together and miss the same request all execute it; block order avoids that
+  for siblings, stride balances load when cost follows the outermost choice. A final
   `cache_mode="read_only", require_cached=True` run collects the complete `ExperimentReport`
   with guaranteed zero recomputation.
+- **Collect mode (`force_cache_mode=`):** `run_experiment(..., force_cache_mode="read_only")`
+  overrides every cache mode, per-call ones included; `--collect` uses it, so a call that asks
+  for `refresh` still finds the result a piece or DAG task published.
+- **Branch selection (`select=`):** `run_experiment(..., select={"mesh": "fine"})` (a label or a
+  list of labels per `compare()` name; several names must all match) runs only matching branches,
+  found by the same discovery pass. Branch indices stay those of the full experiment, sharding
+  splits the selected branches, and a branch that never reaches a selected choice is left out.
+  Unknown names or labels, or an empty selection, raise `ValueError`. The report records
+  `selection`, and `save` refuses a selected report unless `allow_partial=True`.
 - **Termination:** while `run_experiment` runs in the main thread with no SIGTERM handler set,
   SIGTERM (what SLURM sends at the time limit or on `scancel`) raises `SystemExit(143)`. Lockfile
   and lease acquisition defer SIGTERM across the atomic create/arm boundary, and each stage runs
@@ -152,7 +166,9 @@ SLURM shard is a separate process and keeps its own record.
   `raise SystemExit(experiment_main(pipeline))` accepts `--count` (dry run; prints
   `branches: N`), `--shard I/N`, `--warmup` (first branch only, to fill shared early steps) and
   `--collect --out DIR` (read-only gather with `require_cached=True` and `save`; refuses with
-  exit code 2 if any stage misses the cache, unless `--allow-recompute`). Inside an array job
+  exit code 2 if any stage misses the cache, unless `--allow-recompute`). Every mode takes
+  `--select NAME=LABEL` (repeatable) and `--shard-order stride|block`; DAG mode adds
+  `--dag-plan FILE` and `--dag-task G/I` (below). Inside an array job
   without `--shard` it uses `shard="slurm"`. Exit code 1 means a branch failed, so a SLURM
   `afterok` dependency keeps the collect job from starting. `scripts/delftblue/` wraps this for
   DelftBlue.
@@ -178,6 +194,80 @@ SLURM shard is a separate process and keeps its own record.
   `HIT` vs `WOULD_RUN` without launching binaries. `ExperimentReport.save_csv(..., layout="long")`
   writes a loop-friendly tidy CSV (one row per `(branch, step_index, stage)` including HPC
   metadata), while `layout="wide"` disambiguates repeated stage calls (`stage#0`, `stage#1`, ...).
+
+## DAG Mode (`dag.py`)
+
+An opt-in alternative to shards, where each stage run is its own Slurm array task and an
+array starts once the arrays it reads from have finished. Shards remain the default.
+
+- **Planning (`plan_dag`, `--dag-plan FILE`):** discovery finds the (selected) branches, then
+  each one is dry-run with the experiment's real cache modes while `run_stage` logs every call
+  (`_StageCallRecord`): `hit` (cached: no task), `run` (a new task) or `reused` (the same
+  request as an earlier task). While planning, a request planned earlier wins over an old cache
+  entry, so a `refresh` call and a later `use` call of it agree (plain dry runs keep the
+  lookup-first order of real runs). A task's parents are the tasks whose placeholder outputs it
+  reads (`Artifact.request_key`). Refused: a planned call whose cache mode doesn't write (`off`,
+  `read_only` miss), since nothing downstream could read it, and refreshing a request that an
+  earlier call already read from the cache, since its new output would orphan what was built
+  on the old one.
+- **Tasks and the guard:** a task is identified by its branch's choice path and its stage call
+  number in that branch, plus `check`: the request key computed without inputs (stage, code
+  hash, settings, env, output specs), and `known_inputs`: the content ids of the inputs known
+  when planning (raw files, cached results; `null` for a parent task's output). They catch a
+  rebuilt binary, an edited experiment or input file, and nodes linking different shared
+  libraries. The task also stores its effective cache mode, repeats and warmup, which the task
+  run uses whatever options it is given.
+- **Resources:** `DEFAULT_RESOURCES` < `stage_resources[stage]` < the call's own
+  `run_stage(..., resources=)`, merged key by key (`cpus`, `time`, `mem_per_cpu`). Resources
+  stay out of the request key. Two calls of one request asking for different explicit resources
+  are refused.
+- **Grouping:** tasks go to arrays, in planning order (a topological order), keyed by
+  `(stage, resources, split label, parent arrays)`. Different resources already separate the
+  chains below them. `split_by=NAME` additionally separates the options of one `compare()`,
+  giving each task the label all its branches agree on (a shared prefix gets none). Arrays
+  above `max_array_size` (default 1000) are split before their children are grouped. Arrays
+  depend on whole parent arrays (`afterok`), so a task can wait for siblings of its parent.
+- **Chain fusion (default; `fuse=False`, `--no-fuse` to turn off):** every array costs a
+  scheduler round (measured on DelftBlue: 1-31 s between a parent finishing and its child
+  starting). So before grouping, `_fuse_chains` merges tasks into units run back to back in one
+  job: task `c` joins its parent `t`'s chain when, in the transitive reduction of the task graph,
+  `t` is `c`'s only parent and `c` is `t`'s only child, and both need the same `cpus` and
+  `mem_per_cpu`. The reduction drops a parent that is also an ancestor of another parent (the
+  skip edges of `case_mesh` and of `adapt_mesh` reading both mesh and solution), which adds no
+  waiting. Joins are not fused (that would make `t` wait for `c`'s other parent too), nor are
+  fan-outs (the children would wait for each other), nor a chain the replay would run out of
+  order (a pipeline sharing artifacts between branches). A unit's time limit is the sum of its
+  members', each rounded up to a minute as Slurm does; a chain stops growing before it passes
+  `max_fused_time` (`--max-fused-time`, default `24:00:00`, DelftBlue's education limit), and
+  tasks with no time limit (`0`) stay alone. Its split label is its last member's. Inside a
+  unit a planned `refresh` always executes, even if an earlier member produced the same request. Units, not tasks, are grouped as above, keyed
+  by their tuple of stages; an array of fused units is labelled `a+b+c` (or `a+N+z` for long
+  chains, at most 48 safe characters, for job names and log files).
+- **Running a task (`run_dag_task`, `--dag-plan FILE --dag-task G/I`):** element I of array G
+  is a unit. Its branch is its last member's, which calls every earlier member too (each reads
+  the one before); `steps` are the members' call numbers there. The replay is a dry run in
+  which every other stage call only looks up the cache (`READ_ONLY`, a miss gives a
+  placeholder), so only the unit's parent arrays need to be done. Each member's call must have no
+  placeholder inputs, the same stage, `check` and known inputs, and a writing mode; it executes
+  (or is found cached) and never reuses a placeholder that an earlier call of the replay left
+  for the same request (two producers with identical bytes give their consumers one real key).
+  Later members read earlier members' real outputs in memory. After the last member,
+  `_DagTaskDone`, a `BaseException`, ends the replay; the unit then fails unless every member
+  finished and is published in the cache (a pipeline catching a member's failure and carrying on
+  with a fallback input must not count as done). `run.dry_run` stays `True` for the pipeline's
+  code, as in `--count`.
+- **Limits:** a pipeline whose shape depends on stage outputs (e.g. an AMR loop that reads
+  `info["status"]`) can't be planned, since a dry run has no outputs; a task then fails with
+  "Plan mismatch" and the read-only collect refuses. Use shards for those. Leases don't span
+  Slurm jobs, so an output evicted between two arrays fails the later task: run DAG sweeps
+  with `max_bytes=None` or a cache larger than the sweep. Rerunning a failed sweep means
+  planning it again: only uncached tasks are submitted.
+- **Plan file:** JSON with `format_version` (2), `selection`, `split_by`, `fused`, the choice
+  paths of the branches that run a unit, `tasks` (id, branch, step, stage, check, parents,
+  resources, split, unit), `units` (id, branch, tasks, steps, stages, parents, resources,
+  split, group) and `groups` (id, stage label, stages, resources, split, parents, units). `--dag-plan`
+  also prints one `dag-group id|size|parents|cpus|time|mem_per_cpu|stage|leaf` line per
+  array (`-` for no parents) for `submit.sh --dag`.
 
 ## Results: Named Outputs, Metric Columns, Saved Runs & Evaluation (`report.py`, `records.py`, `results.py`)
 

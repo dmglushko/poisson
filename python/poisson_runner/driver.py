@@ -120,6 +120,65 @@ class _BranchConfig:
     stage_warmup: Mapping[str, int]
     dry_run: bool
     require_cached: bool = False
+    force_cache_mode: CacheMode | None = None
+
+
+@dataclass
+class _StageCallRecord:
+    """One `run_stage` call seen while planning a DAG (see `dag.py`).
+
+    `outcome` is "hit" (already cached), "run" (would execute: a new task) or "reused" (the same
+    request as an earlier planned call). `parents` are the request keys of the planned calls whose
+    placeholder outputs this call reads.
+    """
+
+    step: int
+    stage: str
+    request_key: str
+    outcome: str
+    parents: list[str]
+    resources: dict[str, Any] | None
+    writes: bool
+    check: str
+    known_inputs: dict[str, Any]
+    mode: str
+    repeats: int
+    warmup: int
+
+
+@dataclass(frozen=True)
+class _DagTarget:
+    """The one stage call a DAG task executes: call number `step` of its branch, whose code,
+    settings, env and outputs must hash to `check` (the request key without inputs), whose inputs
+    known at planning time must still have the content ids in `known_inputs` (`None` marks an
+    input a parent task produces), and which runs with the planned cache mode and repeats."""
+
+    step: int
+    stage: str
+    check: str
+    known_inputs: Mapping[str, Any]
+    mode: CacheMode
+    repeats: int
+    warmup: int
+
+
+def _known_inputs(spec: Mapping[str, Any]) -> dict[str, Any]:
+    """Input content ids with dry-run placeholders (outputs of planned tasks) replaced by `None`."""
+
+    def known(cid: str) -> str | None:
+        return None if cid.startswith("dryrun:") else cid
+
+    return {k: [known(c) for c in v] if isinstance(v, list) else known(v) for k, v in spec.items()}
+
+
+class _DagTaskDone(BaseException):
+    """Stops a DAG task's replay right after its last stage ran (a `BaseException`, so a
+    pipeline's `except Exception:` can't swallow it). `done` maps the steps of the task's own
+    stage calls that finished to their traces, in call order."""
+
+    def __init__(self, done: dict[int, StageTrace]) -> None:
+        super().__init__("DAG task done")
+        self.done = done
 
 
 @dataclass(frozen=True)
@@ -166,6 +225,7 @@ class RunContext:
         dry_run: bool = False,
         require_cached: bool = False,
         state: _ExperimentState | None = None,
+        force_cache_mode: CacheMode | None = None,
     ) -> None:
         self.cache = cache
         self.executor = executor
@@ -183,10 +243,16 @@ class RunContext:
         self._stage_warmup: dict[str, int] = dict(stage_warmup) if stage_warmup else {}
         self.dry_run = dry_run
         self._require_cached = require_cached
+        self._force_cache_mode = force_cache_mode
         self._state = state if state is not None else _ExperimentState()
         self.choices: dict[str, Any] = {}
         self.choice_labels: dict[str, str] = {}
         self.trace: list[StageTrace] = []
+        self._stage_calls = 0
+        self._call_log: list[_StageCallRecord] | None = None  # set while planning a DAG
+        # Set while running one DAG task: the stage calls (by step) it executes, in order.
+        self._dag_targets: dict[int, _DagTarget] | None = None
+        self._dag_done: dict[int, StageTrace] = {}
 
     @classmethod
     def _for_branch(
@@ -214,6 +280,7 @@ class RunContext:
             dry_run=config.dry_run,
             require_cached=config.require_cached,
             state=state,
+            force_cache_mode=config.force_cache_mode,
         )
 
     # ------------------------------------------------------------------ choices
@@ -293,9 +360,11 @@ class RunContext:
         cache: CacheMode | str | bool | None,
         use_cache: bool | None,
     ) -> CacheMode:
-        """Per-call > `stage_cache_modes[stage]` > experiment `cache_mode` > `Stage.default_cache`."""
+        """`force_cache_mode` > per-call > `stage_cache_modes[stage]` > experiment `cache_mode` > `Stage.default_cache`."""
         if cache is not None and use_cache is not None:
             raise ValueError("Pass either 'cache' or 'use_cache', not both")
+        if self._force_cache_mode is not None:
+            return self._force_cache_mode
         if cache is not None:
             return normalize_cache_mode(cache)
         if use_cache is not None:
@@ -387,20 +456,23 @@ class RunContext:
                 info=info,
                 execution=execution,
                 warnings=[str(w) for w in warnings] if isinstance(warnings, list) else [],
-                dry_run=self.dry_run or is_placeholder,
+                dry_run=(self.dry_run and self._dag_targets is None) or is_placeholder,
                 outputs=dict(artifacts),
             )
         )
         return _single_or_dict(artifacts)
 
-    def _reusable(self, request_key: str) -> dict[str, Artifact] | None:
-        """Outputs of the same request executed earlier in this experiment, if still on disk."""
+    def _reusable(self, request_key: str, *, placeholders: bool) -> dict[str, Artifact] | None:
+        """Outputs of the same request executed earlier in this experiment, if still on disk.
+
+        Dry-run placeholders count only when `placeholders` (a dry-run call); a call that really
+        executes, such as a DAG task's own stage, must never "reuse" a placeholder."""
         prior = self._state.executed.get(request_key)
         if prior is None:
             return None
         for art in prior.values():
             if _is_dry_run_placeholder(art):
-                if not self.dry_run:
+                if not placeholders:
                     return None
                 continue
             if not art.path.is_file():
@@ -430,8 +502,56 @@ class RunContext:
         already executed earlier in this experiment -> execute. A cache hit is used whatever
         `repeats` it was measured with; pass `cache="refresh"` to re-measure.
         """
+        step = self._stage_calls
+        self._stage_calls += 1
+        targets = self._dag_targets
+        target = targets.get(step) if targets is not None else None
+        if target is None:
+            forced = CacheMode.READ_ONLY if targets is not None else None  # other calls of a DAG task only look up
+            return self._run_stage(
+                stage, inputs=inputs, settings=settings, cache=cache, use_cache=use_cache, repeats=repeats,
+                warmup=warmup, env=env, resources=resources, step=step, forced_mode=forced, target=None,
+            )
+        assert targets is not None
+        if any(s < step and s not in self._dag_done for s in targets):
+            # An earlier stage of this chain failed and the pipeline carried on (an `except`
+            # around it): stop before this one runs on a fallback input; the task then fails.
+            raise _DagTaskDone(dict(self._dag_done))
+        result = self._run_stage(
+            stage, inputs=inputs, settings=settings, cache=cache, use_cache=use_cache, repeats=repeats,
+            warmup=warmup, env=env, resources=resources, step=step, forced_mode=None, target=target,
+        )
+        self._dag_done[step] = self.trace[-1]
+        if step == max(targets):
+            raise _DagTaskDone(dict(self._dag_done))
+        return result  # a fused task: later stage calls of the chain read this output in memory
+
+    def _run_stage(
+        self,
+        stage: Stage,
+        *,
+        inputs: Mapping[str, InputValue],
+        settings: Mapping[str, Any] | None,
+        cache: CacheMode | str | bool | None,
+        use_cache: bool | None,
+        repeats: int | None,
+        warmup: int | None,
+        env: Mapping[str, str] | None,
+        resources: Mapping[str, Any] | None,
+        step: int,
+        forced_mode: CacheMode | None,
+        target: _DagTarget | None,
+    ) -> Artifact | dict[str, Artifact]:
+        is_target = target is not None
         mode = self._resolve_cache_mode(stage, cache, use_cache)
+        if forced_mode is not None:
+            mode = forced_mode
+        dry_run = self.dry_run and not is_target
+        planning = self._call_log is not None
         n_repeats, n_warmup = self._resolve_repeats(stage, repeats, warmup)
+        if target is not None:  # the plan decided how the task's stage runs
+            mode = target.mode
+            n_repeats, n_warmup = target.repeats, target.warmup
         resolved = self._resolve_inputs(inputs)
         watched = resolved.watched_paths + stage.tracked_code_files()
         pre_signatures = {p: file_signature(p) for p in watched}
@@ -448,19 +568,61 @@ class RunContext:
             env=env_dict,
         )
 
-        if mode.reads and not resolved.has_placeholder:
+        check = ""
+        if planning or is_target:
+            check = Cache.compute_request_key(
+                stage.name, code_hash, {}, settings_dict, output_specs=stage.output_specs, env=env_dict
+            )
+        if target is not None:
+            self._check_dag_target(target, stage, check, resolved, mode)
+
+        def log(outcome: str) -> None:
+            if self._call_log is None:
+                return
+            parents: list[str] = []
+            for value in resolved.artifacts.values():
+                for art in value if isinstance(value, list) else [value]:
+                    if _is_dry_run_placeholder(art) and art.request_key and art.request_key not in parents:
+                        parents.append(art.request_key)
+            self._call_log.append(
+                _StageCallRecord(
+                    step=step,
+                    stage=stage.name,
+                    request_key=request_key,
+                    outcome=outcome,
+                    parents=parents,
+                    resources=dict(resources) if resources is not None else None,
+                    writes=mode.writes,
+                    check=check,
+                    known_inputs=_known_inputs(resolved.spec),
+                    mode=mode.value,
+                    repeats=n_repeats,
+                    warmup=n_warmup,
+                )
+            )
+
+        # While planning a DAG, a request planned earlier wins over an old cache entry, so a
+        # `refresh` call and a later `use` call of the same request agree on what will run.
+        prior = self._reusable(request_key, placeholders=True) if planning else None
+        if mode.reads and not resolved.has_placeholder and prior is None:
             hit = self.cache.lookup(request_key, expected_outputs=stage.output_specs, lease=self._lease)
             if hit is not None:
+                log("hit")
                 return self._record(stage, hit, request_key=request_key, settings=settings_dict, cached=True)
 
-        prior = self._reusable(request_key)
+        # A DAG task's planned `refresh` must execute, even when an earlier stage of its fused chain
+        # happened to produce the same request (e.g. identical bytes): the plan asked for a re-run.
+        if prior is None and not (target is not None and not mode.reads):
+            prior = self._reusable(request_key, placeholders=dry_run)
         if prior is not None:
             first = next(iter(prior.values()))
+            log("reused")
             return self._record(stage, prior, request_key=first.request_key, settings=settings_dict, reused=True)
 
-        if self.dry_run:
+        if dry_run:
             artifacts = self._placeholders(stage, request_key)
             self._state.executed[request_key] = artifacts
+            log("run")
             return self._record(stage, artifacts, request_key=request_key, settings=settings_dict)
 
         if self._require_cached:
@@ -483,6 +645,50 @@ class RunContext:
         return self._record(
             stage, artifacts, request_key=request_key if mode.writes else None, settings=settings_dict
         )
+
+    def _check_dag_target(
+        self, target: _DagTarget, stage: Stage, check: str, resolved: _ResolvedInputs, mode: CacheMode
+    ) -> None:
+        where = f"DAG task (stage call {target.step} of this branch)"
+        if stage.name != target.stage:
+            raise RuntimeError(
+                f"Plan mismatch: {where} is '{stage.name}', the plan expected '{target.stage}'. "
+                "The experiment changed since it was planned, or its shape depends on stage outputs; "
+                "plan it again or use pieces (shards)."
+            )
+        if check != target.check:
+            raise RuntimeError(
+                f"Plan mismatch: {where} '{stage.name}' has a different program, settings, env or outputs "
+                "than when it was planned: the stage was rebuilt, the experiment edited, or this node links "
+                "different shared libraries than the node that planned it (see Stage track_shared_libs); "
+                "plan it again where the tasks run."
+            )
+        planned = dict(target.known_inputs)
+        current = dict(resolved.spec)
+        changed = sorted(set(planned) ^ set(current))
+        for key in set(planned) & set(current):
+            want, have = planned[key], current[key]
+            if isinstance(want, list) or isinstance(have, list):
+                if not (isinstance(want, list) and isinstance(have, list) and len(want) == len(have)) or any(
+                    w is not None and w != h for w, h in zip(want, have)
+                ):
+                    changed.append(key)
+            elif want is not None and want != have:
+                changed.append(key)
+        if changed:
+            raise RuntimeError(
+                f"Plan mismatch: {where} '{stage.name}': input(s) {', '.join(sorted(changed))} differ from when "
+                "it was planned (an input file was edited, or an upstream result changed); plan it again."
+            )
+        if resolved.has_placeholder:
+            missing = [k for k, v in resolved.artifacts.items() if any(
+                _is_dry_run_placeholder(a) for a in (v if isinstance(v, list) else [v]))]
+            raise RuntimeError(
+                f"{where} '{stage.name}': input(s) {', '.join(missing)} are not in the cache. A parent task "
+                "failed or ran with a different build, or the cache evicted its output."
+            )
+        if not mode.writes:
+            raise RuntimeError(f"{where} '{stage.name}' runs with a cache mode that doesn't write ({mode.value})")
 
     @staticmethod
     def _normalize_env(env: Mapping[str, str] | None) -> dict[str, str] | None:
@@ -749,6 +955,70 @@ def _normalize_shard(shard: tuple[int, int] | Literal["slurm"] | None) -> tuple[
     return (index, total)
 
 
+def _normalize_select(select: Mapping[str, str | Sequence[str]] | None) -> dict[str, list[str]]:
+    """`{"mesh": "fine"}` / `{"mesh": ["coarse", "fine"]}` -> `{"mesh": ["fine"]}` / both labels."""
+    if not select:
+        return {}
+    out: dict[str, list[str]] = {}
+    for name, labels in select.items():
+        if not isinstance(name, str) or not name:
+            raise ValueError(f"select names must be non-empty strings, got {name!r}")
+        values = [labels] if isinstance(labels, str) else list(labels)
+        if not values or not all(isinstance(v, str) for v in values):
+            raise ValueError(f"select[{name!r}] must be a label or a non-empty list of labels, got {labels!r}")
+        out[name] = list(dict.fromkeys(values))
+    return out
+
+
+def _select_paths(
+    indexed: list[tuple[int, tuple[_ChoiceStep, ...]]],
+    selection: Mapping[str, Sequence[str]],
+) -> list[tuple[int, tuple[_ChoiceStep, ...]]]:
+    """Keep branches whose every selected choice has an allowed label; reject unknown names/labels.
+
+    A branch that never reaches a selected choice (it sits behind an `if`) is left out.
+    """
+    if not selection:
+        return indexed
+    seen: dict[str, list[str]] = {}
+    for _, path in indexed:
+        for step in path:
+            labels = seen.setdefault(step.name, [])
+            if step.label not in labels:
+                labels.append(step.label)
+    for name, labels in selection.items():
+        if name not in seen:
+            known = ", ".join(repr(n) for n in seen) or "none"
+            raise ValueError(f"select: this experiment has no compare() named {name!r} (choices: {known})")
+        unknown = [label for label in labels if label not in seen[name]]
+        if unknown:
+            raise ValueError(
+                f"select: compare({name!r}) has no option labelled {', '.join(map(repr, unknown))} "
+                f"(labels: {', '.join(map(repr, seen[name]))})"
+            )
+    kept = []
+    for index, path in indexed:
+        labels = {step.name: step.label for step in path}
+        if all(labels.get(name) in allowed for name, allowed in selection.items()):
+            kept.append((index, path))
+    if not kept:
+        raise ValueError(f"select: no branch matches {dict(selection)!r}")
+    return kept
+
+
+def _shard_paths(
+    indexed: list[tuple[int, tuple[_ChoiceStep, ...]]],
+    shard: tuple[int, int],
+    order: str,
+) -> list[tuple[int, tuple[_ChoiceStep, ...]]]:
+    """This shard's part of `indexed`: every `total`-th entry ("stride") or one contiguous run ("block")."""
+    index, total = shard
+    if order == "stride":
+        return [item for pos, item in enumerate(indexed) if pos % total == index]
+    n = len(indexed)
+    return indexed[(index * n) // total : ((index + 1) * n) // total]
+
+
 def _call_pipeline(pipeline_fn: Callable[..., Any], ctx: RunContext, takes_ctx: bool, path: tuple[_ChoiceStep, ...]) -> Any:
     token = _ACTIVE_RUN.set(ctx)
     try:
@@ -853,6 +1123,45 @@ def _run_branch(
     )
 
 
+def _make_config(
+    *,
+    cache: Cache | None = None,
+    executor: Executor | None = None,
+    build_dir: Path | str | None = None,
+    cache_mode: CacheMode | str | bool | None = None,
+    stage_cache_modes: Mapping[str, CacheMode | str | bool] | None = None,
+    repeats: int = 1,
+    warmup: int = 0,
+    stage_repeats: Mapping[str, int] | None = None,
+    stage_warmup: Mapping[str, int] | None = None,
+    dry_run: bool = False,
+    require_cached: bool = False,
+    force_cache_mode: CacheMode | str | bool | None = None,
+) -> _BranchConfig:
+    """Validate the experiment-wide options shared by `run_experiment` and the DAG mode."""
+    _validate_repeats(repeats, warmup)
+    stage_repeats = dict(stage_repeats) if stage_repeats else {}
+    stage_warmup = dict(stage_warmup) if stage_warmup else {}
+    for name, n in stage_repeats.items():
+        _validate_repeats(n, 0, f" for stage '{name}'")
+    for name, n in stage_warmup.items():
+        _validate_repeats(1, n, f" for stage '{name}'")
+    return _BranchConfig(
+        cache=cache if cache is not None else Cache(),
+        executor=executor if executor is not None else LocalExecutor(),
+        build_dir=build_dir,
+        cache_mode=normalize_cache_mode(cache_mode) if cache_mode is not None else None,
+        stage_cache_modes={n: normalize_cache_mode(m) for n, m in (stage_cache_modes or {}).items()},
+        repeats=repeats,
+        warmup=warmup,
+        stage_repeats=stage_repeats,
+        stage_warmup=stage_warmup,
+        dry_run=dry_run,
+        require_cached=require_cached,
+        force_cache_mode=normalize_cache_mode(force_cache_mode) if force_cache_mode is not None else None,
+    )
+
+
 def run_experiment(
     pipeline_fn: Callable[..., Any],
     *,
@@ -868,8 +1177,11 @@ def run_experiment(
     dry_run: bool = False,
     require_cached: bool = False,
     shard: tuple[int, int] | Literal["slurm"] | None = None,
+    shard_order: Literal["stride", "block"] = "stride",
+    select: Mapping[str, str | Sequence[str]] | None = None,
     continue_on_error: bool = False,
     max_branches: int | None = None,
+    force_cache_mode: CacheMode | str | bool | None = None,
 ) -> ExperimentReport:
     """Execute `pipeline_fn` across every combination of `compare(...)` choices without loops.
 
@@ -880,32 +1192,35 @@ def run_experiment(
 
     A stage request executed once in this call is reused by every later branch that makes the
     same request, even under `refresh`/`off`. Pass `shard=(index, total)` or `shard="slurm"` to
-    execute only branches where `branch_index % total == index` against a shared cache.
+    execute only some branches against a shared cache: with `shard_order="stride"` (default)
+    the branches where `branch_index % total == index`, with `"block"` one contiguous run of
+    branches per shard (siblings sharing a prefix stay in one shard, so it runs once there).
+    `select={"mesh": "fine"}` (or `{"mesh": ["coarse", "fine"]}`) keeps only the branches whose
+    choice has one of those labels; several names must all match. Branch indices stay those of
+    the full experiment, and sharding splits the selected branches.
     Pass `require_cached=True` to raise `CacheMissError` instead of executing any stage on miss.
+    `force_cache_mode` overrides every cache mode, per-call ones included (the collect job uses
+    `"read_only"`, so a call that asks for `refresh` still finds the result a piece published).
     """
-    _validate_repeats(repeats, warmup)
-    stage_repeats = dict(stage_repeats) if stage_repeats else {}
-    stage_warmup = dict(stage_warmup) if stage_warmup else {}
-    for name, n in stage_repeats.items():
-        _validate_repeats(n, 0, f" for stage '{name}'")
-    for name, n in stage_warmup.items():
-        _validate_repeats(1, n, f" for stage '{name}'")
-
     resolved_shard = _normalize_shard(shard)
-    cache = cache if cache is not None else Cache()
-    config = _BranchConfig(
+    if shard_order not in ("stride", "block"):
+        raise ValueError(f"shard_order must be 'stride' or 'block', got {shard_order!r}")
+    selection = _normalize_select(select)
+    config = _make_config(
         cache=cache,
-        executor=executor if executor is not None else LocalExecutor(),
+        executor=executor,
         build_dir=build_dir,
-        cache_mode=normalize_cache_mode(cache_mode) if cache_mode is not None else None,
-        stage_cache_modes={n: normalize_cache_mode(m) for n, m in (stage_cache_modes or {}).items()},
+        cache_mode=cache_mode,
+        stage_cache_modes=stage_cache_modes,
         repeats=repeats,
         warmup=warmup,
         stage_repeats=stage_repeats,
         stage_warmup=stage_warmup,
         dry_run=dry_run,
         require_cached=require_cached,
+        force_cache_mode=force_cache_mode,
     )
+    cache = config.cache
     takes_ctx = len(inspect.signature(pipeline_fn).parameters) > 0
     state = _ExperimentState()
     branches: list[BranchResult] = []
@@ -913,10 +1228,13 @@ def run_experiment(
 
     with _sigterm_as_exit():
         selected: list[tuple[int, tuple[_ChoiceStep, ...]]] | None = None
-        if resolved_shard is not None and resolved_shard[1] > 1:
-            shard_idx, shard_total = resolved_shard
+        sharded = resolved_shard is not None and resolved_shard[1] > 1
+        if sharded or selection:
             all_paths = _discover_branch_paths(pipeline_fn, takes_ctx=takes_ctx, config=config)
-            selected = [(i, p) for i, p in enumerate(all_paths) if i % shard_total == shard_idx]
+            selected = _select_paths(list(enumerate(all_paths)), selection)
+            if sharded:
+                assert resolved_shard is not None
+                selected = _shard_paths(selected, resolved_shard, shard_order)
             if max_branches is not None:
                 selected = selected[:max_branches]
 
@@ -951,4 +1269,5 @@ def run_experiment(
         dry_run=dry_run,
         shard=resolved_shard,
         cache_root=cache.root,
+        selection=selection or None,
     )

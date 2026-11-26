@@ -30,6 +30,7 @@ from .executor import (
     detect_cpu_model,
 )
 from .experiment_cli import experiment_main
+from .dag import DagPlan, plan_dag, run_dag_task
 from .records import RecordError, UnresolvedRecord, Unserializable, register_record
 from .cases import Case, dirichlet, neumann, robin
 from .report import info_scalars
@@ -68,6 +69,7 @@ __all__ = [
     "CacheMode",
     "CacheStats",
     "Case",
+    "DagPlan",
     "case_inputs",
     "case_mesh",
     "collect_host_environment",
@@ -81,6 +83,8 @@ __all__ = [
     "Executor",
     "ExperimentReport",
     "experiment_main",
+    "plan_dag",
+    "run_dag_task",
     "gmsh_mesh",
     "import_free_charges",
     "import_mesh",

@@ -179,6 +179,7 @@ def load_run(directory: str | os.PathLike[str], *, cache: Cache | None = None) -
         dry_run=bool(payload.get("dry_run", False)),
         shard=(int(shard["index"]), int(shard["total"])) if isinstance(shard, dict) else None,
         cache_root=cache_root,
+        selection=payload.get("selection") or None,
     )
     return SavedRun(path=report_json.parent, report=report)
 

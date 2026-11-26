@@ -8,7 +8,7 @@ saved run. Jobs share their results through one cache on `/scratch`.
 |---|---|
 | `env.sh` | Loads the modules and sets the paths and settings every other script uses. **Edit the settings at the top once.** |
 | `build.sh` | Configures and compiles the C++ stage programs into `build-delftblue/`. |
-| `submit.sh` | Submits an experiment: optional warm-up job, the parallel pieces, and the collect job. |
+| `submit.sh` | Submits an experiment: optional warm-up job, the parallel pieces (or, with `--dag`, one array per group of stage runs), and the collect job. |
 | `job.sbatch` | The Slurm job script that `submit.sh` submits. You don't run it yourself. |
 | `smoke_test.py` | A tiny 3-branch experiment for checking the setup. |
 
@@ -74,6 +74,67 @@ Logs go to `logs/<name>/`, one file per job. The collect job saves the run (`rep
 has succeeded. It also refuses to save if any result is missing from the cache, instead of quietly
 recomputing everything in one job.
 
+### Choosing branches and how they are split
+
+`--select NAME=LABEL` submits only the branches whose `compare(NAME)` chose `LABEL`, for example
+`--select mesh=fine`. Repeat it for several labels or names. Together with `--no-collect` and
+`--collect-only` this gives each group its own resources, followed by one collect job:
+
+```bash
+a=$(bash scripts/delftblue/submit.sh experiments/sweep.py --select mesh=coarse --no-collect --print-id)
+b=$(bash scripts/delftblue/submit.sh experiments/sweep.py --select mesh=fine --cpus 16 --time 04:00:00 \
+      --no-collect --print-id)
+bash scripts/delftblue/submit.sh experiments/sweep.py --collect-only --after "$a,$b"
+```
+
+With fewer pieces than branches, `--shard-order` decides which branches share a piece. `stride`
+(the default) deals them out round-robin, which evens out the work when, say, all fine-mesh
+branches come last. `block` gives each piece a run of neighbouring branches. Neighbours share
+their early steps (the same mesh with different solvers), and pieces that start at the same time
+would each compute a shared step that isn't cached yet, so `block` computes it once per piece.
+
+### DAG mode (each stage run is its own job)
+
+`--dag` plans the experiment and submits one job array per group of stage runs
+that aren't cached yet. An array starts once the arrays it reads from have finished, so a
+coarse-mesh solve doesn't wait for the fine mesh to be imported:
+
+```bash
+bash scripts/delftblue/submit.sh experiments/sweep.py --dag --time 00:30:00 \
+    --stage-resources solve:cpus=16,time=04:00:00 --split-by mesh
+```
+
+- `--cpus`, `--time` and `--mem-per-cpu` are the defaults for every task, `--stage-resources`
+  overrides them for one stage, and an experiment can pass `resources={"cpus": 16, "time": "04:00:00"}`
+  to a `run_stage` call to override both (for example only for fine meshes).
+- Arrays wait for whole parent arrays. Runs with different resources get separate arrays anyway,
+  and `--split-by NAME` also separates the options of one `compare()`.
+- Each array waits in the queue on its own: on DelftBlue, 1-31 s passed between an array
+  finishing and the next one starting. To save those rounds, a chain of stage runs where each
+  one only feeds the next (and needs the same cpus and memory) runs back to back in one task,
+  shown as e.g. `assemble+solve`, with the sum of their time limits. A stage shared by several
+  branches, or one that reads two separate chains, still gets its own array. A chain stops
+  before its summed time passes `--max-fused-time` (default `24:00:00`, the education account
+  limit; research accounts can allow more, e.g. `5-00:00:00`). `--no-fuse` gives every stage run
+  its own array again.
+- DAG mode pays off when shared early steps are heavy, or stages need very different resources;
+  when stages take seconds, pieces are simpler.
+- It needs an experiment whose stage calls don't depend on stage results. An AMR loop that reads
+  `info["status"]` to decide whether to continue can't be planned ahead. Its tasks fail with
+  "Plan mismatch", so use pieces for it.
+- If a task fails, cancel the queued jobs the message names, fix the cause, and run the same
+  command again. It plans again and submits only what's still missing.
+- Don't rebuild while it runs; a task notices a changed program and refuses.
+- The plan is made where you run `submit.sh`. On DelftBlue the login nodes and compute nodes
+  have different builds of the system `libc`/`libm`, so a plan made on a login node makes every
+  task refuse with "Plan mismatch" (the same cause as
+  [#3](https://github.com/dmglushko/poisson/issues/3)). Until #3 is decided, run the submission
+  itself on a compute node, which also plans faster than a busy login node:
+
+  ```bash
+  srun -p compute-p1 -n1 -c1 -t 00:10:00 bash scripts/delftblue/submit.sh experiments/sweep.py --dag
+  ```
+
 ### When a piece fails
 
 The collect job then stays queued with reason `DependencyNeverSatisfied`. Read the piece's log,
@@ -97,8 +158,8 @@ The other pieces' results are reused from the cache, and a new collect job is qu
   turns off HDF5's own file locking. The runner also picks `lockfile` by itself inside any Slurm
   job.
 - **Time limits.** When a job hits its time limit, Slurm stops it and the runner cleans up its
-  locks and temporary files, so other jobs aren't held up. Pieces are dealt out round-robin, so
-  set `--time` for the slowest piece.
+  locks and temporary files, so other jobs aren't held up. By default pieces are dealt out round-robin
+  (`--shard-order stride`), so set `--time` for the slowest piece.
 - **Python packages.** `poisson_runner` itself uses only the Python standard library, so running
   experiments works with the default `2026` modules. The `2026` stack does not include a `py-h5py`
   module, so running the `test_runner.py` suite under `ctest` (or writing post-processing scripts
