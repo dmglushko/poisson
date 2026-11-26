@@ -27,7 +27,8 @@ In `CMakeLists.txt`, core stage libraries (`poisson_common`, `poisson_importer`,
 `poisson_verification`)
 stay free of HDF5 stage serialization and BLAKE3 hashing. Stage I/O lives in `poisson_io`,
 split into one translation unit per data type (`src/io/h5_common.cpp`, `mesh_io.cpp`,
-`free_charges_io.cpp`, `assembled_problem_io.cpp`, `solver_result_io.cpp`, `amr_io.cpp`). Each
+`free_charges_io.cpp`, `assembled_problem_io.cpp`, `solver_result_io.cpp`, `amr_io.cpp`,
+`verification_io.cpp`). Each
 stage CLI links only its own module library plus `poisson_io`, so the linker only pulls in the
 serializers that stage calls and editing an unrelated stage's code or serializer does not change
 other stage binaries' BLAKE3 hashes.
@@ -43,6 +44,16 @@ Every stage executable:
 4. Rejects path aliasing between outputs and inputs (including symlinks/hard links) and publishes
    outputs via sibling temp files + checked flush/close + atomic `std::filesystem::rename`.
 5. Returns exit code `0` on success and non-zero with a clear `stderr` message on failure.
+
+## `poisson_import` (`cli/importer/poisson_import.cpp`)
+
+Imports either a mesh (with optional material and charge files) or a primary-electron `.pri` file:
+
+```text
+poisson_import --mesh <mesh.msh> [--material <mat.yaml|.mat>]... [--charges <file.cha>]
+               [--screening on|off] --out <mesh.h5> [--info-out <info.json>]
+poisson_import --primaries <file.pri> --out <free_charges.h5> [--info-out <info.json>]
+```
 
 ## `poisson_adapt` (`cli/amr/poisson_adapt.cpp`)
 

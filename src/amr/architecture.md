@@ -99,7 +99,7 @@ leaves `Session` for concrete HDF5 serialization across CLI invocations.
 
 ## Shared shape of the interfaces
 
-As in pde2d: the public function of each interface (`estimate`, `mark`, `refine`,
+The public function of each interface (`estimate`, `mark`, `refine`,
 `Session::adapt`) is **not virtual**. It checks the input/postconditions, times the work,
 applies the rules every method shares, and then calls a private virtual function with the
 method's own work (`indicators`, `select`, `refine_marked`, `adapt_step`). So the checks
@@ -182,8 +182,8 @@ in `common/` because Assembly needs it too), with the degree set by the estimato
 
 ## Marking
 
-The rules of pde2d unchanged: indicators must be finite and non-negative, zeros are never
-marked, the result is sorted and unique, ties go by tet index.
+Indicators must be finite and non-negative, zeros are never
+marked, the result is sorted and unique, and ties go by tet index.
 
 ## Refinement
 

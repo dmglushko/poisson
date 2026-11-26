@@ -17,6 +17,8 @@
 | `cache.py` | Two-layer content-addressed cache, locking, leases, eviction |
 | `executor.py` | `Executor` backends and per-process OS metrics |
 | `dag.py` | DAG mode: `plan_dag` (stage calls -> tasks -> Slurm array groups, plan file) and `run_dag_task` |
+| `experiment_cli.py` | `experiment_main`: standard CLI for experiment scripts (`--count`, `--shard`, `--collect`, `--dag-plan`, `--dag-task`) |
+| `cli.py` | `python3 -m poisson_runner` CLI for cache management (`cache status\|inspect\|clean`) and file hashing |
 | `hashing.py` | BLAKE3 bindings and canonical JSON |
 
 Adding a pipeline stage means adding a `make_<stage>_stage` factory plus a helper function in

@@ -279,10 +279,23 @@ solve loop over `AnalyticalMaker`, `Assembly`, `Solver`, `SolutionBuilder`, and 
 
 Assembly, AnalyticalMaker and Ray Tracing.
 
+## Tooling & supporting subsystems
+
+- **Stage CLIs & HDF5 I/O:** thin per-stage C++ executables under `cli/` and deterministic HDF5
+  serialization under `src/io/`. Described in [cli/architecture.md](cli/architecture.md).
+- **Experiment runner & cache:** Python orchestration, BLAKE3 content-addressed caching,
+  `compare(...)` sweeps, SLURM sharding/DAG execution, and saved-run evaluation. Described in
+  [python/poisson_runner/architecture.md](python/poisson_runner/architecture.md).
+- **Python test solver:** external-library (`scikit-fem`/`scipy`/`pyamg`) stand-in for `Assembly`,
+  `Solver`, and nodal field reconstruction, used for closed-loop AMR testing and independent checks.
+  Described in [python/poisson_test_solver/architecture.md](python/poisson_test_solver/architecture.md).
+- **Cluster scripts:** Slurm build and submission helpers for DelftBlue. Described in
+  [scripts/delftblue/README.md](scripts/delftblue/README.md).
+
 ## Open points
 
-- `Analytical Solution`: contents not decided. Planned as local singularity subtraction (P3M): a smooth cloud per charge in f, plus an analytical correction within r_c of each charge.
-  analytical functions around the trapped charges.
+- `Analytical Solution`: contents not decided. Planned as local singularity subtraction (P3M): a
+  smooth cloud per charge in f, plus an analytical correction within r_c of each charge.
 - `Solution`: contents not decided; it depends on the shape of `Analytical Solution`. It
   is a data class, so the Solution Builder returns it wrapped with its `Info`
   (`SolutionBuildResult { solution, info }`).

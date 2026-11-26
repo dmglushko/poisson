@@ -10,9 +10,10 @@ The high-level data flow, data classes, and stage contracts are described in
 primitives ([src/common/architecture.md](src/common/architecture.md)), adaptive mesh
 refinement ([src/amr/architecture.md](src/amr/architecture.md)), verification cases with
 exact solutions ([src/verification/architecture.md](src/verification/architecture.md)), stage CLIs & deterministic
-HDF5 serialization ([cli/architecture.md](cli/architecture.md)), and the Python caching/compare
-runner ([python/poisson_runner/architecture.md](python/poisson_runner/architecture.md)) are
-implemented.
+HDF5 serialization ([cli/architecture.md](cli/architecture.md)), the Python caching/compare
+runner ([python/poisson_runner/architecture.md](python/poisson_runner/architecture.md)), and the
+Python test solver ([python/poisson_test_solver/architecture.md](python/poisson_test_solver/architecture.md))
+are implemented.
 
 ## Build and test
 
@@ -30,9 +31,8 @@ ctest --test-dir build --output-on-failure
 
 ## Stage CLI and caching runner
 
-Each implemented pipeline stage has a thin C++ CLI binary under `cli/<stage>/`
-(`cli/importer/poisson_import.cpp` → `build/poisson_import`,
-`cli/amr/poisson_adapt.cpp` → `build/poisson_adapt`) that writes deterministic HDF5 data
+Each implemented stage has a thin C++ CLI binary under `cli/<stage>/`
+(`poisson_import`, `poisson_adapt`, `poisson_case`) that writes deterministic HDF5 data
 files and separate JSON `Info` sidecars:
 
 ```bash
