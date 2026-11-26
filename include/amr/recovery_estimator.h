@@ -9,8 +9,9 @@
 //   quantity = gradient:  G at the nodes,  eta_K^2 = integral over K of eps_K |G - grad u_h|^2
 //   quantity = flux:      Q at the nodes,  eta_K^2 = integral over K of |Q - eps_K grad u_h|^2 / eps_K
 //
-// Both are in the energy norm. Across a material interface neither grad u nor eps grad u is
-// continuous (the normal flux and the tangential gradient are), so averaging across it
+// Both are in the energy norm. The difference is linear on K, so the integral is computed
+// exactly from its values at the four nodes. Across a material interface neither grad u nor
+// eps grad u is continuous (the normal flux and the tangential gradient are), so averaging across it
 // reports an error on every interface tet that refinement never removes. With
 // per_material = true a node on an interface gets one average per material, from that
 // material's tets only, and both quantities then give the same eta (eps is constant within
@@ -25,12 +26,9 @@ public:
     struct Settings {
         Quantity quantity = Quantity::flux;
         bool     per_material = true;
-        // Exact degree of the tet rule. The integrand is quadratic, so 2 is exact.
-        int tet_degree = 2;
         PointSourceRule point_sources = PointSourceRule::exclude_patch;
     };
 
-    // Throws std::invalid_argument for a degree outside [0, max_quadrature_degree].
     RecoveryEstimator();   // default Settings
     explicit RecoveryEstimator(Settings settings);
     const Settings& settings() const { return settings_; }

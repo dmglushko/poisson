@@ -829,8 +829,10 @@ pathlib.Path(a.info_out).write_text(json.dumps({{"time": 0.015}}))
                 g.create_dataset("element", data=np.zeros((0,), dtype="<u4"), dtype="<u4")
             return path
 
+        # Each material of the small mesh is one tet, so per-material recovery is exactly 0 there;
+        # averaging across the interface gives it something to measure.
         config_for = lambda est, ref, **adapter: {  # noqa: E731
-            "estimator": {"type": est},
+            "estimator": {"type": est, **({"per_material": False} if est == "recovery" else {})},
             "marker": {"type": "dorfler", "theta": 0.5},
             "refiner": {"type": ref},
             **({"adapter": adapter} if adapter else {}),
@@ -956,7 +958,7 @@ pathlib.Path(a.info_out).write_text(json.dumps({{"time": 0.015}}))
 
         bad_int = run_adapt_raw(
             {
-                "estimator": {"type": "kelly", "face_degree": 1e10},
+                "estimator": {"type": "residual", "tet_degree": 1e10},
                 "marker": {"type": "dorfler"},
                 "refiner": {"type": "red_green"},
             }

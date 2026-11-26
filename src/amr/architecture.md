@@ -171,9 +171,14 @@ does not change what the relative rules do (Dörfler, maximum, fixed fraction,
 `absolute_tolerance` and equidistribution's `tolerance` get a meaning. A face to a metal with
 a prescribed voltage is a Dirichlet face for the local problem. The paper validates the indicator only without screening.
 
-Quadrature comes from `include/common/quadrature.h` (collapsed Gauss rules on tets and
-triangles, any degree up to 20, positive weights); it lives in `common/` because Assembly
-will need it too.
+Every integral of a polynomial in the barycentric coordinates is computed in closed form,
+$\int_K \prod_i \lambda_i^{a_i} = 3!\,|K| \prod_i a_i! / (3 + \sum_i a_i)!$ (and $2!\,|F|\cdots$ on a
+face): the flux jumps and the Neumann/Robin residuals (constant and linear on a face), the
+recovery difference (linear on a tet), and the trajectory bubble matrix, Robin block and face
+loads. Only the integrals that contain the source `f` (an arbitrary function) use quadrature,
+from `include/common/quadrature.h` (collapsed Gauss rules of any degree up to 20, positive
+weights; in `common/` because Assembly needs it too), with the degree set by the estimator's
+`tet_degree`.
 
 ## Marking
 

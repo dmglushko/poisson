@@ -12,7 +12,7 @@ Dependency rule: every pipeline stage (`importer`, `amr`, `assembly`, `solver`,
 | Header | Purpose | Used by |
 |---|---|---|
 | `include/common/constants.h` | Physical constants (`elementary_charge`, `vacuum_permittivity`, `electron_mass`, `speed_of_light`) and derived solver-unit factors (`e_over_eps0_nm`, `coulomb_constant_nm`, `e_over_me`) in `poisson::constants`. | AnalyticalMaker, Assembly, Ray Tracing |
-| `include/common/quadrature.h` | Collapsed Gauss–Legendre (Stroud conical product) rules on tetrahedra and triangles up to degree 20, strictly positive weights summing to 1. | AMR estimators, Assembly |
+| `include/common/quadrature.h` | Collapsed Gauss–Legendre (Stroud conical product) rules on tetrahedra and triangles up to degree 20, strictly positive weights summing to 1. | AMR estimators (the source terms), Assembly |
 | `include/common/mesh_locator.h` | Non-owning spatial index (`MeshLocator`) over `MeshProperties`: flat-array AABB BVH with median centroid splits (`O(log N)` cold lookup), `mesh.neighbours` walking with BVH fallback (`locate_near`), exact closed-ball tet intersection (`query_sphere`), and box queries (`query_box`). | AMR point-source location, AnalyticalMaker (P3M), Ray Tracing |
 
 ## Tests

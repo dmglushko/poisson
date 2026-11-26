@@ -32,7 +32,7 @@ double root_of_sum(const std::vector<double>& squares) {
 // with_element: the residual estimator (element residual, which calls the source);
 // otherwise Kelly.
 Terms residual_terms(const MeshProperties& mesh, const RefinementInput& input, bool with_element, int tet_degree,
-                     int face_degree, const std::string& who, ErrorEstimate::Info& info) {
+                     const std::string& who, ErrorEstimate::Info& info) {
     const std::vector<TetGeometry> geometry = tet_geometry(mesh, who);
     const std::size_t count = mesh.elements.size();
     std::vector<Coefficients> material(mesh.materials.size());
@@ -43,7 +43,7 @@ Terms residual_terms(const MeshProperties& mesh, const RefinementInput& input, b
 
     Terms terms{std::vector<double>(count, 0), std::vector<double>(count, 0), std::vector<double>(count, 0)};
 
-    // Element residual f - c u_h.
+    // Element residual f - c u_h: f is an arbitrary function, so quadrature.
     if (with_element) {
         const auto rule = tet_rule(tet_degree);
         for (uint32_t k = 0; k < count; ++k) {
@@ -68,7 +68,6 @@ Terms residual_terms(const MeshProperties& mesh, const RefinementInput& input, b
         }
     }
 
-    const auto face_rule = triangle_rule(face_degree);
     uint32_t natural_interior = 0;
     for (const Face& face : faces(mesh)) {
         const uint32_t k = face.element;
@@ -98,18 +97,14 @@ Terms residual_terms(const MeshProperties& mesh, const RefinementInput& input, b
             continue;
         }
 
-        // Outer face: Neumann, Robin, or natural (no boundary element: g = 0).
+        // Outer face: Neumann, Robin, or natural (no boundary element: g = 0). R_F is linear
+        // on the face (g and alpha constant), so ||R_F||^2 is exact from its vertex values.
         const double g_value = bc ? bc->value : 0;
         const double alpha = bc && bc->type == MeshProperties::BcType::Robin ? bc->alpha.value_or(0) : 0;
         const double flux = ck.eps * dot(grad[k], normal);
-        double sum = 0;
-        for (const auto& q : face_rule) {
-            double u_h = 0;
-            for (int i = 0; i < 3; ++i) u_h += q.barycentric[i] * input.u[face.node[i]];
-            const double r = g_value - alpha * u_h - flux;
-            sum += q.weight * r * r;
-        }
-        terms.boundary[k] += h_f / ck.eps * area * sum;
+        std::array<double, 3> r{};
+        for (int i = 0; i < 3; ++i) r[i] = g_value - alpha * input.u[face.node[i]] - flux;
+        terms.boundary[k] += h_f / ck.eps * integral_of_square(r, area);
     }
     if (natural_interior > 0)
         info.warnings.push_back(std::to_string(natural_interior) +
@@ -125,13 +120,11 @@ ResidualEstimator::ResidualEstimator() : ResidualEstimator(Settings{}) {}
 ResidualEstimator::ResidualEstimator(Settings settings)
     : ErrorEstimator(settings.point_sources), settings_(settings) {
     check_degree(settings_.tet_degree, "ResidualEstimator::Settings::tet_degree");
-    check_degree(settings_.face_degree, "ResidualEstimator::Settings::face_degree");
 }
 
 std::vector<double> ResidualEstimator::indicators(const MeshProperties& mesh, const RefinementInput& input,
                                                   std::span<const uint8_t> excluded, ErrorEstimate::Info& info) const {
-    Terms terms = residual_terms(mesh, input, true, settings_.tet_degree, settings_.face_degree,
-                                 name() + " estimator", info);
+    Terms terms = residual_terms(mesh, input, true, settings_.tet_degree, name() + " estimator", info);
     std::vector<double> eta(terms.element.size(), 0);
     for (std::size_t k = 0; k < eta.size(); ++k) {
         if (excluded[k]) {
@@ -150,13 +143,11 @@ std::vector<double> ResidualEstimator::indicators(const MeshProperties& mesh, co
 
 KellyEstimator::KellyEstimator() : KellyEstimator(Settings{}) {}
 
-KellyEstimator::KellyEstimator(Settings settings) : ErrorEstimator(settings.point_sources), settings_(settings) {
-    check_degree(settings_.face_degree, "KellyEstimator::Settings::face_degree");
-}
+KellyEstimator::KellyEstimator(Settings settings) : ErrorEstimator(settings.point_sources), settings_(settings) {}
 
 std::vector<double> KellyEstimator::indicators(const MeshProperties& mesh, const RefinementInput& input,
                                                std::span<const uint8_t> excluded, ErrorEstimate::Info& info) const {
-    Terms terms = residual_terms(mesh, input, false, 0, settings_.face_degree, name() + " estimator", info);
+    Terms terms = residual_terms(mesh, input, false, 0, name() + " estimator", info);
     std::vector<double> eta(terms.jump.size(), 0);
     for (std::size_t k = 0; k < eta.size(); ++k) {
         if (excluded[k]) {

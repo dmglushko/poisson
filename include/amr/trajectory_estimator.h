@@ -45,11 +45,9 @@ public:
         // R / (4 T V) in 1/(V nm^2), and total is dimensionless. Finite and > 0.
         double scale = 1;
         // Exact degree of the tet rule for the integral of (f - c u_h) times a bubble.
-        // f is arbitrary, so this is a choice of accuracy; c u_h alone needs 3.
+        // f is arbitrary, so this is a choice of accuracy; c u_h alone needs 3. The matrix
+        // and the face loads are computed exactly.
         int tet_degree = 4;
-        // Exact degree of the triangle rule for the Neumann / Robin load: 3 is exact for
-        // constant g and alpha.
-        int face_degree = 3;
         PointSourceRule point_sources = PointSourceRule::exclude_patch;
     };
 
