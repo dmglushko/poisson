@@ -14,22 +14,31 @@
 double factorial(int n) { return n <= 1 ? 1 : n * factorial(n - 1); }
 
 template <typename Point, std::size_t N>
-void check_symmetry_and_uniqueness(const std::vector<Point>& rule) {
+void check_symmetry_and_uniqueness(const char* kind, int degree, const std::vector<Point>& rule) {
     // Every pair of points must be distinct.
-    for (std::size_t i = 0; i < rule.size(); ++i) {
+    bool unique = true;
+    for (std::size_t i = 0; i < rule.size() && unique; ++i) {
         for (std::size_t j = i + 1; j < rule.size(); ++j) {
             double max_diff = 0;
             for (std::size_t k = 0; k < N; ++k)
                 max_diff = std::max(max_diff, std::abs(rule[i].barycentric[k] - rule[j].barycentric[k]));
-            CHECK(max_diff > 1e-12);
+            if (!(max_diff > 1e-12)) {
+                std::cerr << "FAILED " << kind << " degree " << degree << ": duplicate points " << i << " and " << j
+                          << "\n";
+                unique = false;
+                break;
+            }
         }
     }
+    CHECK(unique);
 
     // Closed under every permutation of the N barycentric coordinates (S_N).
+    bool symmetric = true;
     std::array<std::size_t, N> perm{};
     std::iota(perm.begin(), perm.end(), 0);
     do {
-        for (const auto& q : rule) {
+        for (std::size_t qi = 0; qi < rule.size() && symmetric; ++qi) {
+            const auto& q = rule[qi];
             std::array<double, N> permuted{};
             for (std::size_t k = 0; k < N; ++k) permuted[k] = q.barycentric[perm[k]];
             bool found = false;
@@ -42,9 +51,16 @@ void check_symmetry_and_uniqueness(const std::vector<Point>& rule) {
                     break;
                 }
             }
-            CHECK(found);
+            if (!found) {
+                std::cerr << "FAILED " << kind << " degree " << degree << ": point " << qi
+                          << " has no match under permutation (";
+                for (std::size_t k = 0; k < N; ++k) std::cerr << (k ? "," : "") << perm[k];
+                std::cerr << ")\n";
+                symmetric = false;
+            }
         }
-    } while (std::next_permutation(perm.begin(), perm.end()));
+    } while (symmetric && std::next_permutation(perm.begin(), perm.end()));
+    CHECK(symmetric);
 }
 
 void test_tet() {
@@ -53,7 +69,7 @@ void test_tet() {
         const auto rule = tet_rule(degree);
         if (degree <= 8) {
             CHECK(rule.size() == expected_symmetric_counts[degree]);
-            check_symmetry_and_uniqueness<TetQuadraturePoint, 4>(rule);
+            check_symmetry_and_uniqueness<TetQuadraturePoint, 4>("tet", degree, rule);
         }
         double sum = 0;
         bool positive = true;
@@ -71,7 +87,8 @@ void test_tet() {
         CHECK_NEAR(sum, 1, 1e-13);
         CHECK(positive);
         CHECK(interior);
-        // The mean of x^a y^b z^c over the unit tet: 6 a! b! c! / (a + b + c + 3)!.
+        const double rel_tol = degree <= 8 ? 1e-13 : 1e-12;
+        // The mean of lambda_1^a lambda_2^b lambda_3^c over the unit tet: 6 a! b! c! / (a + b + c + 3)!.
         for (int a = 0; a <= degree; ++a)
             for (int b = 0; a + b <= degree; ++b)
                 for (int c = 0; a + b + c <= degree; ++c) {
@@ -80,8 +97,13 @@ void test_tet() {
                         value += q.weight * std::pow(q.barycentric[1], a) * std::pow(q.barycentric[2], b) *
                                  std::pow(q.barycentric[3], c);
                     const double exact = 6 * factorial(a) * factorial(b) * factorial(c) / factorial(a + b + c + 3);
-                    CHECK_NEAR(value / exact, 1, 1e-11);
+                    CHECK_NEAR(value / exact, 1, rel_tol);
                 }
+        // Direct lambda_0 moment (exercises the reconstructed coordinate 1 - x - y - z).
+        double lambda0_moment = 0;
+        for (const auto& q : rule) lambda0_moment += q.weight * std::pow(q.barycentric[0], degree);
+        const double exact_lambda0 = 6 * factorial(degree) / factorial(degree + 3);
+        CHECK_NEAR(lambda0_moment / exact_lambda0, 1, rel_tol);
     }
 }
 
@@ -91,7 +113,7 @@ void test_triangle() {
         const auto rule = triangle_rule(degree);
         if (degree <= 8) {
             CHECK(rule.size() == expected_symmetric_counts[degree]);
-            check_symmetry_and_uniqueness<TriangleQuadraturePoint, 3>(rule);
+            check_symmetry_and_uniqueness<TriangleQuadraturePoint, 3>("triangle", degree, rule);
         }
         double sum = 0;
         bool positive = true;
@@ -109,14 +131,19 @@ void test_triangle() {
         CHECK_NEAR(sum, 1, 1e-13);
         CHECK(positive);
         CHECK(interior);
+        const double rel_tol = degree <= 8 ? 1e-13 : 1e-12;
         for (int a = 0; a <= degree; ++a)
             for (int b = 0; a + b <= degree; ++b) {
                 double value = 0;
                 for (const auto& q : rule)
                     value += q.weight * std::pow(q.barycentric[1], a) * std::pow(q.barycentric[2], b);
                 const double exact = 2 * factorial(a) * factorial(b) / factorial(a + b + 2);
-                CHECK_NEAR(value / exact, 1, 1e-11);
+                CHECK_NEAR(value / exact, 1, rel_tol);
             }
+        double lambda0_moment = 0;
+        for (const auto& q : rule) lambda0_moment += q.weight * std::pow(q.barycentric[0], degree);
+        const double exact_lambda0 = 2 * factorial(degree) / factorial(degree + 2);
+        CHECK_NEAR(lambda0_moment / exact_lambda0, 1, rel_tol);
     }
 }
 
