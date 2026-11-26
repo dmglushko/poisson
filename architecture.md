@@ -42,44 +42,28 @@ flowchart LR
     RT --> OUT
 ```
 
-## Conventions
+## Units and PDE convention
 
-- Classes are CamelCase, variables are snake_case.
-- **Data classes** (`MeshProperties`, `FreeCharges`, `AssembledProblem`, and later
-  `Solution`) hold only problem data, never an `Info`. The same data class can come from
-  different stages (a `MeshProperties` from the Importer or from AMR) or from disk, so how
-  one run went cannot be part of it.
-- **Stage results** (`MeshImportResult`, `FreeChargesImportResult`, `AssemblyResult`,
-  `SolverResult`, `ErrorEstimate`, `RefinementResult`, `AdaptationResult`) are
-  `{ outputs...; Info info; }`:
-  - **outputs** are everything a later stage or the driver reads: the data classes, plain
-    arrays such as `x` or `eta`, helpers such as `parents`, and control values such as
-    `AdaptationResult::status`. CLIs write them as `.h5`.
-  - **`Info`** is only for people and logs: at least `time` and `warnings`, plus counts,
-    timings, a `details` map or `stages`. Summaries derived from outputs (`nnz`,
-    `max_indicator`, the refined mesh size) are fine, but `Info` never repeats a value that
-    is already an output, and never reports the same quantity twice (under two names, or
-    in both a composite's own fields and its `stages`). CLIs write it as `.info.json`.
+All stages share one unit system (matching Nebula):
 
-  A quick test: if deleting a field would break a later stage, it is an output; if only
-  the `.info.json` would change, it belongs in `Info`. One exception in the CLIs: a small
-  control output such as `AdaptationResult::status` may be written into the `.info.json`
-  next to the `Info` instead of into an `.h5`, so that an orchestrator can read it without
-  opening one. In C++ it stays an output. Such a value is then not covered by the runner's
-  `.h5` determinism check.
-- Drivers and composite stages are preferably built by composing smaller interchangeable
-  module interfaces.
-- When a module or driver needs configuration, the preferred convention is a nested
-  `Settings` struct passed to its constructor (with driver-level settings kept separate
-  from sub-module settings).
+- **Length:** nanometers (`nm`). Coordinates in `.msh`, `.cha`, and `.pri` are read as-is in `nm`; `.mat` `screening_length` values are converted to `nm`.
+- **Potential:** volts (`V`).
+- **Permittivity:** dimensionless relative permittivity $\varepsilon_r$ (without $\varepsilon_0$ on the left-hand side).
+- **Equation:** inside each non-metal tet, with $c = \varepsilon_r / \lambda^2$ when `mesh.screened && screening_length > 0` (and $c = 0$ otherwise):
+  $$-\nabla \cdot (\varepsilon_r \nabla u) + c u = f = \frac{\rho}{\varepsilon_0}$$
+  so $f$ has units $\text{V}/\text{nm}^2$, and a point charge of $q$ elementary charges contributes $q \cdot \frac{e}{\varepsilon_0\,\mathrm{nm}} \approx 18.0951\,q\;\text{V}\cdot\text{nm}$ to the integrated right-hand side.
+- **Boundary conditions:** Dirichlet prescribes $u\;\text{[V]}$; Neumann and Robin satisfy $\varepsilon_r \frac{\partial u}{\partial n} + \alpha u = g$ with $g$ in $\text{V}/\text{nm}$ and $\alpha$ in $\text{nm}^{-1}$ ($\alpha = 0$ for Neumann).
 
 ## Data classes
 
-### MeshProperties
+Shared problem-data structs live in the root headers under `include/`. They hold only problem
+data, never run metadata like timing or warnings.
 
-The mesh with its materials, boundary conditions and trapped charges. Elements and boundary
-elements store only indices; coordinates, materials and boundary conditions are looked up
-in the other vectors.
+### MeshProperties (`include/mesh_properties.h`)
+
+The mesh with its materials, boundary conditions, and trapped charges. Elements and boundary
+elements store only indices; coordinates, materials, and boundary conditions are looked up in
+the other vectors.
 
 ```cpp
 struct MeshProperties {
@@ -132,22 +116,9 @@ struct MeshProperties {
 };
 ```
 
-#### Units and PDE convention
+### FreeCharges (`include/free_charges.h`)
 
-All stages (`Importer`, `AnalyticalMaker`, `Assembly`, `Solver`, `AMR`, `Ray Tracing`) share one unit system (matching Nebula):
-
-- **Length:** nanometers (`nm`). Coordinates in `.msh`, `.cha`, and `.pri` are read as-is in `nm`; `.mat` `screening_length` values are converted to `nm`.
-- **Potential:** volts (`V`).
-- **Permittivity:** dimensionless relative permittivity $\varepsilon_r$ (without $\varepsilon_0$ on the left-hand side).
-- **Equation:** inside each non-metal tet, with $c = \varepsilon_r / \lambda^2$ when `mesh.screened && screening_length > 0` (and $c = 0$ otherwise):
-  $$-\nabla \cdot (\varepsilon_r \nabla u) + c u = f = \frac{\rho}{\varepsilon_0}$$
-  so $f$ has units $\text{V}/\text{nm}^2$, and a point charge of $q$ elementary charges contributes $q \cdot \frac{e}{\varepsilon_0\,\mathrm{nm}} \approx 18.0951\,q\;\text{V}\cdot\text{nm}$ to the integrated right-hand side.
-- **Boundary conditions:** Dirichlet prescribes $u\;\text{[V]}$; Neumann and Robin satisfy $\varepsilon_r \frac{\partial u}{\partial n} + \alpha u = g$ with $g$ in $\text{V}/\text{nm}$ and $\alpha$ in $\text{nm}^{-1}$ ($\alpha = 0$ for Neumann).
-
-### FreeCharges
-
-The primary electrons, passed to the ray tracer. One entry holds what one record of a
-`.pri` file holds.
+The primary electrons, passed to the ray tracer. One entry holds what one record of a `.pri` file holds.
 
 ```cpp
 struct FreeCharges {
@@ -162,15 +133,14 @@ struct FreeCharges {
 };
 ```
 
-### AssembledProblem
+### AssembledProblem (`include/assembled_problem.h`)
 
-The linear system A x = f.
+The linear system $A x = f$.
 
-A has one row per unknown, not one per node. `row` gives the row of each node; several
+$A$ has one row per unknown, not one per node. `row` gives the row of each node; several
 nodes may share a row (all nodes of one connected floating metal share one row). Nodes
 whose value is known in advance (Dirichlet boundaries and prescribed-voltage metals) have
-no row and are listed in `known`. The potential at every node follows from the solution `x`
-of the system (`SolverResult::x`):
+no row and are listed in `known`. The potential at every node follows from `SolverResult::x`:
 
 - node with a row: `u[i] = x[*row[i]]`
 - every `(node, value)` in `known`: `u[node] = value`
@@ -186,12 +156,38 @@ struct AssembledProblem {
 
 ## Stage results
 
-Results that cross a stage boundary through the root headers. The others are defined in
-their module's header (`include/importer/importer.h`, `include/amr/*.h`).
+Each stage returns `{ outputs..., Info info }`, where `outputs` are what downstream stages
+read and `info` holds diagnostics for people and logs (at least `time` and `warnings`, plus
+any useful counts or timings). AMR's `AdaptationResult` is documented in
+[src/amr/architecture.md](src/amr/architecture.md).
 
-### AssemblyResult
+### MeshImportResult and FreeChargesImportResult (`include/importer/importer.h`)
 
-What Assembly returns (`include/assembled_problem.h`).
+```cpp
+struct MeshImportResult {
+    struct Info {
+        double                   time = 0;            // total, in seconds
+        double                   time_read = 0;       // reading the .msh
+        double                   time_geometry = 0;   // checking the geometry
+        std::vector<std::string> warnings;            // e.g. a volume without a material file
+    };
+
+    MeshProperties mesh;
+    Info           info;
+};
+
+struct FreeChargesImportResult {
+    struct Info {
+        double                   time = 0;            // total, in seconds
+        std::vector<std::string> warnings;
+    };
+
+    FreeCharges charges;
+    Info        info;
+};
+```
+
+### AssemblyResult (`include/assembled_problem.h`)
 
 ```cpp
 struct AssemblyResult {
@@ -209,10 +205,7 @@ struct AssemblyResult {
 };
 ```
 
-### SolverResult
-
-What the solver returns: the solution `x` of A x = f. `x` is a plain array, so it needs no
-data class of its own.
+### SolverResult (`include/solver_result.h`)
 
 ```cpp
 struct SolverResult {
@@ -228,75 +221,59 @@ struct SolverResult {
 };
 ```
 
-## Steps
+## Pipeline stages
 
-### Importer
+- **Importer:** Reads `.msh`/`.msh2`, material `.yaml`/`.mat`, `.cha`, and `.pri` files and
+  returns `MeshImportResult { mesh, info }` and `FreeChargesImportResult { charges, info }`
+  (`include/importer/importer.h`). Details: [src/importer/architecture.md](src/importer/architecture.md).
+- **AnalyticalMaker:** *Not defined yet* (see Open points).
+- **Assembly:** Output contract (`AssembledProblem` / `AssemblyResult`) is defined above;
+  the C++ interface and `Analytical Solution` input are still open.
+- **Solver:** Solves $A x = f$. Takes `A` and `f` from `AssembledProblem` and returns a
+  `SolverResult`.
+- **Solution Builder:** Builds `Solution` from `SolverResult::x`, `AssembledProblem` (`row`,
+  `known`), and `Analytical Solution`.
+- **Adaptive Mesh Refining:** Session-based `MeshAdapter` (`include/amr/mesh_adapter.h`) and
+  `ErrorBasedAdapter` (`include/amr/error_based_adapter.h`), taking `MeshProperties` and a
+  `RefinementInput` and returning an `AdaptationResult`. Details: [src/amr/architecture.md](src/amr/architecture.md).
+- **Ray Tracing:** *Not defined yet*.
 
-Reads the input files (`.msh`/`.msh2`, material `.yaml`/`.mat`, `.cha`, `.pri`) and returns
-`MeshImportResult { mesh, info }` and `FreeChargesImportResult { charges, info }`
-(`include/importer/importer.h`, `src/importer/importer.cpp`). Described in
-[src/importer/architecture.md](src/importer/architecture.md).
+## Shared utilities & tooling
 
-### Solver
-
-Solves A x = f. It takes `A` and `f` from `AssembledProblem` (Assembly's
-`AssemblyResult::problem`) and returns a `SolverResult`.
-
-### Solution Builder
-
-Builds `Solution` from `SolverResult::x`, using `row` and `known` from `AssembledProblem`.
-
-### Adaptive Mesh Refining
-
-Top-level virtual `MeshAdapter` (`include/amr/mesh_adapter.h`, session-based) and its
-composite `ErrorBasedAdapter` (`include/amr/error_based_adapter.h`), built from three
-interchangeable step interfaces (`ErrorEstimator`, `MarkingStrategy`, `Refiner`). Its input
-is `MeshProperties` and a `RefinementInput` (u at every node, the source f as a function,
-point sources); its output is an `AdaptationResult`. Described in
-[src/amr/architecture.md](src/amr/architecture.md).
-
-### Common primitives
-
-Stage-agnostic numerical and geometric helpers (`include/common/`, `src/common/`):
-quadrature rules on tetrahedra and triangles (`quadrature.h`) and a BVH + neighbour-walk
-spatial lookup index over `MeshProperties` (`mesh_locator.h`). Described in
-[src/common/architecture.md](src/common/architecture.md).
-
-### Verification
-
-Not a pipeline stage: cases with a known exact solution (geometry, materials, boundary
-conditions, charges and formula in one C++ class) and the CLI that turns a case into input
-files (`include/verification/`, `src/verification/`). Comparing a solution with them waits
-for `Solution`. Described in [src/verification/architecture.md](src/verification/architecture.md).
-
-### Driver (placeholder)
-
-`PoissonDriver` (`include/poisson_driver.h`) is a placeholder header sketching the top-level
-solve loop over `AnalyticalMaker`, `Assembly`, `Solver`, `SolutionBuilder`, and an optional
-`MeshAdapter`. To be implemented once those contracts are defined.
-
-### Not defined yet
-
-Assembly, AnalyticalMaker and Ray Tracing.
-
-## Tooling & supporting subsystems
-
-- **Stage CLIs & HDF5 I/O:** thin per-stage C++ executables under `cli/` and deterministic HDF5
-  serialization under `src/io/`. Described in [cli/architecture.md](cli/architecture.md).
-- **Experiment runner & cache:** Python orchestration, BLAKE3 content-addressed caching,
-  `compare(...)` sweeps, SLURM sharding/DAG execution, and saved-run evaluation. Described in
-  [python/poisson_runner/architecture.md](python/poisson_runner/architecture.md).
-- **Python test solver:** external-library (`scikit-fem`/`scipy`/`pyamg`) stand-in for `Assembly`,
-  `Solver`, and nodal field reconstruction, used for closed-loop AMR testing and independent checks.
-  Described in [python/poisson_test_solver/architecture.md](python/poisson_test_solver/architecture.md).
-- **Cluster scripts:** Slurm build and submission helpers for DelftBlue. Described in
+- **Common primitives (`include/common/`):** Physical/math constants (`constants.h`),
+  quadrature rules on tetrahedra and triangles up to degree 20 (`quadrature.h`), and a
+  coordinate-to-tetrahedron spatial lookup index over `MeshProperties` (`mesh_locator.h`).
+  Details: [src/common/architecture.md](src/common/architecture.md).
+- **Verification (`include/verification/`):** Test cases with known exact solutions (geometry,
+  materials, BCs, charges, and analytical formula) plus a CLI to generate input files.
+  Details: [src/verification/architecture.md](src/verification/architecture.md).
+- **Driver (`include/poisson_driver.h`):** Placeholder header sketching the top-level solve
+  loop, to be implemented once the remaining stage contracts are defined.
+- **Stage CLIs & HDF5 I/O:** Thin per-stage executables under `cli/` and HDF5/JSON
+  serialization under `src/io/`. Details: [cli/architecture.md](cli/architecture.md).
+- **Experiment runner & cache:** Python orchestration, BLAKE3 caching, `compare(...)` sweeps,
+  and saved-run evaluation. Details: [python/poisson_runner/architecture.md](python/poisson_runner/architecture.md).
+- **Python test solver:** `scikit-fem`/`scipy`/`pyamg` stand-in for `Assembly` and `Solver`,
+  used for closed-loop AMR testing. Details: [python/poisson_test_solver/architecture.md](python/poisson_test_solver/architecture.md).
+- **Cluster scripts:** Slurm build and submission helpers for DelftBlue. Details:
   [scripts/delftblue/README.md](scripts/delftblue/README.md).
+
+## Conventions
+
+- **Naming:** Types/classes are `CamelCase`, variables and fields are `snake_case`.
+- **Data vs. `Info`:** Keep problem-data structs free of run metadata (`time`, `warnings`,
+  etc.); put those in the stage's `Result::Info` instead. A quick rule of thumb: if a later
+  stage needs it, it's an output; if it's only for people/logs, it goes in `Info` (see
+  [cli/architecture.md](cli/architecture.md) for how CLIs split outputs into `.h5` and `Info`
+  into `.info.json`).
+- **Keep stages decoupled:** Stage interfaces should talk through the shared structs in
+  `include/` rather than depending on each other's internals.
 
 ## Open points
 
-- `Analytical Solution`: contents not decided. Planned as local singularity subtraction (P3M): a
-  smooth cloud per charge in f, plus an analytical correction within r_c of each charge.
-- `Solution`: contents not decided; it depends on the shape of `Analytical Solution`. It
-  is a data class, so the Solution Builder returns it wrapped with its `Info`
-  (`SolutionBuildResult { solution, info }`).
-- `Output`: contents not decided.
+- **`Analytical Solution`:** Contents not decided. Planned as local singularity subtraction
+  (P3M): a smooth cloud per charge in $f$, plus an analytical correction within $r_c$ of each
+  charge.
+- **`Solution`:** Contents not decided; depends on `Analytical Solution`. Will be a data
+  class returned as `SolutionBuildResult { solution, info }`.
+- **`Output`:** Contents not decided.
