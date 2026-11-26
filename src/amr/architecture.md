@@ -176,8 +176,8 @@ $\int_K \prod_i \lambda_i^{a_i} = 3!\,|K| \prod_i a_i! / (3 + \sum_i a_i)!$ (and
 face): the flux jumps and the Neumann/Robin residuals (constant and linear on a face), the
 recovery difference (linear on a tet), and the trajectory bubble matrix, Robin block and face
 loads. Only the integrals that contain the source `f` (an arbitrary function) use quadrature,
-from `include/common/quadrature.h` (collapsed Gauss rules of any degree up to 20, positive
-weights; in `common/` because Assembly needs it too), with the degree set by the estimator's
+from `include/common/quadrature.h` (see [src/common/architecture.md](../common/architecture.md);
+in `common/` because Assembly needs it too), with the degree set by the estimator's
 `tet_degree`.
 
 ## Marking

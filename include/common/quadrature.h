@@ -3,14 +3,15 @@
 #include <array>
 #include <vector>
 
-// Quadrature rules on a tetrahedron and on a triangle, in barycentric coordinates. The
-// weights are positive and sum to 1, so the integral over an element is its volume (area)
-// times the weighted sum.
+// Quadrature rules on a tetrahedron and on a triangle, in barycentric coordinates. Every
+// point lies strictly inside the element and every weight is strictly positive, with
+// weights summing to 1, so the integral over an element is its volume (area) times the
+// weighted sum.
 //
-// The rules are collapsed Gauss-Legendre products (Stroud's conical product with the
-// Jacobian folded into the weights): exact for every polynomial of total degree <= degree,
-// with more points than the best known rules of the same degree, but simple, positive and
-// available for any degree.
+// Degrees 0..8 use fully symmetric Witherden-Vincent rules (compact point counts,
+// invariant under vertex permutations); degrees 9..max_quadrature_degree fall back to
+// collapsed Gauss-Legendre products (Stroud's conical product with the Jacobian folded
+// into the weights). Every rule is exact for all polynomials of total degree <= degree.
 
 constexpr int max_quadrature_degree = 20;
 

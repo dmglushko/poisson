@@ -12,7 +12,7 @@ Dependency rule: every pipeline stage (`importer`, `amr`, `assembly`, `solver`,
 | Header | Purpose | Used by |
 |---|---|---|
 | `include/common/constants.h` | Physical constants (`elementary_charge`, `vacuum_permittivity`, `electron_mass`, `speed_of_light`) and derived solver-unit factors (`e_over_eps0_nm`, `coulomb_constant_nm`, `e_over_me`) in `poisson::constants`. | AnalyticalMaker, Assembly, Ray Tracing |
-| `include/common/quadrature.h` | Collapsed Gauss–Legendre (Stroud conical product) rules on tetrahedra and triangles up to degree 20, strictly positive weights summing to 1. | AMR estimators (the source terms), Assembly |
+| `include/common/quadrature.h` | Strictly positive, strictly interior quadrature rules on tetrahedra and triangles up to degree 20 (weights summing to 1): fully symmetric Witherden–Vincent rules (via PyFR, BSD-3) for degrees 0–8, with collapsed Gauss–Legendre (Stroud conical product) fallback for degrees 9–20. | AMR estimators (the source terms), Assembly |
 | `include/common/mesh_locator.h` | Non-owning spatial index (`MeshLocator`) over `MeshProperties`: flat-array AABB BVH (`O(log N)` cold `locate`), BVH-free neighbour walks (`walk_to_point`, `walk_along_segment`, also as standalone free functions), warm `locate_near` (walk, then BVH fallback), exact closed-ball tet intersection (`query_sphere`), and tet-AABB box queries (`query_box`). See [MeshLocator](#meshlocator). | AMR point-source location, AnalyticalMaker (P3M), Ray Tracing |
 
 ## MeshLocator
@@ -108,7 +108,7 @@ versus ~170 B/tet for the previous layout with per-tet barycentric gradients and
 ## Tests
 
 - `tests/test_constants.cpp`: checks `poisson::constants` identities and solver-unit magnitudes.
-- `tests/test_quadrature.cpp`: monomial exactness up to degree 20 on tets and triangles.
+- `tests/test_quadrature.cpp`: positivity, strict interiority, point counts, $S_4$/$S_3$ permutation symmetry (degrees 0–8), monomial exactness up to degree 20 on tets and triangles, and out-of-range degree validation.
 - `tests/test_locator.cpp`: cold and warm point location (interior, vertices, edges, faces,
   outside, non-convex cavity/hole fallback, missing neighbours); barycentric coordinates with
   permuted local node orders and shared-face consistency; `walk_to_point` and
