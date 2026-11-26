@@ -30,6 +30,19 @@ double total(const ErrorEstimator& estimator, const MeshProperties& mesh, const 
     return estimator.estimate(mesh, input).total;
 }
 
+// One tet, (0,0,0), (1,0,0), (0,1,0), (0,0,1), with Dirichlet faces opposite nodes 0 and 1:
+// only the bubble of edge (0, 1) is free. Face (0,1,2) (z = 0) has `bottom` (Robin unless
+// replaced), face (0,1,3) (y = 0) is natural.
+MeshProperties one_bubble_tet(const Bc& bottom) {
+    MeshProperties mesh;
+    mesh.nodes = {{0, 0, 0}, {1, 0, 0}, {0, 1, 0}, {0, 0, 1}};
+    mesh.elements = {{{0, 1, 2, 3}, 0}};
+    mesh.boundary_conditions = {{BcType::Dirichlet, 0, {}}, bottom};
+    mesh.boundary_elements = {{{1, 3, 2}, 0}, {{0, 2, 3}, 0}, {{0, 2, 1}, 1}};
+    mesh.materials = {{"one", 1, 0, false, {}}};
+    return mesh;
+}
+
 // A linear u with Dirichlet data everywhere is exact: every estimator gives 0.
 void test_linear_is_exact() {
     const MeshProperties mesh = cube_mesh(3);
@@ -107,6 +120,44 @@ void test_interface() {
     CHECK(across_gradient > 0.05);
     // The flux eps du/dx is continuous here (u varies in x only), so averaging it is exact.
     CHECK_NEAR(across_flux, 0, 1e-12);
+}
+
+// Exact values where the integrand varies over the element (the closed forms, not a
+// constant residual). One tet (0,0,0), (1,0,0), (0,1,0), (0,0,1), u = x (grad u = (1,0,0)),
+// Robin alpha = 2, g = 0 on the bottom z = 0: the flux there is 0, so R_F = -2x, and
+// ||R_F||^2 = 4 * (integral of x^2 over the unit right triangle = 1/12) = 1/3. h_F = sqrt(2);
+// the other faces are Dirichlet or natural with zero flux.
+void test_linear_boundary_residual() {
+    const MeshProperties mesh = one_bubble_tet({BcType::Robin, 0, 2.0});
+    const std::vector<double> u{0, 1, 0, 0};
+    const double expected = std::sqrt(std::sqrt(2.0) / 3);
+    const ErrorEstimate kelly = KellyEstimator().estimate(mesh, input_for(u));
+    CHECK_NEAR(kelly.total, expected, 1e-14);
+    CHECK_NEAR(kelly.info.details.at("boundary_part"), expected, 1e-14);
+    const ErrorEstimate residual = ResidualEstimator().estimate(mesh, input_for(u));
+    CHECK_NEAR(residual.info.details.at("boundary_part"), expected, 1e-14);
+}
+
+// Two tets sharing face (1, 2, 3): A = (0,0,0), (1,0,0), (0,1,0), (0,0,1) with |A| = 1/6 and
+// B = (1,0,0), (0,1,0), (0,0,1), (1,1,1) with |B| = 1/3. u = x on A and x + (x + y + z - 1)
+// on B, so grad u_B - grad u_A = D = (1, 1, 1). The recovered gradient at the shared nodes is
+// (|A| g_A + |B| g_B) / (|A| + |B|) = g_A + 2D/3; at the other nodes it is the tet's own. So
+// G - grad u_h is linear with node values (0, 2D/3, 2D/3, 2D/3) on A and (-D/3 x3, 0) on B:
+//   eta_A^2 = |A|/20 (3 (4/9) + 4) |D|^2 = 2/15,   eta_B^2 = |B|/20 (3/9 + 1) |D|^2 = 1/15.
+void test_recovery_linear_difference() {
+    MeshProperties mesh;
+    mesh.nodes = {{0, 0, 0}, {1, 0, 0}, {0, 1, 0}, {0, 0, 1}, {1, 1, 1}};
+    std::array<uint32_t, 4> a{0, 1, 2, 3}, b{1, 2, 3, 4};
+    if (signed_volume(mesh, a) < 0) std::swap(a[2], a[3]);
+    if (signed_volume(mesh, b) < 0) std::swap(b[2], b[3]);
+    mesh.elements = {{a, 0}, {b, 0}};
+    mesh.materials = {{"one", 1, 0, false, {}}};
+    const std::vector<double> u{0, 1, 0, 0, 3};
+    for (const auto quantity : {RecoveryEstimator::Quantity::gradient, RecoveryEstimator::Quantity::flux}) {
+        const ErrorEstimate e = RecoveryEstimator({.quantity = quantity}).estimate(mesh, input_for(u));
+        CHECK_NEAR(e.eta[0], std::sqrt(2.0 / 15), 1e-14);
+        CHECK_NEAR(e.eta[1], std::sqrt(1.0 / 15), 1e-14);
+    }
 }
 
 // u = sin(pi x) sin(pi y) sin(pi z), f = 3 pi^2 u: the estimates halve when h halves.
@@ -239,8 +290,6 @@ void test_bad_input() {
     bad.point_sources[0] = {{std::nan(""), 0, 0}, 1, {}};
     CHECK_THROWS(std::invalid_argument, KellyEstimator().estimate(mesh, bad), "point source 0 is not finite");
     CHECK_THROWS(std::invalid_argument, ResidualEstimator({.tet_degree = 21}), "ResidualEstimator::Settings::tet_degree");
-    CHECK_THROWS(std::invalid_argument, KellyEstimator({.face_degree = -1}), "KellyEstimator::Settings::face_degree");
-    CHECK_THROWS(std::invalid_argument, RecoveryEstimator({.tet_degree = 99}), "RecoveryEstimator::Settings::tet_degree");
     MeshProperties flat = mesh;
     std::swap(flat.elements[0].node[0], flat.elements[0].node[1]);
     CHECK_THROWS(std::invalid_argument, KellyEstimator().estimate(flat, input_for(u)), "tet 0 has volume");
@@ -367,20 +416,7 @@ void test_trajectory() {
     CHECK_THROWS(std::invalid_argument, trajectory.estimate(metal, RefinementInput{u, {}, {}}), "needs the source f");
     for (double scale : {0.0, -1.0, std::nan("")})
         CHECK_THROWS(std::invalid_argument, TrajectoryEstimator({.scale = scale}), "TrajectoryEstimator::Settings::scale");
-    CHECK_THROWS(std::invalid_argument, TrajectoryEstimator({.face_degree = -1}), "TrajectoryEstimator::Settings::face_degree");
-}
-
-// One tet, (0,0,0), (1,0,0), (0,1,0), (0,0,1), with Dirichlet faces opposite nodes 0 and 1:
-// only the bubble of edge (0, 1) is free. Face (0,1,2) (z = 0) has `bottom` (Robin unless
-// replaced), face (0,1,3) (y = 0) is natural.
-MeshProperties one_bubble_tet(const Bc& bottom) {
-    MeshProperties mesh;
-    mesh.nodes = {{0, 0, 0}, {1, 0, 0}, {0, 1, 0}, {0, 0, 1}};
-    mesh.elements = {{{0, 1, 2, 3}, 0}};
-    mesh.boundary_conditions = {{BcType::Dirichlet, 0, {}}, bottom};
-    mesh.boundary_elements = {{{1, 3, 2}, 0}, {{0, 2, 3}, 0}, {{0, 2, 1}, 1}};
-    mesh.materials = {{"one", 1, 0, false, {}}};
-    return mesh;
+    CHECK_THROWS(std::invalid_argument, TrajectoryEstimator({.tet_degree = -1}), "TrajectoryEstimator::Settings::tet_degree");
 }
 
 // The analytic values of the one free bubble phi = 4 lambda_0 lambda_1 (|K| = 1/6,
@@ -407,6 +443,41 @@ void test_trajectory_one_bubble() {
     const auto tiny = [](const std::array<double, 3>&, uint32_t) { return 1e-200; };
     CHECK_NEAR(TrajectoryEstimator().estimate(natural, input_for(zero, huge)).total / 1e200, eta_one, 1e-12);
     CHECK_NEAR(TrajectoryEstimator().estimate(natural, input_for(zero, tiny)).total * 1e200, eta_one, 1e-12);
+    // u = x, Robin alpha = 2, g = 0: the bottom residual is r = -2x = -2 lambda_1, so the load
+    // is -2 * 4 * (integral over the bottom of lambda_0 lambda_1^2 = 2 area 2!/5! = 1/60).
+    const std::vector<double> u_x{0, 1, 0, 0};
+    const MeshProperties robin_zero_g = one_bubble_tet({BcType::Robin, 0, 2.0});
+    CHECK_NEAR(TrajectoryEstimator().estimate(robin_zero_g, input_for(u_x)).total,
+               std::sqrt(2.0) / 6 * (2 * 4.0 / 60) / (0.8 + 2 * 0.5 * 8 / 45), 1e-14);
+    // Screening c = 1 / 0.5^2 = 4 with f = 1, u = 0: the mass term is
+    // c * 16 * (integral of lambda_0^2 lambda_1^2 = 6 |K| 2! 2! / 7! = 1/1260) = 4 * 4/315.
+    MeshProperties screened = one_bubble_tet({BcType::Neumann, 0, {}});
+    screened.materials[0].screening_length = 0.5;
+    CHECK_NEAR(TrajectoryEstimator().estimate(screened, input_for(zero, one)).total,
+               std::sqrt(2.0) / 6 * (1.0 / 30) / (0.8 + 4 * 4.0 / 315), 1e-14);
+    // Boundary data near the overflow limit: the face terms scale with g and stay finite.
+    // Kelly squares g, so 4e153 (its square 1.6e307 is still representable); the trajectory
+    // load is linear in g, so 9e307 on a tet twice the size (face area 2).
+    const auto kelly_g = [&](double g) {
+        return KellyEstimator().estimate(one_bubble_tet({BcType::Neumann, g, {}}), input_for(zero)).total;
+    };
+    CHECK_NEAR(kelly_g(4e153) / 4e153, kelly_g(1), 1e-14);
+    const auto doubled = [](const Bc& bottom) {
+        MeshProperties mesh = one_bubble_tet(bottom);
+        for (auto& p : mesh.nodes)
+            for (double& v : p) v *= 2;
+        return mesh;
+    };
+    const auto trajectory_g = [&](double g) {
+        return TrajectoryEstimator().estimate(doubled({BcType::Neumann, g, {}}), input_for(zero)).total;
+    };
+    CHECK_NEAR(trajectory_g(9e307) / 9e307, trajectory_g(1), 1e-14);
+    // A huge Robin alpha: the local problem stays regular. Load g area / 3 = 2/3, matrix
+    // 2 * 0.8 (stiffness scales with h) + alpha area 8/45, |K| = 4/3, |grad lambda_0 + grad lambda_1| = sqrt(2)/2.
+    const double huge_alpha = 1e308;
+    CHECK_NEAR(TrajectoryEstimator().estimate(doubled({BcType::Robin, 1, huge_alpha}), input_for(zero)).total /
+                   (4.0 / 3 * std::sqrt(2.0) / 2 * (2.0 / 3) / (1.6 + huge_alpha * (2.0 * 8 / 45))),
+               1, 1e-10);
     // A negative Robin alpha is rejected (the local problem could be singular).
     CHECK_THROWS(std::invalid_argument, TrajectoryEstimator().estimate(one_bubble_tet({BcType::Robin, 3, -9.0}), input_for(zero)),
                  "negative Robin alpha");
@@ -428,6 +499,22 @@ void test_trajectory_one_bubble() {
         if (fixed) CHECK(e.eta[0] == 0);
         else CHECK_NEAR(e.eta[0], eta_one, 1e-12);
     }
+}
+
+// Three coupled bubbles, so the off-diagonal stiffness, mass and Robin entries all matter.
+// The unit tet with a Dirichlet face opposite node 0 (only the bubbles of edges (0, j) are
+// free), Robin alpha = 2, g = 0 on the other three faces, eps = 1, c = 1 / 0.5^2 = 4, f = 1,
+// u = 0. By symbolic integration of the 3x3 local problem: eta = 7 sqrt(3) / 1072.
+void test_trajectory_coupled_bubbles() {
+    MeshProperties mesh;
+    mesh.nodes = {{0, 0, 0}, {1, 0, 0}, {0, 1, 0}, {0, 0, 1}};
+    mesh.elements = {{{0, 1, 2, 3}, 0}};
+    mesh.boundary_conditions = {{BcType::Dirichlet, 0, {}}, {BcType::Robin, 0, 2.0}};
+    mesh.boundary_elements = {{{1, 3, 2}, 0}, {{0, 2, 1}, 1}, {{0, 1, 3}, 1}, {{0, 3, 2}, 1}};
+    mesh.materials = {{"one", 1, 0.5, false, {}}};
+    const std::vector<double> zero(4, 0.0);
+    const auto one = [](const std::array<double, 3>&, uint32_t) { return 1.0; };
+    CHECK_NEAR(TrajectoryEstimator().estimate(mesh, input_for(zero, one)).total, 7 * std::sqrt(3.0) / 1072, 1e-15);
 }
 
 // Two tets sharing face (1, 2, 3), permittivities 1 and 4, a piecewise-linear u with a nonzero
@@ -471,6 +558,8 @@ int main() {
     test_natural_conditions();
     test_screening();
     test_interface();
+    test_linear_boundary_residual();
+    test_recovery_linear_difference();
     test_rate();
     test_metal();
     test_point_sources();
@@ -478,6 +567,7 @@ int main() {
     test_bad_input();
     test_trajectory();
     test_trajectory_one_bubble();
+    test_trajectory_coupled_bubbles();
     test_trajectory_two_tets();
     return finish("estimator");
 }

@@ -102,15 +102,13 @@ ParsedConfig parse_config(const JsonValue& root) {
         const std::string& type = tit->second.as_string("config.estimator.type");
 
         if (type == "kelly") {
-            reject_unknown_keys(eo, {"type", "face_degree", "point_sources"}, "config.estimator");
+            reject_unknown_keys(eo, {"type", "point_sources"}, "config.estimator");
             KellyEstimator::Settings s;
-            if (auto p = eo.find("face_degree"); p != eo.end()) s.face_degree = p->second.as_int("face_degree");
             if (auto p = eo.find("point_sources"); p != eo.end())
                 s.point_sources = parse_point_source_rule(p->second, "point_sources");
             cfg.estimator = std::make_shared<KellyEstimator>(s);
         } else if (type == "recovery") {
-            reject_unknown_keys(eo, {"type", "quantity", "per_material", "tet_degree", "point_sources"},
-                                "config.estimator");
+            reject_unknown_keys(eo, {"type", "quantity", "per_material", "point_sources"}, "config.estimator");
             RecoveryEstimator::Settings s;
             if (auto p = eo.find("quantity"); p != eo.end()) {
                 const std::string& q = p->second.as_string("quantity");
@@ -119,28 +117,24 @@ ParsedConfig parse_config(const JsonValue& root) {
                 else throw std::runtime_error("config.estimator.quantity: expected 'flux' or 'gradient'");
             }
             if (auto p = eo.find("per_material"); p != eo.end()) s.per_material = p->second.as_bool("per_material");
-            if (auto p = eo.find("tet_degree"); p != eo.end()) s.tet_degree = p->second.as_int("tet_degree");
             if (auto p = eo.find("point_sources"); p != eo.end())
                 s.point_sources = parse_point_source_rule(p->second, "point_sources");
             cfg.estimator = std::make_shared<RecoveryEstimator>(s);
         } else if (type == "residual") {
-            reject_unknown_keys(eo, {"type", "tet_degree", "face_degree", "point_sources", "constant_source"},
-                                "config.estimator");
+            reject_unknown_keys(eo, {"type", "tet_degree", "point_sources", "constant_source"}, "config.estimator");
             ResidualEstimator::Settings s;
             if (auto p = eo.find("tet_degree"); p != eo.end()) s.tet_degree = p->second.as_int("tet_degree");
-            if (auto p = eo.find("face_degree"); p != eo.end()) s.face_degree = p->second.as_int("face_degree");
             if (auto p = eo.find("point_sources"); p != eo.end())
                 s.point_sources = parse_point_source_rule(p->second, "point_sources");
             if (auto p = eo.find("constant_source"); p != eo.end() && !p->second.is_null())
                 cfg.constant_source = p->second.as_double("constant_source");
             cfg.estimator = std::make_shared<ResidualEstimator>(s);
         } else if (type == "trajectory") {
-            reject_unknown_keys(eo, {"type", "scale", "tet_degree", "face_degree", "point_sources", "constant_source"},
+            reject_unknown_keys(eo, {"type", "scale", "tet_degree", "point_sources", "constant_source"},
                                 "config.estimator");
             TrajectoryEstimator::Settings s;
             if (auto p = eo.find("scale"); p != eo.end()) s.scale = p->second.as_double("scale");
             if (auto p = eo.find("tet_degree"); p != eo.end()) s.tet_degree = p->second.as_int("tet_degree");
-            if (auto p = eo.find("face_degree"); p != eo.end()) s.face_degree = p->second.as_int("face_degree");
             if (auto p = eo.find("point_sources"); p != eo.end())
                 s.point_sources = parse_point_source_rule(p->second, "point_sources");
             if (auto p = eo.find("constant_source"); p != eo.end() && !p->second.is_null())

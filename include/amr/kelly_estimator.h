@@ -15,12 +15,9 @@
 class KellyEstimator final : public ErrorEstimator {
 public:
     struct Settings {
-        // Exact degree of the triangle rule for ||R_F||^2: 2 is exact for constant g and alpha.
-        int face_degree = 2;
         PointSourceRule point_sources = PointSourceRule::exclude_patch;
     };
 
-    // Throws std::invalid_argument for a degree outside [0, max_quadrature_degree].
     KellyEstimator();   // default Settings
     explicit KellyEstimator(Settings settings);
     const Settings& settings() const { return settings_; }

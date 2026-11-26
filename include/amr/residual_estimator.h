@@ -15,7 +15,8 @@
 // - J_F = (eps_K grad u_h|K - eps_L grad u_h|L) . n, n pointing out of K: the jump of the
 //   normal flux across the face to tet L. eps_F = max(eps_K, eps_L).
 // - R_F = g - alpha u_h - eps_K grad u_h . n on a Neumann (alpha = 0) or Robin face. An
-//   outer face without a boundary element is natural: g = 0, alpha = 0.
+//   outer face without a boundary element is natural: g = 0, alpha = 0. J_F is constant and
+//   R_F linear on a face, so their norms are computed in closed form.
 // - Dirichlet faces contribute nothing, nor do faces that touch a metal tet (the metal is
 //   an equipotential; its surface carries whatever charge it needs). An interior face with
 //   a Neumann or Robin boundary element is treated as an ordinary interior face (warning).
@@ -29,10 +30,8 @@ class ResidualEstimator final : public ErrorEstimator {
 public:
     struct Settings {
         // Exact degree of the tet rule for ||f - c u_h||^2. f is arbitrary, so this is a
-        // choice of accuracy; c u_h alone needs 2.
+        // choice of accuracy; c u_h alone needs 2. The face terms are computed exactly.
         int tet_degree = 4;
-        // Exact degree of the triangle rule for ||R_F||^2: 2 is exact for constant g and alpha.
-        int face_degree = 2;
         PointSourceRule point_sources = PointSourceRule::exclude_patch;
     };
 

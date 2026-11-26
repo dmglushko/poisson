@@ -5,6 +5,7 @@
 
 #include "mesh_properties.h"
 
+#include <algorithm>
 #include <array>
 #include <cmath>
 #include <cstdint>
@@ -60,6 +61,24 @@ std::vector<Face> faces(const MeshProperties& mesh);
 
 // The longest edge of a triangle.
 double triangle_diameter(const MeshProperties& mesh, const std::array<uint32_t, 3>& node);
+
+// The integral of p^2 over a simplex with N vertices (a triangle or a tet) of size `measure`,
+// for p linear with `vertex` values there: measure / (N (N + 1)) (sum p_i^2 + (sum p_i)^2).
+// A sum of squares, so never negative; scaled by the largest |p_i|, so squaring the values
+// does not overflow before the integral itself would.
+template <std::size_t N>
+double integral_of_square(const std::array<double, N>& vertex, double measure) {
+    double largest = 0;
+    for (double p : vertex) largest = std::max(largest, std::abs(p));
+    if (largest == 0) return 0;
+    double squares = 0, sum = 0;
+    for (double p : vertex) {
+        const double scaled = p / largest;
+        squares += scaled * scaled;
+        sum += scaled;
+    }
+    return largest * (measure / double(N * (N + 1)) * (squares + sum * sum)) * largest;
+}
 
 // Throws std::invalid_argument unless 0 <= degree <= max_quadrature_degree, naming the setting.
 void check_degree(int degree, const char* setting);

@@ -24,6 +24,51 @@ bool on_face(int e, int f) { return edges[e][0] != f && edges[e][1] != f; }
 using Vector6 = std::array<double, 6>;
 using Matrix6 = std::array<Vector6, 6>;
 
+// The integral of a product of barycentric coordinates lambda_i, i in `index` (repeats
+// allowed), over a simplex of the given dimension, divided by its size:
+//   dimension! prod(a_i!) / (dimension + sum a_i)!,  a_i how often i appears in `index`.
+template <std::size_t M>
+double moment(const std::array<int, M>& index, int dimension) {
+    constexpr std::array<double, 8> factorial{1, 1, 2, 6, 24, 120, 720, 5040};
+    std::array<int, 4> power{};
+    for (int i : index) ++power[i];
+    double result = factorial[dimension] / factorial[dimension + M];
+    for (int p : power) result *= factorial[p];
+    return result;
+}
+
+// The integrals of the bubbles phi_e = 4 lambda_a lambda_b that do not depend on the tet,
+// divided by |K| (over K) or |F| (over local face f, where lambda_f = 0).
+struct BubbleIntegrals {
+    std::array<std::array<double, 4>, 4> pair;       // lambda_a lambda_b over K
+    Matrix6                              mass;       // phi_r phi_s over K
+    std::array<Matrix6, 4>               face_mass;  // phi_r phi_s over face f
+    // lambda_m phi_e over face f: [f][e][m]
+    std::array<std::array<std::array<double, 4>, 6>, 4> face_linear;
+};
+
+const BubbleIntegrals& bubble_integrals() {
+    static const BubbleIntegrals integrals = [] {
+        BubbleIntegrals b{};
+        for (int i = 0; i < 4; ++i)
+            for (int j = 0; j < 4; ++j) b.pair[i][j] = moment(std::array{i, j}, 3);
+        for (int r = 0; r < 6; ++r)
+            for (int s = 0; s < 6; ++s) {
+                const std::array index{edges[r][0], edges[r][1], edges[s][0], edges[s][1]};
+                b.mass[r][s] = 16 * moment(index, 3);
+                for (int f = 0; f < 4; ++f)
+                    b.face_mass[f][r][s] = on_face(r, f) && on_face(s, f) ? 16 * moment(index, 2) : 0;
+            }
+        for (int f = 0; f < 4; ++f)
+            for (int e = 0; e < 6; ++e)
+                for (int m = 0; m < 4; ++m)
+                    b.face_linear[f][e][m] =
+                        on_face(e, f) && m != f ? 4 * moment(std::array{m, edges[e][0], edges[e][1]}, 2) : 0;
+        return b;
+    }();
+    return integrals;
+}
+
 // Solves A x = b on the unknowns with free[i]; the others are 0. A restricted to the free
 // unknowns is symmetric positive definite (the bubbles hold no constant; eps > 0, c >= 0,
 // alpha >= 0), so Gaussian elimination with partial pivoting is plenty. Empty if a pivot
@@ -82,7 +127,6 @@ TrajectoryEstimator::TrajectoryEstimator() : TrajectoryEstimator(Settings{}) {}
 TrajectoryEstimator::TrajectoryEstimator(Settings settings)
     : ErrorEstimator(settings.point_sources, IndicatorSum::values), settings_(settings) {
     check_degree(settings_.tet_degree, "TrajectoryEstimator::Settings::tet_degree");
-    check_degree(settings_.face_degree, "TrajectoryEstimator::Settings::face_degree");
     if (!(std::isfinite(settings_.scale) && settings_.scale > 0))
         throw std::invalid_argument("TrajectoryEstimator::Settings::scale must be finite and positive, got " +
                                     std::to_string(settings_.scale));
@@ -104,7 +148,7 @@ std::vector<double> TrajectoryEstimator::indicators(const MeshProperties& mesh, 
     std::vector<Vector6> load(count, Vector6{});
     std::vector<uint8_t> dirichlet(count, 0);
     std::vector<std::array<double, 4>> robin(count, std::array<double, 4>{});
-    const auto face_rule = triangle_rule(settings_.face_degree);
+    const BubbleIntegrals& bubble = bubble_integrals();
     uint32_t natural_interior = 0;
     for (const Face& face : faces(mesh)) {
         const uint32_t k = face.element;
@@ -153,22 +197,18 @@ std::vector<double> TrajectoryEstimator::indicators(const MeshProperties& mesh, 
             continue;
         }
 
-        // Outer face: Neumann, Robin, or natural (no boundary element: g = 0). face.node lists
-        // k's nodes other than face.local in order, so the face barycentrics map to k's.
+        // Outer face: Neumann, Robin, or natural (no boundary element: g = 0). The residual
+        // is linear on the face: r = sum over k's nodes m on the face of r_m lambda_m.
         const double g_value = bc ? bc->value : 0;
         const double alpha = bc && bc->type == MeshProperties::BcType::Robin ? bc->alpha.value_or(0) : 0;
         robin[k][face.local] = alpha;
         const double flux = ck.eps * dot(grad[k], normal);
-        for (const auto& q : face_rule) {
-            std::array<double, 4> lambda{};
-            for (int j = 0, f = 0; j < 4; ++j)
-                if (j != face.local) lambda[j] = q.barycentric[f++];
-            double u_h = 0;
-            for (int i = 0; i < 3; ++i) u_h += q.barycentric[i] * input.u[face.node[i]];
-            const double r = g_value - alpha * u_h - flux;
-            for (int e = 0; e < 6; ++e)
-                if (on_face(e, face.local))
-                    load[k][e] += q.weight * area * r * 4 * lambda[edges[e][0]] * lambda[edges[e][1]];
+        const auto& n = mesh.elements[k].node;
+        for (int m = 0; m < 4; ++m) {
+            if (m == face.local) continue;
+            const double r = g_value - alpha * input.u[n[m]] - flux;
+            // area times the (small) moment first: r near the overflow limit stays finite.
+            for (int e = 0; e < 6; ++e) load[k][e] += r * (area * bubble.face_linear[face.local][e][m]);
         }
     }
     if (natural_interior > 0)
@@ -177,9 +217,7 @@ std::vector<double> TrajectoryEstimator::indicators(const MeshProperties& mesh, 
                                 "ordinary interior faces");
 
     // 2. Per tet: the element load and matrix, the 6x6 solve, and |integral of grad e_K|.
-    const auto matrix_rule = tet_rule(4);   // exact for the bubble products (degree 4)
-    const auto load_rule = tet_rule(settings_.tet_degree);
-    const auto robin_rule = triangle_rule(4);
+    const auto load_rule = tet_rule(settings_.tet_degree);   // f is arbitrary
     std::vector<double> eta(count, 0);
     for (uint32_t k = 0; k < count; ++k) {
         const Coefficients& c = coef(k);
@@ -197,20 +235,22 @@ std::vector<double> TrajectoryEstimator::indicators(const MeshProperties& mesh, 
         }
         if (!any_free) continue;
 
+        // grad phi_e = 4 (lambda_b grad lambda_a + lambda_a grad lambda_b) for edge (a, b), so
+        // the stiffness is a combination of the integrals of lambda_a lambda_b with weights
+        // G_ab = grad lambda_a . grad lambda_b.
+        std::array<std::array<double, 4>, 4> gram;
+        for (int i = 0; i < 4; ++i)
+            for (int j = 0; j < 4; ++j) gram[i][j] = dot(geo.grad_lambda[i], geo.grad_lambda[j]);
+        const auto& p = bubble.pair;
         Matrix6 a{};
-        for (const auto& q : matrix_rule) {
-            const auto& l = q.barycentric;
-            std::array<Vec3, 6> dphi;
-            Vector6 phi;
-            for (int e = 0; e < 6; ++e) {
-                const int i = edges[e][0], j = edges[e][1];
-                phi[e] = 4 * l[i] * l[j];
-                for (int d = 0; d < 3; ++d) dphi[e][d] = 4 * (l[j] * geo.grad_lambda[i][d] + l[i] * geo.grad_lambda[j][d]);
+        for (int r = 0; r < 6; ++r)
+            for (int s = 0; s < 6; ++s) {
+                const auto [i, j] = edges[r];
+                const auto [m, l] = edges[s];
+                const double stiffness =
+                    16 * (p[j][l] * gram[i][m] + p[j][m] * gram[i][l] + p[i][l] * gram[j][m] + p[i][m] * gram[j][l]);
+                a[r][s] = geo.volume * (c.eps * stiffness + c.c * bubble.mass[r][s]);
             }
-            for (int r = 0; r < 6; ++r)
-                for (int s = 0; s < 6; ++s)
-                    a[r][s] += q.weight * geo.volume * (c.eps * dot(dphi[r], dphi[s]) + c.c * phi[r] * phi[s]);
-        }
         for (int f = 0; f < 4; ++f) {
             if (robin[k][f] == 0) continue;
             std::array<uint32_t, 3> face_node{};
@@ -218,15 +258,8 @@ std::vector<double> TrajectoryEstimator::indicators(const MeshProperties& mesh, 
                 if (j != f) face_node[m++] = n[j];
             const double area = 0.5 * norm(cross(sub(mesh.nodes[face_node[1]], mesh.nodes[face_node[0]]),
                                                  sub(mesh.nodes[face_node[2]], mesh.nodes[face_node[0]])));
-            for (const auto& q : robin_rule) {
-                std::array<double, 4> l{};
-                for (int j = 0, m = 0; j < 4; ++j)
-                    if (j != f) l[j] = q.barycentric[m++];
-                Vector6 phi;
-                for (int e = 0; e < 6; ++e) phi[e] = 4 * l[edges[e][0]] * l[edges[e][1]];
-                for (int r = 0; r < 6; ++r)
-                    for (int s = 0; s < 6; ++s) a[r][s] += q.weight * area * robin[k][f] * phi[r] * phi[s];
-            }
+            for (int r = 0; r < 6; ++r)
+                for (int s = 0; s < 6; ++s) a[r][s] += robin[k][f] * (area * bubble.face_mass[f][r][s]);
         }
 
         Vector6 b = load[k];

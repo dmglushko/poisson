@@ -1,7 +1,6 @@
 #include "amr/recovery_estimator.h"
 
 #include "estimator_geometry.h"
-#include "common/quadrature.h"
 
 #include <cmath>
 
@@ -10,9 +9,7 @@ using namespace amr_detail;
 RecoveryEstimator::RecoveryEstimator() : RecoveryEstimator(Settings{}) {}
 
 RecoveryEstimator::RecoveryEstimator(Settings settings)
-    : ErrorEstimator(settings.point_sources), settings_(settings) {
-    check_degree(settings_.tet_degree, "RecoveryEstimator::Settings::tet_degree");
-}
+    : ErrorEstimator(settings.point_sources), settings_(settings) {}
 
 std::vector<double> RecoveryEstimator::indicators(const MeshProperties& mesh, const RefinementInput& input,
                                                   std::span<const uint8_t>, ErrorEstimate::Info&) const {
@@ -34,7 +31,6 @@ std::vector<double> RecoveryEstimator::indicators(const MeshProperties& mesh, co
     std::vector<double> eta(count, 0);
     std::vector<Vec3> recovered(mesh.nodes.size());
     std::vector<double> weight(mesh.nodes.size());
-    const auto rule = tet_rule(settings_.tet_degree);
 
     // Average over the tets that `take` accepts, then measure those tets.
     const auto recover_and_measure = [&](const auto& take) {
@@ -52,16 +48,16 @@ std::vector<double> RecoveryEstimator::indicators(const MeshProperties& mesh, co
                 for (double& v : recovered[i]) v /= weight[i];
         for (uint32_t k = 0; k < count; ++k) {
             if (!take(k)) continue;
+            // The difference is linear on K: integrate each component's square exactly.
             const auto& n = mesh.elements[k].node;
             const double eps = material[mesh.elements[k].material].eps;
-            double sum = 0;
-            for (const auto& q : rule) {
-                Vec3 difference = {-own[k][0], -own[k][1], -own[k][2]};
-                for (int i = 0; i < 4; ++i)
-                    for (int d = 0; d < 3; ++d) difference[d] += q.barycentric[i] * recovered[n[i]][d];
-                sum += q.weight * dot(difference, difference);
+            double integral = 0;
+            for (int d = 0; d < 3; ++d) {
+                std::array<double, 4> difference{};
+                for (int i = 0; i < 4; ++i) difference[i] = recovered[n[i]][d] - own[k][d];
+                integral += integral_of_square(difference, geometry[k].volume);
             }
-            eta[k] = std::sqrt(geometry[k].volume * sum * (flux ? 1 / eps : eps));
+            eta[k] = std::sqrt(integral * (flux ? 1 / eps : eps));
         }
     };
 
