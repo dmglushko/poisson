@@ -421,6 +421,8 @@ void test_small_files(const fs::path& dir) {
     CHECK_THROWS(importer.import_mesh(broken("10 20 30 50", "10 20 30")), "too few nodes");
     CHECK_THROWS(importer.import_mesh(broken("4 4 2 2 2", "4 4 2 3 2")), "not a named volume");
     CHECK_THROWS(importer.import_mesh(broken("1 2 2 7 1 10 20 40", "1 2 2 7 1 20 40 50")), "not a face of any tetrahedron");
+    CHECK_THROWS(importer.import_mesh(broken("1 2 2 7 1 10 20 40", "1 2 2 7 1 10 20 30")),
+                 "is an interior face shared by two tetrahedra");
     CHECK_THROWS(importer.import_mesh(broken("4 4 2 2 2 10 20 30 50", "4 5 2 2 2 10 20 30 40 50 10 20 30")),
                  "unsupported element type 5");
     CHECK_THROWS(importer.import_mesh(broken("$Elements\n4", "$Elements\n3")), "expected $EndElements");

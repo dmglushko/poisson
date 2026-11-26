@@ -228,7 +228,8 @@ without `estimate_at_limit`, `StageInfo` collection, and the `PoissonDriver` pla
 - Faces between a dielectric and a floating metal (no voltage) are skipped like Dirichlet
   faces.
 - An interior face with a Neumann or Robin boundary element is treated as an ordinary
-  interior face, with a warning.
+  interior face, with a warning. Only meshes built through the C++ API can reach this, since
+  the importer rejects boundary elements on interior faces.
 - On a face shared between an excluded point-source tet and a non-excluded neighbour, the
   non-excluded neighbour still receives half of that face's flux jump.
 - No coarsening, no maximum refinement level.

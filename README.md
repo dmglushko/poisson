@@ -17,7 +17,9 @@ implemented.
 ## Build and test
 
 Needs a C++23 compiler, CMake, Eigen3 (`libeigen3-dev` on Ubuntu), the HDF5 library
-(`libhdf5-dev`), and Python 3 (`python3-h5py` for inspecting `.h5` files in tests). BLAKE3
+(`libhdf5-dev`), and Python 3 (`python3-h5py` for inspecting `.h5` files in tests;
+`python3-numpy`, `python3-scipy`, and `python3-h5py` for the `poisson_test_solver` tests, which are
+skipped without them, plus `scikit-fem`/`pyamg` in a venv for its assembly and AMG tests). BLAKE3
 v1.8.7 is vendored under `third_party/blake3/` so no external hashing dependency is required.
 
 ```bash

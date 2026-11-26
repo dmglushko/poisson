@@ -531,7 +531,7 @@ void check_geometry(const fs::path& file, MeshProperties& mesh, const MeshReadSt
         mesh.neighbours[faces[i - 1].element][faces[i - 1].local] = faces[i].element;
     }
 
-    // Every boundary triangle must be a face of a tet, and must be listed only once.
+    // Every boundary triangle must be an outer face of a tet, and must be listed only once.
     struct BoundaryFace {
         Face face;
         std::size_t index;
@@ -544,6 +544,9 @@ void check_geometry(const fs::path& file, MeshProperties& mesh, const MeshReadSt
                                             [](const TetFace& a, const Face& b) { return a.face < b; });
         if (found == faces.end() || found->face != face)
             fail(file, state.boundary_lines[i], "triangle with " + describe(face) + " is not a face of any tetrahedron");
+        if (std::next(found) != faces.end() && std::next(found)->face == face)
+            fail(file, state.boundary_lines[i],
+                 "triangle with " + describe(face) + " is an interior face shared by two tetrahedra");
         boundary_faces.push_back({face, i});
     }
     std::sort(boundary_faces.begin(), boundary_faces.end(), [](const BoundaryFace& a, const BoundaryFace& b) {

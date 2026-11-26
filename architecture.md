@@ -167,9 +167,10 @@ struct FreeCharges {
 The linear system A x = f.
 
 A has one row per unknown, not one per node. `row` gives the row of each node; several
-nodes may share a row. Nodes whose value is known in advance have no row and are listed in
-`known`. The potential at every node follows from the solution `x` of the system
-(`SolverResult::x`):
+nodes may share a row (all nodes of one connected floating metal share one row). Nodes
+whose value is known in advance (Dirichlet boundaries and prescribed-voltage metals) have
+no row and are listed in `known`. The potential at every node follows from the solution `x`
+of the system (`SolverResult::x`):
 
 - node with a row: `u[i] = x[*row[i]]`
 - every `(node, value)` in `known`: `u[node] = value`

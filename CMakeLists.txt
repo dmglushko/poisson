@@ -175,6 +175,10 @@ target_include_directories(test_serialization PRIVATE ${HDF5_INCLUDE_DIRS})
 target_compile_options(test_serialization PRIVATE -Wall -Wextra -Wpedantic)
 add_test(NAME serialization COMMAND test_serialization)
 
+add_executable(io_roundtrip_tool tests/io_roundtrip_tool.cpp)
+target_link_libraries(io_roundtrip_tool PRIVATE poisson_io poisson_common)
+target_compile_options(io_roundtrip_tool PRIVATE -Wall -Wextra -Wpedantic)
+
 if(Python3_FOUND)
     add_test(
         NAME runner

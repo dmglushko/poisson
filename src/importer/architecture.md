@@ -86,3 +86,5 @@ has a screening length.
   potential: no used Dirichlet surface, no used Robin surface with `alpha > 0`, no volume
   with a voltage, and (when screened) no non-metal volume with a screening length.
 - A material given twice, in one file or in two, is an error.
+- Every boundary triangle must be an outer face of one tetrahedron; a boundary triangle on an
+  interior face shared by two tetrahedra is an error.
