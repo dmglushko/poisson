@@ -17,6 +17,10 @@
 enum class PointSourceRule {
     // eta_K = 0 for every tet that shares a node with a tet containing a point source.
     exclude_patch,
+    // eta_K = 0 for every tet intersecting the closed ball |x - p| <= exclusion_radius
+    // around each non-zero point source (via MeshLocator::query_sphere). Keeps the excluded
+    // region fixed in physical space across AMR cycles.
+    exclude_radius,
     // Nothing: the point sources are not looked at.
     ignore,
 };
@@ -64,7 +68,8 @@ public:
 
 protected:
     explicit ErrorEstimator(PointSourceRule point_sources, IndicatorSum sum = IndicatorSum::squares)
-        : point_sources_(point_sources), sum_(sum) {}
+        : ErrorEstimator(point_sources, 0.0, sum) {}
+    ErrorEstimator(PointSourceRule point_sources, double exclusion_radius, IndicatorSum sum = IndicatorSum::squares);
 
 private:
     // Called by estimate() with a checked input and the point-source exclusion mask
@@ -74,5 +79,6 @@ private:
                                            std::span<const uint8_t> excluded, ErrorEstimate::Info& info) const = 0;
 
     PointSourceRule point_sources_;
+    double          exclusion_radius_ = 0.0;
     IndicatorSum    sum_;
 };

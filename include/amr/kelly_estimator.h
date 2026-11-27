@@ -16,6 +16,8 @@ class KellyEstimator final : public ErrorEstimator {
 public:
     struct Settings {
         PointSourceRule point_sources = PointSourceRule::exclude_patch;
+        // Radius in nm when point_sources == PointSourceRule::exclude_radius (finite, > 0).
+        double          point_source_exclusion_radius = 0.0;
     };
 
     KellyEstimator();   // default Settings

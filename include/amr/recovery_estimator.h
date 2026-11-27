@@ -24,9 +24,11 @@ public:
     enum class Quantity { gradient, flux };
 
     struct Settings {
-        Quantity quantity = Quantity::flux;
-        bool     per_material = true;
+        Quantity        quantity = Quantity::flux;
+        bool            per_material = true;
         PointSourceRule point_sources = PointSourceRule::exclude_patch;
+        // Radius in nm when point_sources == PointSourceRule::exclude_radius (finite, > 0).
+        double          point_source_exclusion_radius = 0.0;
     };
 
     RecoveryEstimator();   // default Settings

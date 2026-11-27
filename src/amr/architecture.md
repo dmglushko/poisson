@@ -141,8 +141,11 @@ Shared rules (in `ErrorEstimator::estimate`):
 - **Metal** tets get `eta = 0`; faces that touch a metal are skipped like Dirichlet faces.
 - **Point sources**: `PointSourceRule::exclude_patch` (default) sets `eta = 0` on every tet
   that shares a node with the tet containing a non-zero delta, because near a delta every
-  estimator keeps growing under refinement. `ignore` leaves them out. A source without an
-  element hint is located with `MeshLocator` (`include/common/mesh_locator.h`).
+  estimator keeps growing under refinement. `PointSourceRule::exclude_radius` sets `eta = 0`
+  on every tet intersecting the closed sphere of `point_source_exclusion_radius` around each
+  non-zero delta (via `MeshLocator::query_sphere`), keeping the excluded zone fixed in
+  physical space across AMR cycles. `ignore` leaves them out. A source without an element
+  hint is located with `MeshLocator` (`include/common/mesh_locator.h`).
 - An outer face without a boundary element is natural (`g = 0`).
 
 Recovery averages per material by default (`per_material = true`): neither `grad u` nor

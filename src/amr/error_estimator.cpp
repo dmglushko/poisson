@@ -10,6 +10,20 @@
 #include <optional>
 #include <stdexcept>
 
+ErrorEstimator::ErrorEstimator(PointSourceRule point_sources, double exclusion_radius, IndicatorSum sum)
+    : point_sources_(point_sources), exclusion_radius_(exclusion_radius), sum_(sum) {
+    if (point_sources_ == PointSourceRule::exclude_radius) {
+        if (!(std::isfinite(exclusion_radius_) && exclusion_radius_ > 0.0))
+            throw std::invalid_argument(
+                "ErrorEstimator: point_source_exclusion_radius must be finite and positive for exclude_radius");
+        if (!std::isfinite(exclusion_radius_ * exclusion_radius_))
+            throw std::invalid_argument(
+                "ErrorEstimator: point_source_exclusion_radius is too large (square overflows)");
+    } else if (!(std::isfinite(exclusion_radius_) && exclusion_radius_ >= 0.0)) {
+        throw std::invalid_argument("ErrorEstimator: point_source_exclusion_radius must be finite and non-negative");
+    }
+}
+
 ErrorEstimate ErrorEstimator::estimate(const MeshProperties& mesh, const RefinementInput& input) const {
     const auto start = std::chrono::steady_clock::now();
     const std::string who = name() + " estimator";
@@ -105,6 +119,28 @@ ErrorEstimate ErrorEstimator::estimate(const MeshProperties& mesh, const Refinem
                 }
         if (outside > 0)
             result.info.warnings.push_back(std::to_string(outside) + " point sources lie outside the mesh; they were skipped");
+    } else if (point_sources_ == PointSourceRule::exclude_radius && !input.point_sources.empty()) {
+        std::optional<MeshLocator> locator;
+        std::vector<uint32_t> hits;
+        uint32_t outside = 0;
+        for (const auto& p : input.point_sources) {
+            if (p.value == 0.0) continue;
+            if (!locator) locator.emplace(mesh);
+            locator->query_sphere(p.position, exclusion_radius_, hits);
+            if (hits.empty()) {
+                ++outside;
+                continue;
+            }
+            for (uint32_t k : hits) {
+                if (!excluded_mask[k]) {
+                    excluded_mask[k] = 1;
+                    ++excluded;
+                }
+            }
+        }
+        if (outside > 0)
+            result.info.warnings.push_back(std::to_string(outside) +
+                                           " point source exclusion spheres intersect no tets; they were skipped");
     }
 
     result.eta = indicators(mesh, input, excluded_mask, result.info);

@@ -9,7 +9,7 @@ using namespace amr_detail;
 RecoveryEstimator::RecoveryEstimator() : RecoveryEstimator(Settings{}) {}
 
 RecoveryEstimator::RecoveryEstimator(Settings settings)
-    : ErrorEstimator(settings.point_sources), settings_(settings) {}
+    : ErrorEstimator(settings.point_sources, settings.point_source_exclusion_radius), settings_(settings) {}
 
 std::vector<double> RecoveryEstimator::indicators(const MeshProperties& mesh, const RefinementInput& input,
                                                   std::span<const uint8_t>, ErrorEstimate::Info&) const {

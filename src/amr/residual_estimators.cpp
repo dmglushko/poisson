@@ -130,7 +130,7 @@ Terms residual_terms(const MeshProperties& mesh, const RefinementInput& input, s
 ResidualEstimator::ResidualEstimator() : ResidualEstimator(Settings{}) {}
 
 ResidualEstimator::ResidualEstimator(Settings settings)
-    : ErrorEstimator(settings.point_sources), settings_(settings) {
+    : ErrorEstimator(settings.point_sources, settings.point_source_exclusion_radius), settings_(settings) {
     check_degree(settings_.tet_degree, "ResidualEstimator::Settings::tet_degree");
 }
 
@@ -155,7 +155,8 @@ std::vector<double> ResidualEstimator::indicators(const MeshProperties& mesh, co
 
 KellyEstimator::KellyEstimator() : KellyEstimator(Settings{}) {}
 
-KellyEstimator::KellyEstimator(Settings settings) : ErrorEstimator(settings.point_sources), settings_(settings) {}
+KellyEstimator::KellyEstimator(Settings settings)
+    : ErrorEstimator(settings.point_sources, settings.point_source_exclusion_radius), settings_(settings) {}
 
 std::vector<double> KellyEstimator::indicators(const MeshProperties& mesh, const RefinementInput& input,
                                                std::span<const uint8_t> excluded, ErrorEstimate::Info& info) const {

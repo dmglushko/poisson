@@ -241,6 +241,84 @@ void test_point_sources() {
     CHECK_NEAR(res_parts, res_excl.total, 1e-12);
     const double kelly_parts = std::hypot(excluded.info.details.at("jump_part"), excluded.info.details.at("boundary_part"));
     CHECK_NEAR(kelly_parts, excluded.total, 1e-12);
+
+    // Fixed-radius exclusion via MeshLocator::query_sphere: larger radius excludes more tets,
+    // overlapping spheres do not double-count, zero-weight sources are skipped, and spheres
+    // outside the mesh warn without excluding anything.
+    const ErrorEstimate r_small =
+        KellyEstimator({.point_sources = PointSourceRule::exclude_radius, .point_source_exclusion_radius = 0.05})
+            .estimate(mesh, input);
+    const ErrorEstimate r_big =
+        KellyEstimator({.point_sources = PointSourceRule::exclude_radius, .point_source_exclusion_radius = 0.35})
+            .estimate(mesh, input);
+    CHECK(r_small.info.excluded_elements >= 1);
+    CHECK(r_big.info.excluded_elements > r_small.info.excluded_elements);
+    CHECK(r_big.info.excluded_elements < mesh.elements.size());
+    CHECK(r_big.total < r_small.total);
+    CHECK_NEAR(std::hypot(r_big.info.details.at("jump_part"), r_big.info.details.at("boundary_part")), r_big.total, 1e-12);
+
+    // Works identically across all estimators (Residual, Recovery, Trajectory).
+    const ErrorEstimate res_rad =
+        ResidualEstimator({.point_sources = PointSourceRule::exclude_radius, .point_source_exclusion_radius = 0.35})
+            .estimate(mesh, input);
+    const ErrorEstimate rec_rad =
+        RecoveryEstimator({.point_sources = PointSourceRule::exclude_radius, .point_source_exclusion_radius = 0.35})
+            .estimate(mesh, input);
+    const ErrorEstimate traj_rad =
+        TrajectoryEstimator({.point_sources = PointSourceRule::exclude_radius, .point_source_exclusion_radius = 0.35})
+            .estimate(mesh, input);
+    CHECK(res_rad.info.excluded_elements == r_big.info.excluded_elements);
+    CHECK(rec_rad.info.excluded_elements == r_big.info.excluded_elements);
+    CHECK(traj_rad.info.excluded_elements == r_big.info.excluded_elements);
+    CHECK_NEAR(std::hypot(res_rad.info.details.at("element_part"),
+                          std::hypot(res_rad.info.details.at("jump_part"), res_rad.info.details.at("boundary_part"))),
+               res_rad.total, 1e-12);
+
+    // Duplicate/overlapping point sources do not double-count excluded_elements.
+    RefinementInput dup = input;
+    dup.point_sources.push_back(input.point_sources[0]);
+    const ErrorEstimate dup_rad =
+        KellyEstimator({.point_sources = PointSourceRule::exclude_radius, .point_source_exclusion_radius = 0.35})
+            .estimate(mesh, dup);
+    CHECK(dup_rad.info.excluded_elements == r_big.info.excluded_elements);
+
+    // Zero-weight source excludes nothing under exclude_radius too.
+    const ErrorEstimate zero_rad =
+        KellyEstimator({.point_sources = PointSourceRule::exclude_radius, .point_source_exclusion_radius = 0.35})
+            .estimate(mesh, zero_delta);
+    CHECK(zero_rad.info.excluded_elements == 0);
+    CHECK_NEAR(zero_rad.total, ignored.total, 1e-12);
+
+    // Sphere completely outside the mesh emits a warning and excludes 0 tets.
+    RefinementInput far_away = input_for(u);
+    far_away.point_sources.push_back({{5.0, 5.0, 5.0}, 1.0, {}});
+    const ErrorEstimate far_rad =
+        KellyEstimator({.point_sources = PointSourceRule::exclude_radius, .point_source_exclusion_radius = 0.2})
+            .estimate(mesh, far_away);
+    CHECK(far_rad.info.warnings.size() == 1);
+    CHECK(far_rad.info.excluded_elements == 0);
+
+    // Invalid exclusion radii are rejected by the constructor.
+    CHECK_THROWS(std::invalid_argument,
+                 (KellyEstimator(KellyEstimator::Settings{.point_sources = PointSourceRule::exclude_radius,
+                                                          .point_source_exclusion_radius = 0.0})),
+                 "positive");
+    CHECK_THROWS(std::invalid_argument,
+                 (KellyEstimator(KellyEstimator::Settings{.point_sources = PointSourceRule::exclude_radius,
+                                                          .point_source_exclusion_radius = -0.5})),
+                 "positive");
+    CHECK_THROWS(std::invalid_argument,
+                 (ResidualEstimator(ResidualEstimator::Settings{.point_sources = PointSourceRule::exclude_radius,
+                                                                .point_source_exclusion_radius = std::nan("")})),
+                 "positive");
+    CHECK_THROWS(std::invalid_argument,
+                 (TrajectoryEstimator(TrajectoryEstimator::Settings{.point_sources = PointSourceRule::exclude_radius,
+                                                                    .point_source_exclusion_radius = 1e200})),
+                 "overflow");
+    CHECK_THROWS(std::invalid_argument,
+                 (RecoveryEstimator(RecoveryEstimator::Settings{.point_sources = PointSourceRule::exclude_patch,
+                                                                .point_source_exclusion_radius = -1.0})),
+                 "non-negative");
 }
 
 void test_large_scale_and_many_materials() {

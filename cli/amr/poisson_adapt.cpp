@@ -71,8 +71,23 @@ void reject_unknown_keys(const JsonValue::Object& obj, const std::set<std::strin
 PointSourceRule parse_point_source_rule(const JsonValue& v, const std::string& ctx) {
     const std::string& s = v.as_string(ctx);
     if (s == "exclude_patch") return PointSourceRule::exclude_patch;
+    if (s == "exclude_radius") return PointSourceRule::exclude_radius;
     if (s == "ignore") return PointSourceRule::ignore;
-    throw std::runtime_error(ctx + ": expected 'exclude_patch' or 'ignore', got '" + s + "'");
+    throw std::runtime_error(ctx + ": expected 'exclude_patch', 'exclude_radius', or 'ignore', got '" + s + "'");
+}
+
+void parse_point_source_settings(const JsonValue::Object& eo, PointSourceRule& rule, double& radius) {
+    if (auto p = eo.find("point_sources"); p != eo.end())
+        rule = parse_point_source_rule(p->second, "config.estimator.point_sources");
+    const auto rp = eo.find("point_source_exclusion_radius");
+    if (rule == PointSourceRule::exclude_radius) {
+        if (rp == eo.end() || rp->second.is_null())
+            throw std::runtime_error("config.estimator: 'exclude_radius' requires 'point_source_exclusion_radius'");
+        radius = rp->second.as_double("config.estimator.point_source_exclusion_radius");
+    } else if (rp != eo.end() && !rp->second.is_null()) {
+        throw std::runtime_error(
+            "config.estimator: 'point_source_exclusion_radius' is only allowed with point_sources='exclude_radius'");
+    }
 }
 
 struct ParsedConfig {
@@ -102,13 +117,13 @@ ParsedConfig parse_config(const JsonValue& root) {
         const std::string& type = tit->second.as_string("config.estimator.type");
 
         if (type == "kelly") {
-            reject_unknown_keys(eo, {"type", "point_sources"}, "config.estimator");
+            reject_unknown_keys(eo, {"type", "point_sources", "point_source_exclusion_radius"}, "config.estimator");
             KellyEstimator::Settings s;
-            if (auto p = eo.find("point_sources"); p != eo.end())
-                s.point_sources = parse_point_source_rule(p->second, "point_sources");
+            parse_point_source_settings(eo, s.point_sources, s.point_source_exclusion_radius);
             cfg.estimator = std::make_shared<KellyEstimator>(s);
         } else if (type == "recovery") {
-            reject_unknown_keys(eo, {"type", "quantity", "per_material", "point_sources"}, "config.estimator");
+            reject_unknown_keys(eo, {"type", "quantity", "per_material", "point_sources", "point_source_exclusion_radius"},
+                                "config.estimator");
             RecoveryEstimator::Settings s;
             if (auto p = eo.find("quantity"); p != eo.end()) {
                 const std::string& q = p->second.as_string("quantity");
@@ -117,26 +132,27 @@ ParsedConfig parse_config(const JsonValue& root) {
                 else throw std::runtime_error("config.estimator.quantity: expected 'flux' or 'gradient'");
             }
             if (auto p = eo.find("per_material"); p != eo.end()) s.per_material = p->second.as_bool("per_material");
-            if (auto p = eo.find("point_sources"); p != eo.end())
-                s.point_sources = parse_point_source_rule(p->second, "point_sources");
+            parse_point_source_settings(eo, s.point_sources, s.point_source_exclusion_radius);
             cfg.estimator = std::make_shared<RecoveryEstimator>(s);
         } else if (type == "residual") {
-            reject_unknown_keys(eo, {"type", "tet_degree", "point_sources", "constant_source"}, "config.estimator");
+            reject_unknown_keys(
+                eo, {"type", "tet_degree", "point_sources", "point_source_exclusion_radius", "constant_source"},
+                "config.estimator");
             ResidualEstimator::Settings s;
             if (auto p = eo.find("tet_degree"); p != eo.end()) s.tet_degree = p->second.as_int("tet_degree");
-            if (auto p = eo.find("point_sources"); p != eo.end())
-                s.point_sources = parse_point_source_rule(p->second, "point_sources");
+            parse_point_source_settings(eo, s.point_sources, s.point_source_exclusion_radius);
             if (auto p = eo.find("constant_source"); p != eo.end() && !p->second.is_null())
                 cfg.constant_source = p->second.as_double("constant_source");
             cfg.estimator = std::make_shared<ResidualEstimator>(s);
         } else if (type == "trajectory") {
-            reject_unknown_keys(eo, {"type", "scale", "tet_degree", "point_sources", "constant_source"},
-                                "config.estimator");
+            reject_unknown_keys(
+                eo,
+                {"type", "scale", "tet_degree", "point_sources", "point_source_exclusion_radius", "constant_source"},
+                "config.estimator");
             TrajectoryEstimator::Settings s;
             if (auto p = eo.find("scale"); p != eo.end()) s.scale = p->second.as_double("scale");
             if (auto p = eo.find("tet_degree"); p != eo.end()) s.tet_degree = p->second.as_int("tet_degree");
-            if (auto p = eo.find("point_sources"); p != eo.end())
-                s.point_sources = parse_point_source_rule(p->second, "point_sources");
+            parse_point_source_settings(eo, s.point_sources, s.point_source_exclusion_radius);
             if (auto p = eo.find("constant_source"); p != eo.end() && !p->second.is_null())
                 cfg.constant_source = p->second.as_double("constant_source");
             cfg.estimator = std::make_shared<TrajectoryEstimator>(s);

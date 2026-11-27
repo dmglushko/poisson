@@ -129,7 +129,8 @@ int local_face(const MeshProperties& mesh, uint32_t element, const std::array<ui
 TrajectoryEstimator::TrajectoryEstimator() : TrajectoryEstimator(Settings{}) {}
 
 TrajectoryEstimator::TrajectoryEstimator(Settings settings)
-    : ErrorEstimator(settings.point_sources, IndicatorSum::values), settings_(settings) {
+    : ErrorEstimator(settings.point_sources, settings.point_source_exclusion_radius, IndicatorSum::values),
+      settings_(settings) {
     check_degree(settings_.tet_degree, "TrajectoryEstimator::Settings::tet_degree");
     if (!(std::isfinite(settings_.scale) && settings_.scale > 0))
         throw std::invalid_argument("TrajectoryEstimator::Settings::scale must be finite and positive, got " +

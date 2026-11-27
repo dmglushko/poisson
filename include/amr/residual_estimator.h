@@ -31,8 +31,10 @@ public:
     struct Settings {
         // Exact degree of the tet rule for ||f - c u_h||^2. f is arbitrary, so this is a
         // choice of accuracy; c u_h alone needs 2. The face terms are computed exactly.
-        int tet_degree = 4;
+        int             tet_degree = 4;
         PointSourceRule point_sources = PointSourceRule::exclude_patch;
+        // Radius in nm when point_sources == PointSourceRule::exclude_radius (finite, > 0).
+        double          point_source_exclusion_radius = 0.0;
     };
 
     // Throws std::invalid_argument for a degree outside [0, max_quadrature_degree].
