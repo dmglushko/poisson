@@ -287,18 +287,25 @@ def make_adapt_stage(build_dir: Path | str | None = None) -> Stage:
 
     Inputs `mesh`, `solution`, optional `state` (the previous cycle's state); outputs `mesh`
     (refined, or the input mesh when not adapted), `parents` (identity when not adapted),
-    `state` (for the next cycle), and `eta` (per-tet indicators of the input mesh).
+    `state` (for the next cycle), `eta` (per-tet indicators of the input mesh), and `marked`
+    (sorted input tet indices chosen by marking; empty when not marked).
     """
     return Stage.from_cli(
         name="adapt_mesh",
         binary="poisson_adapt",
         input_flags={"mesh": "--mesh", "solution": "--solution", "state": "--state"},
         config_flag="--config",
-        output_flags={"mesh": "--out", "parents": "--parents-out", "state": "--state-out", "eta": "--eta-out"},
-        output_specs={"mesh": ".h5", "parents": ".h5", "state": ".h5", "eta": ".h5"},
+        output_flags={
+            "mesh": "--out",
+            "parents": "--parents-out",
+            "state": "--state-out",
+            "eta": "--eta-out",
+            "marked": "--marked-out",
+        },
+        output_specs={"mesh": ".h5", "parents": ".h5", "state": ".h5", "eta": ".h5", "marked": ".h5"},
         info_flag="--info-out",
         build_dir=build_dir,
-        version="adapt_mesh_v2",
+        version="adapt_mesh_v3",
     )
 
 
@@ -370,7 +377,7 @@ def adapt_mesh(
 ) -> dict[str, Artifact]:
     """Run one cached `poisson_adapt` cycle.
 
-    Returns `{"mesh", "parents", "state", "eta"}` (see `make_adapt_stage`). Chain cycles by
+    Returns `{"mesh", "parents", "state", "eta", "marked"}` (see `make_adapt_stage`). Chain cycles by
     passing the previous result's `mesh` and `state`; omit `state` for an imported mesh. The
     status (`adapted` / `converged` / `limit_reached` / `unchanged`) is `result["mesh"].info["status"]`.
     """

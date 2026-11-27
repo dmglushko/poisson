@@ -52,7 +52,7 @@ All stages share one unit system (matching Nebula):
 - **Equation:** inside each non-metal tet, with $c = \varepsilon_r / \lambda^2$ when `mesh.screened && screening_length > 0` (and $c = 0$ otherwise):
   $$-\nabla \cdot (\varepsilon_r \nabla u) + c u = f = \frac{\rho}{\varepsilon_0}$$
   so $f$ has units $\text{V}/\text{nm}^2$, and a point charge of $q$ elementary charges contributes $q \cdot \frac{e}{\varepsilon_0\,\mathrm{nm}} \approx 18.0951\,q\;\text{V}\cdot\text{nm}$ to the integrated right-hand side.
-- **Boundary conditions:** Dirichlet prescribes $u\;\text{[V]}$; Neumann and Robin satisfy $\varepsilon_r \frac{\partial u}{\partial n} + \alpha u = g$ with $g$ in $\text{V}/\text{nm}$ and $\alpha$ in $\text{nm}^{-1}$ ($\alpha = 0$ for Neumann).
+- **Boundary conditions:** Dirichlet prescribes $u\;\text{[V]}$; Neumann and Robin satisfy $\varepsilon_r \frac{\partial u}{\partial n} + \alpha u = g$ with $g$ in $\text{V}/\text{nm}$ and $\alpha$ in $\text{nm}^{-1}$ ($\alpha = 0$ for Neumann). Outer faces with no `BoundaryElement` entry are treated as natural homogeneous Neumann ($g = 0, \alpha = 0$).
 
 ## Data classes
 
@@ -103,7 +103,7 @@ struct MeshProperties {
 
     std::vector<std::array<double, 3>> nodes;               // nodes[id] = {x, y, z} in nm
     std::vector<Element>               elements;
-    std::vector<BoundaryElement>       boundary_elements;
+    std::vector<BoundaryElement>       boundary_elements;   // outer faces with an explicit BC only; unlisted outer faces are natural (g = 0, alpha = 0)
     std::vector<BoundaryCondition>     boundary_conditions;
     std::vector<Material>              materials;
     std::vector<TrappedCharge>         charges;             // all trapped charges; grows after every batch

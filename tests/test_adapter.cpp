@@ -338,6 +338,9 @@ void test_eta_returned() {
         CHECK_NEAR(norm(adapted_eb->eta), estimated_total(adapted).value(), 1e-12 * estimated_total(adapted).value());
         CHECK(*std::max_element(adapted_eb->eta.begin(), adapted_eb->eta.end()) ==
               adapted.info.stages[0].metrics.at("max_indicator"));
+        const auto expected_marked = DorflerMarking().mark(mesh, adapted_eb->eta);
+        CHECK(adapted_eb->marked == expected_marked);
+        CHECK(static_cast<double>(adapted_eb->marked.size()) == adapted.info.stages[1].metrics.at("marked"));
     }
 
     const ErrorBasedAdapter generous(std::make_shared<KellyEstimator>(), std::make_shared<DorflerMarking>(),
@@ -346,7 +349,7 @@ void test_eta_returned() {
     const AdaptationResult converged = generous.start()->adapt(mesh, input);
     const auto* converged_eb = std::get_if<ErrorBasedExtras>(&converged.extras);
     CHECK(converged.status == AdaptationStatus::converged && converged_eb &&
-          converged_eb->eta.size() == mesh.elements.size());
+          converged_eb->eta.size() == mesh.elements.size() && converged_eb->marked.empty());
 
     const ErrorBasedAdapter at_limit(std::make_shared<KellyEstimator>(), std::make_shared<DorflerMarking>(),
                                      std::make_shared<LongestEdgeBisection>(),
@@ -354,7 +357,7 @@ void test_eta_returned() {
     const AdaptationResult limited = at_limit.start()->adapt(mesh, input);
     const auto* limited_eb = std::get_if<ErrorBasedExtras>(&limited.extras);
     CHECK(limited.status == AdaptationStatus::limit_reached && limited_eb &&
-          limited_eb->eta.size() == mesh.elements.size());
+          limited_eb->eta.size() == mesh.elements.size() && limited_eb->marked.empty());
 
     const ErrorBasedAdapter skip(std::make_shared<KellyEstimator>(), std::make_shared<DorflerMarking>(),
                                  std::make_shared<LongestEdgeBisection>(),
@@ -368,7 +371,7 @@ void test_eta_returned() {
     const AdaptationResult unchanged = plain.start()->adapt(mesh, RefinementInput{linear_u, {}, {}});
     const auto* unchanged_eb = std::get_if<ErrorBasedExtras>(&unchanged.extras);
     CHECK(unchanged.status == AdaptationStatus::unchanged && unchanged_eb &&
-          unchanged_eb->eta.size() == mesh.elements.size());
+          unchanged_eb->eta.size() == mesh.elements.size() && unchanged_eb->marked.empty());
 }
 
 // An estimator whose indicators add up linearly (IndicatorSum::values): the adapter's total

@@ -854,7 +854,7 @@ pathlib.Path(a.info_out).write_text(json.dumps({{"time": 0.015}}))
         self.assertEqual(report.cache_hits, 3)     # import cached on branches 1..3
         for br in report.branches:
             res: dict[str, Artifact] = br.result
-            self.assertEqual(set(res), {"mesh", "parents", "state", "eta"})
+            self.assertEqual(set(res), {"mesh", "parents", "state", "eta", "marked"})
             info = res["mesh"].info
             self.assertEqual(info["status"], "adapted")
             self.assertGreater(info["elements_after"], info["elements_before"])
@@ -864,6 +864,12 @@ pathlib.Path(a.info_out).write_text(json.dumps({{"time": 0.015}}))
                 self.assertEqual(h5.attrs["schema"], b"ErrorIndicators")
                 eta = h5["eta"][:]
             self.assertEqual(len(eta), info["elements_before"])   # per tet of the INPUT mesh
+            with h5py.File(res["marked"].path, "r") as h5:
+                self.assertEqual(h5.attrs["schema"], b"MarkedElements")
+                marked = h5["marked"][:]
+            self.assertEqual(len(marked), int(info["stages"][1]["metrics"]["marked"]))
+            self.assertEqual(marked.tolist(), sorted(set(marked.tolist())))
+            self.assertTrue(all(0 <= int(k) < info["elements_before"] for k in marked))
             total = info["stages"][0]["metrics"]["total"]   # the estimate stage's error estimate
             self.assertAlmostEqual(float(np.sqrt(np.sum(eta**2))), total, places=12)
             with h5py.File(res["parents"].path, "r") as h5:
@@ -913,6 +919,9 @@ pathlib.Path(a.info_out).write_text(json.dumps({{"time": 0.015}}))
         first, second = r_rel.branches[0].result
         self.assertEqual(first["mesh"].info["status"], "adapted")
         self.assertEqual(second["mesh"].info["status"], "converged")
+        with h5py.File(second["marked"].path, "r") as h5:
+            self.assertEqual(h5.attrs["schema"], b"MarkedElements")
+            self.assertEqual(len(h5["marked"][:]), 0)
         self.assertEqual(second["mesh"].content_id, first["mesh"].content_id)   # same mesh passed through
         with h5py.File(second["parents"].path, "r") as h5:
             n_el = second["mesh"].info["elements_before"]

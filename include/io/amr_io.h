@@ -35,6 +35,10 @@ ErrorBasedAdapter::State read_adaptation_state(const std::filesystem::path& file
 void write_error_indicators(const std::filesystem::path& file, const std::vector<double>& eta);
 std::vector<double> read_error_indicators(const std::filesystem::path& file);
 
+// ErrorBasedExtras::marked: /marked (uint32, sorted input tet indices chosen by marking; may be empty).
+void write_marked_elements(const std::filesystem::path& file, const std::vector<uint32_t>& marked);
+std::vector<uint32_t> read_marked_elements(const std::filesystem::path& file);
+
 void write_info_json(const std::filesystem::path& file, AdaptationStatus status, const AdaptationResult::Info& info);
 
 }   // namespace poisson::io

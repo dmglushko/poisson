@@ -44,7 +44,10 @@ struct ErrorBasedExtras {
     // Per tet of the INPUT mesh (indexed like mesh.elements): the local error indicator eta_K
     // the decision was based on, estimated before any refinement. Its norm is the "total" metric of
     // the estimate stage in Info::stages.
-    std::vector<double> eta;
+    std::vector<double>   eta;
+    // Sorted, unique indices into the INPUT mesh's elements chosen by MarkingStrategy::mark().
+    // Empty when marking did not run (converged, limit_reached) or marked nothing (unchanged).
+    std::vector<uint32_t> marked;
 };
 
 using AdaptationExtras = std::variant<std::monostate, ErrorBasedExtras>;

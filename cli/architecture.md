@@ -64,7 +64,7 @@ path):
 poisson_adapt --mesh <mesh.h5> --solution <nodal_field.h5> --config <config.json>
               [--state <state.h5>] --out <mesh_out.h5>
               [--parents-out <parents.h5>] [--state-out <state.h5>]
-              [--eta-out <eta.h5>] [--info-out <info.json>]
+              [--eta-out <eta.h5>] [--marked-out <marked.h5>] [--info-out <info.json>]
 ```
 
 - `--state` / `--state-out` carry `ErrorBasedAdapter::State` (red-green history and the base
@@ -72,9 +72,10 @@ poisson_adapt --mesh <mesh.h5> --solution <nodal_field.h5> --config <config.json
 - The outputs always describe the mesh to continue with: when the status is not `adapted`,
   `--out` is the input mesh, `--parents-out` is the identity map, and `--state-out` is the
   (possibly baseline-updated) input state. `--eta-out` holds `ErrorBasedExtras::eta` from
-  `AdaptationResult::extras` for the input mesh (empty when nothing was estimated). The status
-  is in `--info-out`.
-- The Python `adapt_mesh` helper always requests all four `.h5` outputs.
+  `AdaptationResult::extras` for the input mesh (empty when nothing was estimated), and
+  `--marked-out` holds `ErrorBasedExtras::marked` (sorted input tet indices chosen by marking;
+  empty when marking did not run or marked nothing). The status is in `--info-out`.
+- The Python `adapt_mesh` helper always requests all five `.h5` outputs.
 
 ## Verification CLI (`cli/verification/`)
 
@@ -97,9 +98,10 @@ poisson_case --config <case.json> --geo-out <case.geo> --materials-out <case.yam
 
 - Supports `MeshProperties`, `FreeCharges`, `AssembledProblem` (including compressed
   `Eigen::SparseMatrix<double>` `A`), `SolverResult`, and AMR stage artifacts (`NodalField`,
-  `Parents`, `RefinementHistory`, `AdaptationState` — `ErrorBasedAdapter::State`: group
-  `/history` with the `RefinementHistory` layout plus `/initial_error` with 0 or 1 float64
-  entries — and `ErrorIndicators` — `/eta`, float64 per tet), split into matching per-type headers/sources
+  `Parents`, `RefinementHistory`, `AdaptationState` (`ErrorBasedAdapter::State`: group `/history` with
+  the `RefinementHistory` layout plus `/initial_error` with 0 or 1 float64 entries),
+  `ErrorIndicators` (`/eta`, float64 per tet), and `MarkedElements` (`/marked`, uint32 sorted
+  input tet indices), split into matching per-type headers/sources
   (`mesh_io.h/.cpp`, `free_charges_io.h/.cpp`, `assembled_problem_io.h/.cpp`,
   `solver_result_io.h/.cpp`, `amr_io.h/.cpp`, `verification_io.h/.cpp`).
 - Disables HDF5 object timestamp tracking (`H5Pset_obj_track_times(..., false)`) on the root

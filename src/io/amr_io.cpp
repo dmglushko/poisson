@@ -205,6 +205,19 @@ std::vector<double> read_error_indicators(const fs::path& file) {
     return read_dataset_1d<double>(file, h5.id, "eta");
 }
 
+void write_marked_elements(const fs::path& file, const std::vector<uint32_t>& marked) {
+    H5Handle h5 = create_deterministic_h5(file);
+    write_schema_header(file, h5.id, "MarkedElements");
+    write_dataset_1d(file, h5.id, "marked", marked);
+    h5.close_file_checked(file);
+}
+
+std::vector<uint32_t> read_marked_elements(const fs::path& file) {
+    const H5Handle h5 = open_readonly_h5(file);
+    verify_schema_header(file, h5.id, "MarkedElements");
+    return read_dataset_1d<uint32_t>(file, h5.id, "marked");
+}
+
 void write_info_json(const fs::path& file, AdaptationStatus status, const AdaptationResult::Info& info) {
     auto status_str = [](AdaptationStatus s) -> const char* {
         switch (s) {

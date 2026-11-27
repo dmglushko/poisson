@@ -88,3 +88,7 @@ has a screening length.
 - A material given twice, in one file or in two, is an error.
 - Every boundary triangle must be an outer face of one tetrahedron; a boundary triangle on an
   interior face shared by two tetrahedra is an error.
+- Only triangles belonging to named surfaces in the `.msh` file are added to
+  `mesh.boundary_elements`. Unlabeled outer faces have no `BoundaryElement` entry (nothing is
+  left uninitialized) and are treated as natural homogeneous Neumann ($g = 0, \alpha = 0$) by
+  downstream stages.

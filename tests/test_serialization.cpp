@@ -300,6 +300,19 @@ void test_other_data_classes(const fs::path& dir) {
     CHECK(poisson::io::read_error_indicators(eta_file) == eta);
     poisson::io::write_error_indicators(dir / "eta_empty.h5", {});
     CHECK(poisson::io::read_error_indicators(dir / "eta_empty.h5").empty());
+
+    // Marked elements, including the empty case and determinism
+    const std::vector<uint32_t> marked = {0, 3, 7};
+    const fs::path marked_file = dir / "marked.h5";
+    const fs::path marked_again = dir / "marked_again.h5";
+    poisson::io::write_marked_elements(marked_file, marked);
+    const auto marked_loaded = poisson::io::read_marked_elements(marked_file);
+    CHECK(marked_loaded == marked);
+    poisson::io::write_marked_elements(marked_again, marked_loaded);
+    CHECK(read_bytes(marked_file) == read_bytes(marked_again));
+    poisson::io::write_marked_elements(dir / "marked_empty.h5", {});
+    CHECK(poisson::io::read_marked_elements(dir / "marked_empty.h5").empty());
+    CHECK_THROWS(poisson::io::read_marked_elements(eta_file), "expected schema 'MarkedElements'");
 }
 
 void test_info_json(const fs::path& dir) {

@@ -47,6 +47,8 @@ struct MeshProperties {
 
     std::vector<std::array<double, 3>> nodes;               // nodes[id] = {x, y, z} in nm
     std::vector<Element>               elements;
+    // Outer faces with an explicit boundary condition only; unlisted outer faces are
+    // natural homogeneous Neumann (g = 0, alpha = 0).
     std::vector<BoundaryElement>       boundary_elements;
     std::vector<BoundaryCondition>     boundary_conditions;
     std::vector<Material>              materials;

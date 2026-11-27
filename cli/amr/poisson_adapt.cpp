@@ -33,7 +33,7 @@ void print_usage(std::ostream& out) {
         << "  poisson_adapt --mesh <mesh.h5> --solution <nodal_field.h5> --config <config.json>\n"
         << "                [--state <state.h5>] --out <mesh_out.h5>\n"
         << "                [--parents-out <parents.h5>] [--state-out <state.h5>]\n"
-        << "                [--eta-out <eta.h5>] [--info-out <info.json>]\n"
+        << "                [--eta-out <eta.h5>] [--marked-out <marked.h5>] [--info-out <info.json>]\n"
         << "\n"
         << "Runs one ErrorBasedAdapter cycle. --state resumes from the --state-out of the previous\n"
         << "cycle (red-green history and the base error of relative_tolerance); omit it for an\n"
@@ -234,6 +234,7 @@ int main(int argc, char** argv) {
     std::optional<fs::path> parents_out_file;
     std::optional<fs::path> state_out_file;
     std::optional<fs::path> eta_out_file;
+    std::optional<fs::path> marked_out_file;
     std::optional<fs::path> info_out_file;
 
     auto require_value = [&](int& i, std::string_view flag) -> fs::path {
@@ -265,6 +266,8 @@ int main(int argc, char** argv) {
             state_out_file = require_value(i, arg);
         } else if (arg == "--eta-out") {
             eta_out_file = require_value(i, arg);
+        } else if (arg == "--marked-out") {
+            marked_out_file = require_value(i, arg);
         } else if (arg == "--info-out") {
             info_out_file = require_value(i, arg);
         } else {
@@ -286,6 +289,7 @@ int main(int argc, char** argv) {
     if (parents_out_file) outputs.emplace_back("--parents-out", *parents_out_file);
     if (state_out_file) outputs.emplace_back("--state-out", *state_out_file);
     if (eta_out_file) outputs.emplace_back("--eta-out", *eta_out_file);
+    if (marked_out_file) outputs.emplace_back("--marked-out", *marked_out_file);
     if (info_out_file) outputs.emplace_back("--info-out", *info_out_file);
 
     for (std::size_t i = 0; i < outputs.size(); ++i) {
@@ -349,6 +353,13 @@ int main(int argc, char** argv) {
             const std::vector<double> empty_eta;
             const std::vector<double>& eta = eb ? eb->eta : empty_eta;
             stage_output(*eta_out_file, "eta", [&](const fs::path& p) { poisson::io::write_error_indicators(p, eta); });
+        }
+        if (marked_out_file) {
+            const auto* eb = std::get_if<ErrorBasedExtras>(&result.extras);
+            const std::vector<uint32_t> empty_marked;
+            const std::vector<uint32_t>& marked = eb ? eb->marked : empty_marked;
+            stage_output(*marked_out_file, "marked",
+                         [&](const fs::path& p) { poisson::io::write_marked_elements(p, marked); });
         }
         if (info_out_file) {
             stage_output(*info_out_file, "info",

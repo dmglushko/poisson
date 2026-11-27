@@ -55,7 +55,8 @@ without using `ErrorEstimator`, `MarkingStrategy`, or `RefinementHistory`.
 
 ```cpp
 struct ErrorBasedExtras {
-    std::vector<double> eta;      // per tet of the INPUT mesh
+    std::vector<double>   eta;    // per tet of the INPUT mesh
+    std::vector<uint32_t> marked; // sorted INPUT tet indices chosen by MarkingStrategy (empty if not marked)
 };
 using AdaptationExtras = std::variant<std::monostate, ErrorBasedExtras>;
 
@@ -70,10 +71,10 @@ struct AdaptationResult {
 
 Adapter-specific per-cycle data goes in the `extras` variant so top-level `AdaptationResult`
 fields stay strictly common across all adapters. For `ErrorBasedAdapter`, `extras` holds
-`ErrorBasedExtras{eta}` (computed on the input mesh before any refinement; its norm
-$\sqrt{\sum_K \eta_K^2}$, or $\sum_K \eta_K$ for an estimator with `IndicatorSum::values`, is the `total` metric of the `estimate` entry in `info.stages`) on every outcome where the estimator ran (`adapted`,
+`ErrorBasedExtras{eta, marked}` (`eta` computed on the input mesh before any refinement; its norm
+$\sqrt{\sum_K \eta_K^2}$, or $\sum_K \eta_K$ for an estimator with `IndicatorSum::values`, is the `total` metric of the `estimate` entry in `info.stages`; `marked` holds the sorted input tet indices chosen by marking when adapted, and is empty otherwise) on every outcome where the estimator ran (`adapted`,
 `converged`, `unchanged`, and `limit_reached` with `estimate_at_limit = true`), and
-`std::monostate` when estimation was skipped. Mesh-sized arrays (`mesh`, `parents`, `eta`)
+`std::monostate` when estimation was skipped. Mesh-sized arrays (`mesh`, `parents`, `eta`, `marked`)
 are result data, never `Info`, so CLIs write them as `.h5` and `Info` as `.info.json`.
 
 ### Cross-cycle state: `ErrorBasedAdapter::State`

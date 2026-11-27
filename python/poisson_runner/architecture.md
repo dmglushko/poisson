@@ -27,7 +27,7 @@ the driver itself does not change. `RunContext.import_mesh(...)` and friends are
 over those helpers.
 
 `adapt_mesh(run, mesh, solution, config=..., state=None)` runs one `poisson_adapt` cycle and
-always returns `{"mesh", "parents", "state", "eta"}`; chain cycles by passing the previous
+always returns `{"mesh", "parents", "state", "eta", "marked"}`; chain cycles by passing the previous
 result's `mesh` and `state` (the status is `result["mesh"].info["status"]`).
 
 `import_mesh(..., screening=True)` passes `--screening on|off` to the importer.
