@@ -262,7 +262,6 @@ void test_large_scale_and_many_materials() {
                                        ErrorEstimate::Info&) const override {
             return std::vector<double>(m.elements.size(), 1e200);
         }
-        bool needs_source() const override { return false; }
     };
     const MeshProperties small = cube_mesh(1);
     const std::vector<double> zeros(small.nodes.size(), 0.0);
@@ -279,8 +278,8 @@ void test_bad_input() {
     u[2] = std::nan("");
     CHECK_THROWS(std::invalid_argument, KellyEstimator().estimate(mesh, input_for(u)), "u at node 2 is not finite");
     u[2] = 0;
-    CHECK_THROWS(std::invalid_argument, ResidualEstimator().estimate(mesh, RefinementInput{u, {}, {}}), "needs the source f");
-    CHECK(KellyEstimator().estimate(mesh, RefinementInput{u, {}, {}}).total == 0);   // Kelly does not need it
+    CHECK(ResidualEstimator().estimate(mesh, RefinementInput{u, {}, {}}).total == 0);
+    CHECK(KellyEstimator().estimate(mesh, RefinementInput{u, {}, {}}).total == 0);
     CHECK_THROWS(std::invalid_argument,
                  ResidualEstimator().estimate(mesh, input_for(u, [](const auto&, uint32_t) { return std::nan(""); })),
                  "the source is nan");
@@ -401,7 +400,7 @@ void test_trajectory() {
         CHECK_NEAR(scaled.total, 2.5 * e.total, 1e-12 * e.total);
     }
 
-    // Metal tets are zero, and a source is needed.
+    // Metal tets are zero, and an empty source means f = 0.
     const std::vector<MeshProperties::Material> materials{{"oxide", 3.9, 0, false, {}}, {"gate", 1, 0, true, 1.0}};
     const MeshProperties metal = cube_mesh(4, {0, 0, 0, 0, 0, 0}, {{BcType::Dirichlet, 0, {}}}, materials, 0.5);
     const auto u = interpolate(metal, [](const Vec3& p) { return std::sin(3 * p[0]) + p[1] * p[1]; });
@@ -413,7 +412,7 @@ void test_trajectory() {
     }
     CHECK(metal_zero);
     CHECK(oxide_positive);
-    CHECK_THROWS(std::invalid_argument, trajectory.estimate(metal, RefinementInput{u, {}, {}}), "needs the source f");
+    CHECK_NEAR(trajectory.estimate(metal, RefinementInput{u, {}, {}}).total, e.total, 1e-12 * e.total);
     for (double scale : {0.0, -1.0, std::nan("")})
         CHECK_THROWS(std::invalid_argument, TrajectoryEstimator({.scale = scale}), "TrajectoryEstimator::Settings::scale");
     CHECK_THROWS(std::invalid_argument, TrajectoryEstimator({.tet_degree = -1}), "TrajectoryEstimator::Settings::tet_degree");
@@ -553,6 +552,39 @@ void test_trajectory_two_tets() {
     CHECK_NEAR(trajectory.estimate(two_tets(10, true, true), input_for(u_moved)).eta[0], tagged, 1e-12 * tagged);
 }
 
+// An empty input.source means f = 0 and must match an explicit zero source (using the
+// closed-form -c u_h path when screened, and skipping the element integral when unscreened).
+void test_empty_source() {
+    const std::vector<Bc> bcs{{BcType::Dirichlet, 0, {}}, {BcType::Robin, 1.5, 2.0}, {BcType::Neumann, -0.5, {}}};
+    const std::vector<MeshProperties::Material> mats{{"screened", 2.5, 0.4, false, {}}, {"unscreened", 3.0, 0.0, false, {}}};
+    MeshProperties mesh = cube_mesh(3, {0, 1, 2, 2, 0, 1}, bcs, mats, 0.5);
+    const auto u = interpolate(mesh, [](const Vec3& p) { return p[0] * p[0] + 2 * p[1] * p[2] - 0.3 * p[2] + 0.7; });
+    const RefinementInput zero_fn = input_for(u);
+    const RefinementInput empty_fn{u, {}, {}};
+
+    const ResidualEstimator residual;
+    const TrajectoryEstimator trajectory;
+
+    for (const bool screened : {true, false}) {
+        mesh.screened = screened;
+        const ErrorEstimate res_fn = residual.estimate(mesh, zero_fn);
+        const ErrorEstimate res_empty = residual.estimate(mesh, empty_fn);
+        CHECK_NEAR(res_empty.total, res_fn.total, 1e-13 * res_fn.total);
+        CHECK_NEAR(res_empty.info.details.at("element_part"), res_fn.info.details.at("element_part"),
+                   screened ? 1e-13 * res_fn.info.details.at("element_part") : 1e-15);
+        if (!screened) CHECK(res_empty.info.details.at("element_part") == 0);
+        else CHECK(res_empty.info.details.at("element_part") > 0);
+        for (std::size_t k = 0; k < mesh.elements.size(); ++k)
+            CHECK_NEAR(res_empty.eta[k], res_fn.eta[k], 1e-13 * std::max(1.0, res_fn.eta[k]));
+
+        const ErrorEstimate traj_fn = trajectory.estimate(mesh, zero_fn);
+        const ErrorEstimate traj_empty = trajectory.estimate(mesh, empty_fn);
+        CHECK_NEAR(traj_empty.total, traj_fn.total, 1e-13 * traj_fn.total);
+        for (std::size_t k = 0; k < mesh.elements.size(); ++k)
+            CHECK_NEAR(traj_empty.eta[k], traj_fn.eta[k], 1e-13 * std::max(1.0, traj_fn.eta[k]));
+    }
+}
+
 int main() {
     test_linear_is_exact();
     test_natural_conditions();
@@ -565,6 +597,7 @@ int main() {
     test_point_sources();
     test_large_scale_and_many_materials();
     test_bad_input();
+    test_empty_source();
     test_trajectory();
     test_trajectory_one_bubble();
     test_trajectory_coupled_bubbles();

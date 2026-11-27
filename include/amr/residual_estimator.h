@@ -44,6 +44,5 @@ public:
 private:
     std::vector<double> indicators(const MeshProperties& mesh, const RefinementInput& input,
                                    std::span<const uint8_t> excluded, ErrorEstimate::Info& info) const override;
-    bool needs_source() const override { return true; }
     Settings settings_;
 };

@@ -43,6 +43,8 @@ struct BubbleIntegrals {
     std::array<std::array<double, 4>, 4> pair;       // lambda_a lambda_b over K
     Matrix6                              mass;       // phi_r phi_s over K
     std::array<Matrix6, 4>               face_mass;  // phi_r phi_s over face f
+    // lambda_m phi_e over K: [e][m]
+    std::array<std::array<double, 4>, 6> tet_linear;
     // lambda_m phi_e over face f: [f][e][m]
     std::array<std::array<std::array<double, 4>, 6>, 4> face_linear;
 };
@@ -59,6 +61,8 @@ const BubbleIntegrals& bubble_integrals() {
                 for (int f = 0; f < 4; ++f)
                     b.face_mass[f][r][s] = on_face(r, f) && on_face(s, f) ? 16 * moment(index, 2) : 0;
             }
+        for (int e = 0; e < 6; ++e)
+            for (int m = 0; m < 4; ++m) b.tet_linear[e][m] = 4 * moment(std::array{m, edges[e][0], edges[e][1]}, 3);
         for (int f = 0; f < 4; ++f)
             for (int e = 0; e < 6; ++e)
                 for (int m = 0; m < 4; ++m)
@@ -217,7 +221,7 @@ std::vector<double> TrajectoryEstimator::indicators(const MeshProperties& mesh, 
                                 "ordinary interior faces");
 
     // 2. Per tet: the element load and matrix, the 6x6 solve, and |integral of grad e_K|.
-    const auto load_rule = tet_rule(settings_.tet_degree);   // f is arbitrary
+    const std::vector<TetQuadraturePoint> load_rule = input.source ? tet_rule(settings_.tet_degree) : std::vector<TetQuadraturePoint>{};
     std::vector<double> eta(count, 0);
     for (uint32_t k = 0; k < count; ++k) {
         const Coefficients& c = coef(k);
@@ -263,18 +267,25 @@ std::vector<double> TrajectoryEstimator::indicators(const MeshProperties& mesh, 
         }
 
         Vector6 b = load[k];
-        for (const auto& q : load_rule) {
-            const Vec3 x = point_at(mesh, k, q.barycentric);
-            const double f = input.source(x, k);
-            if (!std::isfinite(f))
-                throw std::invalid_argument(who + ": the source is " + std::to_string(f) + " at (" +
-                                            std::to_string(x[0]) + ", " + std::to_string(x[1]) + ", " +
-                                            std::to_string(x[2]) + ") in tet " + std::to_string(k));
-            double u_h = 0;
-            for (int i = 0; i < 4; ++i) u_h += q.barycentric[i] * input.u[n[i]];
-            const double r = f - c.c * u_h;
-            for (int e = 0; e < 6; ++e)
-                b[e] += q.weight * geo.volume * r * 4 * q.barycentric[edges[e][0]] * q.barycentric[edges[e][1]];
+        if (input.source) {
+            for (const auto& q : load_rule) {
+                const Vec3 x = point_at(mesh, k, q.barycentric);
+                const double f = input.source(x, k);
+                if (!std::isfinite(f))
+                    throw std::invalid_argument(who + ": the source is " + std::to_string(f) + " at (" +
+                                                std::to_string(x[0]) + ", " + std::to_string(x[1]) + ", " +
+                                                std::to_string(x[2]) + ") in tet " + std::to_string(k));
+                double u_h = 0;
+                for (int i = 0; i < 4; ++i) u_h += q.barycentric[i] * input.u[n[i]];
+                const double r = f - c.c * u_h;
+                for (int e = 0; e < 6; ++e)
+                    b[e] += q.weight * geo.volume * r * 4 * q.barycentric[edges[e][0]] * q.barycentric[edges[e][1]];
+            }
+        } else if (c.c != 0) {
+            for (int m = 0; m < 4; ++m) {
+                const double cu = c.c * input.u[n[m]];
+                for (int e = 0; e < 6; ++e) b[e] -= cu * (geo.volume * bubble.tet_linear[e][m]);
+            }
         }
 
         const std::optional<Vector6> solved = solve(a, b, free);

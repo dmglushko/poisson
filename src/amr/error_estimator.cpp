@@ -61,8 +61,6 @@ ErrorEstimate ErrorEstimator::estimate(const MeshProperties& mesh, const Refinem
             throw std::invalid_argument(who + ": boundary condition " + std::to_string(c) +
                                         " has a negative Robin alpha");
     }
-    if (needs_source() && !input.source)
-        throw std::invalid_argument(who + ": needs the source f, but input.source is empty");
     for (std::size_t s = 0; s < input.point_sources.size(); ++s) {
         const auto& p = input.point_sources[s];
         if (!std::isfinite(p.value) || !std::isfinite(p.position[0]) || !std::isfinite(p.position[1]) ||

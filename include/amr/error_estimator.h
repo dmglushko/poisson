@@ -55,11 +55,11 @@ public:
     IndicatorSum indicator_sum() const { return sum_; }
 
     // The error indicators of the solution input.u of the problem on `mesh`. Throws
-    // std::invalid_argument for a bad input, naming it: u not one finite value per node; no
-    // source for an estimator that needs one; a point source that is not finite or names
-    // an element out of range; a tet with a volume that is not positive; a source value
-    // that is not finite; a negative Robin alpha. A metal tet (Material::is_metal) has eta_K = 0: u is one constant
-    // there.
+    // std::invalid_argument for a bad input, naming it: u not one finite value per node;
+    // a point source that is not finite or names an element out of range; a tet with a
+    // volume that is not positive; a source value that is not finite; a negative Robin
+    // alpha. An empty input.source means f = 0. A metal tet (Material::is_metal) has
+    // eta_K = 0: u is one constant there.
     ErrorEstimate estimate(const MeshProperties& mesh, const RefinementInput& input) const;
 
 protected:
@@ -72,8 +72,6 @@ private:
     // non-negative value per tet, and may add details and warnings to `info`.
     virtual std::vector<double> indicators(const MeshProperties& mesh, const RefinementInput& input,
                                            std::span<const uint8_t> excluded, ErrorEstimate::Info& info) const = 0;
-    // Whether indicators() calls input.source.
-    virtual bool needs_source() const = 0;
 
     PointSourceRule point_sources_;
     IndicatorSum    sum_;

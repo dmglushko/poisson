@@ -175,11 +175,12 @@ a prescribed voltage is a Dirichlet face for the local problem. The paper valida
 Every integral of a polynomial in the barycentric coordinates is computed in closed form,
 $\int_K \prod_i \lambda_i^{a_i} = 3!\,|K| \prod_i a_i! / (3 + \sum_i a_i)!$ (and $2!\,|F|\cdots$ on a
 face): the flux jumps and the Neumann/Robin residuals (constant and linear on a face), the
-recovery difference (linear on a tet), and the trajectory bubble matrix, Robin block and face
-loads. Only the integrals that contain the source `f` (an arbitrary function) use quadrature,
-from `include/common/quadrature.h` (see [src/common/architecture.md](../common/architecture.md);
-in `common/` because Assembly needs it too), with the degree set by the estimator's
-`tet_degree`.
+recovery difference (linear on a tet), the trajectory bubble matrix, Robin block and face
+loads, and the `-c u_h` element terms when `input.source` is empty (`f = 0`; unscreened tets
+skip the element integral altogether). Quadrature, from `include/common/quadrature.h` (see
+[src/common/architecture.md](../common/architecture.md); in `common/` because Assembly needs it
+too), is used only when a non-empty `source` function `f` is provided, with the degree set by
+the estimator's `tet_degree`.
 
 ## Marking
 

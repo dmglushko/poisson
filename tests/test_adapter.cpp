@@ -179,7 +179,6 @@ private:
                                    ErrorEstimate::Info&) const override {
         return std::vector<double>(mesh.elements.size(), value_);
     }
-    bool needs_source() const override { return false; }
     double value_;
 };
 
@@ -389,7 +388,6 @@ void test_linear_indicator_sum() {
             for (std::size_t k = 0; k < eta.size(); ++k) eta[k] = double(k + 1);
             return eta;
         }
-        bool needs_source() const override { return false; }
     };
     const MeshProperties mesh = cube_mesh(2);   // 48 tets
     const std::vector<double> u(mesh.nodes.size(), 0.0);

@@ -28,8 +28,8 @@ struct RefinementInput {
     // The smooth part f of the right-hand side at a point x (nm) inside `element`: the same
     // f that Assembly integrates, with the same units and sign. The estimator adds -c u_h
     // itself. The element is passed because f may depend on the material (with screening,
-    // f = rho_b - c w). Only estimators that use f call it (the residual estimator);
-    // the others accept an empty function.
+    // f = rho_b - c w). Leave empty when f is identically zero: estimators then skip
+    // quadrature and evaluate any -c u_h term in closed form.
     std::function<double(const std::array<double, 3>& x, uint32_t element)> source;
 
     // The charges still deposited as deltas. Empty once every charge is a smooth cloud.

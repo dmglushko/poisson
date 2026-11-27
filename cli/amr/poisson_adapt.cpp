@@ -317,7 +317,7 @@ int main(int argc, char** argv) {
         RefinementInput ref_input;
         ref_input.u = field.u;
         ref_input.point_sources = field.point_sources;
-        if (cfg.constant_source) {
+        if (cfg.constant_source && *cfg.constant_source != 0.0) {
             const double f_val = *cfg.constant_source;
             ref_input.source = [f_val](const std::array<double, 3>&, uint32_t) { return f_val; };
         }
