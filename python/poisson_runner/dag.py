@@ -4,7 +4,7 @@
 records each stage call that would execute as a task, with the tasks whose outputs it reads as
 parents. Chains of tasks where each one only feeds the next (same cpus and memory) are fused
 into one unit, run back to back in one job; without fusion each task is its own unit. Units are
-grouped into arrays by (stages, resources, split label, parent arrays), in planning order, which
+grouped into arrays by (stages, resources, split labels, parent arrays), in planning order, which
 is a topological order. `run_dag_task(...)` replays one unit's branch: every other stage call
 only looks up the cache (a miss becomes a placeholder, as in a dry run), the unit's own calls
 execute, and the replay stops after the last. See `architecture.md` ("DAG mode").
@@ -46,7 +46,7 @@ __all__ = [
     "run_dag_task",
 ]
 
-PLAN_FORMAT_VERSION = 2
+PLAN_FORMAT_VERSION = 3
 DEFAULT_RESOURCES: dict[str, Any] = {"cpus": 1, "time": "01:00:00", "mem_per_cpu": "3900M"}
 DEFAULT_MAX_ARRAY_SIZE = 1000
 DEFAULT_MAX_FUSED_TIME = "24:00:00"  # DelftBlue's limit for education accounts; research allows more
@@ -136,6 +136,20 @@ def parse_resources(text: str, *, where: str = "resources") -> dict[str, Any]:
     return normalize_resources(raw, where=where)
 
 
+def normalize_split_by(split_by: str | Sequence[str] | None) -> list[str]:
+    """`split_by` as a list of distinct `compare()` names (one name, or several)."""
+    if split_by is None:
+        return []
+    names = [split_by] if isinstance(split_by, str) else list(split_by)
+    out: list[str] = []
+    for name in names:
+        if not isinstance(name, str) or not name.strip():
+            raise ValueError(f"split_by: expected compare() names, got {split_by!r}")
+        if name.strip() not in out:
+            out.append(name.strip())
+    return out
+
+
 def parse_stage_resources(text: str) -> tuple[str, dict[str, Any]]:
     """Parse `"solve:cpus=8,time=02:00:00"` into `("solve", {...})`."""
     stage, sep, rest = text.partition(":")
@@ -159,10 +173,13 @@ class DagTask:
     mode: str = "use"
     repeats: int = 1
     warmup: int = 0
-    split: str | None = None
+    split: tuple[str | None, ...] | None = None  # one label per split name; None without split names
     unit: int = -1
     explicit: dict[str, Any] | None = None  # the call's own `resources=`, for conflict checks
     users: list[int] = field(default_factory=list)  # branches making this request
+    threads: int | None = None  # the request's env thread count (part of its request key)
+    threads_floor: bool = False  # some call of it used `threads=`, which raises a default cpus count
+    where: str = ""  # the call that gave `explicit` (or the first call), for error messages
 
 
 @dataclass
@@ -179,7 +196,7 @@ class DagUnit:
     stages: list[str]
     parents: list[int]
     resources: dict[str, Any]
-    split: str | None
+    split: tuple[str | None, ...] | None
     group: int = -1
 
 
@@ -189,7 +206,7 @@ class DagGroup:
     stage: str  # display label: the stage, or a bounded "a+b+c" label for fused chains
     stages: list[str]
     resources: dict[str, Any]
-    split: str | None
+    split: tuple[str | None, ...] | None
     parents: list[int]
     units: list[int]
 
@@ -201,7 +218,7 @@ class DagPlan:
     units: list[DagUnit]
     groups: list[DagGroup]
     selection: dict[str, list[str]]
-    split_by: str | None
+    split_by: list[str]
     cached_calls: int
     shared_calls: int
     fused: bool = True
@@ -237,7 +254,7 @@ class DagPlan:
                     "warmup": t.warmup,
                     "parents": t.parents,
                     "resources": t.resources,
-                    "split": t.split,
+                    "split": _split_json(t.split),
                     "unit": t.unit,
                 }
                 for t in self.tasks
@@ -251,7 +268,7 @@ class DagPlan:
                     "stages": u.stages,
                     "parents": u.parents,
                     "resources": u.resources,
-                    "split": u.split,
+                    "split": _split_json(u.split),
                     "group": u.group,
                 }
                 for u in self.units
@@ -262,7 +279,7 @@ class DagPlan:
                     "stage": g.stage,
                     "stages": g.stages,
                     "resources": g.resources,
-                    "split": g.split,
+                    "split": _split_json(g.split),
                     "parents": g.parents,
                     "units": g.units,
                 }
@@ -300,6 +317,10 @@ class DagPlan:
         ]
 
 
+def _split_json(split: tuple[str | None, ...] | None) -> list[str | None] | None:
+    return list(split) if split is not None else None
+
+
 def read_plan(path: str | os.PathLike[str]) -> dict[str, Any]:
     payload = json.loads(Path(path).read_text(encoding="utf-8"))
     if payload.get("format_version") != PLAN_FORMAT_VERSION:
@@ -313,7 +334,9 @@ def plan_dag(
     select: Mapping[str, str | Sequence[str]] | None = None,
     resources: Mapping[str, Any] | None = None,
     stage_resources: Mapping[str, Mapping[str, Any]] | None = None,
-    split_by: str | None = None,
+    stage_resource_overrides: Mapping[str, Mapping[str, Any]] | None = None,
+    split_by: str | Sequence[str] | None = None,
+    compare_splits: bool = True,
     max_array_size: int = DEFAULT_MAX_ARRAY_SIZE,
     fuse: bool = True,
     max_fused_time: str = DEFAULT_MAX_FUSED_TIME,
@@ -321,10 +344,15 @@ def plan_dag(
 ) -> DagPlan:
     """Plan the stage calls that still need to run as Slurm array groups.
 
-    `resources` are the defaults for every task, `stage_resources[stage]` override them per stage
-    and a call's own `run_stage(..., resources=...)` overrides both, key by key. `split_by` names a
-    `compare()` whose options get separate arrays even when their resources match, so e.g. the
-    coarse-mesh chain never waits for the fine one. With `fuse`, a chain of tasks where each one
+    Resources merge key by key; from weakest to strongest: `DEFAULT_RESOURCES`, `resources` (for
+    every task), `stage_resources[stage]`, a call's own `run_stage(..., resources=...)`, and
+    `stage_resource_overrides[stage]` (the command line's `--stage-resources`). A call's
+    `threads=N` then raises its cpus to at least N, unless the call's own resources or the
+    override set cpus, which must then be at least N; a raw env `*_NUM_THREADS` above the cpus is
+    refused. `split_by` names one or more `compare()`s whose options get separate arrays even
+    when their resources match, so e.g. the coarse-mesh chain never waits for the fine one; with
+    `compare_splits`, every `compare(..., split=True)` of the selected branches is added to them.
+    With `fuse`, a chain of tasks where each one
     is the only (non-redundant) reader of the one before, with the same cpus and memory, runs as
     one array element, saving a scheduler round per link; its time limit is the members' sum
     (each rounded up to a minute, as Slurm does), and a chain stops growing before it would pass
@@ -348,16 +376,50 @@ def plan_dag(
     per_stage = {
         name: normalize_resources(r, where=f"resources of stage {name!r}") for name, r in (stage_resources or {}).items()
     }
+    overrides = {
+        name: normalize_resources(r, where=f"resource overrides of stage {name!r}")
+        for name, r in (stage_resource_overrides or {}).items()
+    }
+    split_names = normalize_split_by(split_by)
     selection = _normalize_select(select)
+
+    def resolve(task: DagTask) -> dict[str, Any]:
+        """The task's resources by the precedence above, checked against its thread count; run
+        once every call of its request was seen, so the result doesn't depend on branch order."""
+        forced = overrides.get(task.stage, {})
+        explicit = task.explicit or {}
+        merged = {**defaults, **per_stage.get(task.stage, {}), **explicit, **forced}
+        threads = task.threads
+        if threads is not None and merged["cpus"] < threads:
+            pinned = "cpus" in forced or "cpus" in explicit
+            if task.threads_floor and not pinned:
+                merged["cpus"] = threads
+            else:
+                source = ("--stage-resources" if "cpus" in forced else "its resources=" if pinned
+                          else "the default resources")
+                raise ValueError(
+                    f"{task.where} asks for {threads} threads but gets cpus={merged['cpus']} from {source}; "
+                    "give it at least as many cpus as threads"
+                )
+        return merged
+
     config = _make_config(dry_run=True, **run_options)
     takes_ctx = len(inspect.signature(pipeline_fn).parameters) > 0
 
     with _sigterm_as_exit():
         all_paths = _discover_branch_paths(pipeline_fn, takes_ctx=takes_ctx, config=config)
         selected = _select_paths(list(enumerate(all_paths)), selection)
-        if split_by is not None and not any(s.name == split_by for _, p in selected for s in p):
-            names = sorted({s.name for _, p in selected for s in p})
-            raise ValueError(f"split_by: no compare() named {split_by!r} (choices: {', '.join(names) or 'none'})")
+        seen = {s.name for p in all_paths for s in p}  # a --select may leave a name out: then no label
+        for name in split_names:
+            if name not in seen:
+                raise ValueError(
+                    f"split_by: no compare() named {name!r} (choices: {', '.join(sorted(seen)) or 'none'})"
+                )
+        if compare_splits:
+            for _, p in selected:
+                for s in p:
+                    if s.split and s.name not in split_names:
+                        split_names.append(s.name)
 
         state = _ExperimentState()
         tasks: list[DagTask] = []
@@ -388,14 +450,19 @@ def plan_dag(
                         shared += 1
                         task = tasks[task_of[call.request_key]]
                         steps_in.setdefault(index, {}).setdefault(task.id, call.step)
-                        if explicit is not None and task.explicit is not None and explicit != task.explicit:
+                        forced = overrides.get(task.stage, {})
+                        if explicit is not None and task.explicit is not None and any(
+                            explicit.get(k) != task.explicit.get(k)
+                            for k in set(explicit) | set(task.explicit) if k not in forced
+                        ):
                             raise ValueError(
                                 f"{where} asks for resources {explicit} but the same request in branch "
-                                f"{task.branch} asks for {task.explicit}; give both calls the same resources"
+                                f"{task.branch} asks for {task.explicit}; give both calls the same resources "
+                                "(or set the differing ones with --stage-resources)"
                             )
                         if task.explicit is None and explicit is not None:
-                            task.explicit = explicit
-                            task.resources = {**defaults, **per_stage.get(task.stage, {}), **explicit}
+                            task.explicit, task.where = explicit, where
+                        task.threads_floor = task.threads_floor or call.threads_floor
                         if index not in task.users:
                             task.users.append(index)
                         continue
@@ -421,19 +488,28 @@ def plan_dag(
                         repeats=call.repeats,
                         warmup=call.warmup,
                         parents=[task_of[k] for k in call.parents],
-                        resources={**defaults, **per_stage.get(call.stage, {}), **(explicit or {})},
+                        resources={},
                         explicit=explicit,
                         users=[index],
+                        threads=call.threads,
+                        threads_floor=call.threads_floor,
+                        where=where,
                     )
                     task_of[call.request_key] = task.id
                     tasks.append(task)
                     steps_in.setdefault(index, {}).setdefault(task.id, call.step)
 
+    for task in tasks:
+        task.resources = resolve(task)
+
     paths = dict(selected)
-    if split_by is not None:
+    if split_names:
         for task in tasks:
-            labels = {next((s.label for s in paths[b] if s.name == split_by), None) for b in task.users}
-            task.split = labels.pop() if len(labels) == 1 else None
+            split: list[str | None] = []
+            for name in split_names:
+                labels = {next((s.label for s in paths[b] if s.name == name), None) for b in task.users}
+                split.append(labels.pop() if len(labels) == 1 else None)
+            task.split = tuple(split)
 
     units = _fuse_chains(tasks, steps_in, max_seconds=fused_limit) if fuse else [
         _make_unit(i, [t], t.branch, [t.step]) for i, t in enumerate(tasks)
@@ -475,7 +551,7 @@ def plan_dag(
         units=units,
         groups=groups,
         selection=selection,
-        split_by=split_by,
+        split_by=split_names,
         cached_calls=cached,
         shared_calls=shared,
         fused=fuse,
@@ -622,6 +698,8 @@ def run_dag_task(
     missing, or a stage of the chain failed and the pipeline carried on without it.
     """
     payload = read_plan(plan) if not isinstance(plan, Mapping) else plan
+    if payload.get("format_version") != PLAN_FORMAT_VERSION:
+        raise ValueError(f"not a DAG plan of format version {PLAN_FORMAT_VERSION}")
     groups = payload["groups"]
     if not (0 <= group < len(groups)):
         raise ValueError(f"DAG plan has {len(groups)} arrays; there is no array {group}")

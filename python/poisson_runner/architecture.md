@@ -137,7 +137,14 @@ SLURM shard is a separate process and keeps its own record.
 - **Per-stage environment (`env=`):** `run.run_stage(..., env={"OMP_NUM_THREADS": "8"})` passes
   environment overrides to the child process and includes non-empty `env` in `request_key` so
   thread-scaling sweeps cache separate timings while still deduplicating identical output `.h5`
-  bytes in `objects/`.
+  bytes in `objects/`. `threads=N` is the short form: it sets `OMP_NUM_THREADS`,
+  `OPENBLAS_NUM_THREADS` and `MKL_NUM_THREADS` to N (an `env` value for one of them that differs
+  is refused). Without either, a stage inherits the job's thread count (`job.sbatch` sets it to the
+  allocation) and its cache entry is reused whatever that count was. Thread counts must be
+  positive integers (`OMP_NUM_THREADS` may list nested levels, `4,2`, and counts as its first).
+  A call whose own `resources=` gives fewer `cpus` than its env's thread count is refused in
+  every mode, and a run whose effective thread count (set or inherited, from the executor's host
+  metadata) exceeds its usable CPUs stores an oversubscription warning with the cache entry.
 - **SLURM Job Array sharding (`shard=`):** `run_experiment(..., shard=(index, total))` or
   `shard="slurm"` (reads `SLURM_ARRAY_TASK_ID` / `SLURM_ARRAY_TASK_COUNT`, falling back to
   no sharding outside an array job) discovers the full `compare(...)` tree under a short-lived
@@ -174,6 +181,16 @@ SLURM shard is a separate process and keeps its own record.
   without `--shard` it uses `shard="slurm"`. Exit code 1 means a branch failed, so a SLURM
   `afterok` dependency keeps the collect job from starting. `scripts/delftblue/` wraps this for
   DelftBlue.
+- **Execution defaults in the script:** `experiment_main(pipeline, mode=, resources=,
+  stage_resources=, split_by=, fuse=, max_fused_time=, max_array_size=, shard_order=)` sets the
+  script's defaults, validated before anything runs; a command-line flag wins over each
+  (`--resources` and `--stage-resources` key by key, `--split-by` replaces `split_by=` and
+  `compare(..., split=True)`, `--no-split` clears both, `--fuse`/`--no-fuse`). `mode`
+  (`"shard"` or `"dag"`) only tells `submit.sh` how to submit; a plain `python3 sweep.py`
+  always runs every branch. Shard pieces use only `resources`. `--show-settings [--resources ...]
+  [--shard-order ...]` prints `setting mode=|cpus=|time=|mem_per_cpu=|shard_order=` lines with
+  the flags applied, without creating a cache or running the pipeline, so `submit.sh` keeps no
+  copy of these defaults.
 - **Stage registration:** `Stage.from_cli(...)` declaratively maps input flags, flat setting
   flags, and/or `--config <settings.json>` (for deeply nested configs like AMR) with minimal
   boilerplate.
@@ -219,14 +236,25 @@ array starts once the arrays it reads from have finished. Shards remain the defa
   rebuilt binary, an edited experiment or input file, and nodes linking different shared
   libraries. The task also stores its effective cache mode, repeats and warmup, which the task
   run uses whatever options it is given.
-- **Resources:** `DEFAULT_RESOURCES` < `stage_resources[stage]` < the call's own
-  `run_stage(..., resources=)`, merged key by key (`cpus`, `time`, `mem_per_cpu`). Resources
-  stay out of the request key. Two calls of one request asking for different explicit resources
-  are refused.
+- **Resources:** merged key by key (`cpus`, `time`, `mem_per_cpu`), weakest first:
+  `DEFAULT_RESOURCES` < `resources` (the script's, with `--resources` over it) <
+  `stage_resources[stage]` (the script's) < the call's own `run_stage(..., resources=)` <
+  `stage_resource_overrides[stage]` (`--stage-resources`). So within Python the more specific
+  setting wins, and the command line wins over the Python setting it overrides. A call's
+  `threads=N` then raises its `cpus` to at least N, unless the call's own resources or the
+  override set `cpus`, which must then be at least N (so a fixed `stage_resources` allocation
+  stays for a thread-scaling sweep); a raw env `*_NUM_THREADS` above the resolved `cpus` is
+  refused. A task's resources are resolved once all calls of its request were seen (the first
+  explicit `resources=`, and the floor if any call used `threads=`), so they don't depend on
+  branch order. Resources stay out of the request key. Two calls of one request asking for
+  different explicit resources are refused, except for keys `--stage-resources` sets.
 - **Grouping:** tasks go to arrays, in planning order (a topological order), keyed by
-  `(stage, resources, split label, parent arrays)`. Different resources already separate the
-  chains below them. `split_by=NAME` additionally separates the options of one `compare()`,
-  giving each task the label all its branches agree on (a shared prefix gets none). Arrays
+  `(stage, resources, split labels, parent arrays)`. Different resources already separate the
+  chains below them. `split_by` (one or more names) additionally separates the options of those
+  `compare()`s (each must exist on some branch, selected or not), and with `compare_splits` (the
+  default) so does every `compare(..., split=True)` of the selected branches. A task's split is a tuple with, per name, the label all its branches
+  agree on (`None` where they differ, e.g. a shared prefix). The `split` flag lives on the
+  recorded choice step, outside its equality, so replays are checked as before. Arrays
   above `max_array_size` (default 1000) are split before their children are grouped. Arrays
   depend on whole parent arrays (`afterok`), so a task can wait for siblings of its parent.
 - **Chain fusion (default; `fuse=False`, `--no-fuse` to turn off):** every array costs a
@@ -264,7 +292,7 @@ array starts once the arrays it reads from have finished. Shards remain the defa
   Slurm jobs, so an output evicted between two arrays fails the later task: run DAG sweeps
   with `max_bytes=None` or a cache larger than the sweep. Rerunning a failed sweep means
   planning it again: only uncached tasks are submitted.
-- **Plan file:** JSON with `format_version` (2), `selection`, `split_by`, `fused`, the choice
+- **Plan file:** JSON with `format_version` (3), `selection`, `split_by` (a list), `fused`, the choice
   paths of the branches that run a unit, `tasks` (id, branch, step, stage, check, parents,
   resources, split, unit), `units` (id, branch, tasks, steps, stages, parents, resources,
   split, group) and `groups` (id, stage label, stages, resources, split, parents, units). `--dag-plan`

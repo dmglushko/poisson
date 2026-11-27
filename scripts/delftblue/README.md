@@ -74,6 +74,28 @@ Logs go to `logs/<name>/`, one file per job. The collect job saves the run (`rep
 has succeeded. It also refuses to save if any result is missing from the cache, instead of quietly
 recomputing everything in one job.
 
+### Settings in the script
+
+The script can keep the options it always needs, so `submit.sh` needs no flags for them:
+
+```python
+raise SystemExit(experiment_main(
+    pipeline,
+    mode="dag",                                        # or "shard" (the default)
+    resources={"cpus": 1, "time": "00:30:00"},         # every task, and every piece in shard mode
+    stage_resources={"solve": {"cpus": 16, "time": "04:00:00"}},  # DAG tasks of one stage
+    split_by="mesh",                                   # or compare("mesh", [...], split=True)
+    shard_order="block",
+))
+```
+
+An option given to `submit.sh` wins over the script's: `--cpus`, `--time` and `--mem-per-cpu`
+key by key, `--stage-resources` even over a `run_stage(..., resources=)` in the pipeline,
+`--split-by` replaces the script's splits and `--no-split` drops them, `--dag` / `--shards`
+choose the mode. Anything set nowhere gets the built-in default (`1` CPU, `01:00:00`, `3900M`,
+pieces, `stride`). `python3 sweep.py --show-settings` prints what the script resolves to. The
+collect job always uses 1 CPU, 30 minutes and `3900M` (or `--mem-per-cpu` when given).
+
 ### Choosing branches and how they are split
 
 `--select NAME=LABEL` submits only the branches whose `compare(NAME)` chose `LABEL`, for example
@@ -86,6 +108,9 @@ b=$(bash scripts/delftblue/submit.sh experiments/sweep.py --select mesh=fine --c
       --no-collect --print-id)
 bash scripts/delftblue/submit.sh experiments/sweep.py --collect-only --after "$a,$b"
 ```
+
+With `--dag`, `--print-id` prints nothing when everything is cached already; `--after` skips
+such empty ids (if both are empty, nothing was submitted: run `--collect-only` without `--after`).
 
 With fewer pieces than branches, `--shard-order` decides which branches share a piece. `stride`
 (the default) deals them out round-robin, which evens out the work when, say, all fine-mesh
@@ -104,11 +129,15 @@ bash scripts/delftblue/submit.sh experiments/sweep.py --dag --time 00:30:00 \
     --stage-resources solve:cpus=16,time=04:00:00 --split-by mesh
 ```
 
-- `--cpus`, `--time` and `--mem-per-cpu` are the defaults for every task, `--stage-resources`
-  overrides them for one stage, and an experiment can pass `resources={"cpus": 16, "time": "04:00:00"}`
-  to a `run_stage` call to override both (for example only for fine meshes).
+- `--cpus`, `--time` and `--mem-per-cpu` are the defaults for every task, the script's
+  `stage_resources` override them for one stage, an experiment can pass
+  `resources={"cpus": 16, "time": "04:00:00"}` to a `run_stage` call to override both (for
+  example only for fine meshes), and `--stage-resources` overrides all of these for one stage,
+  key by key: `--stage-resources solve:time=06:00:00` gives every solve 6 hours and keeps each
+  call's cpus.
 - Arrays wait for whole parent arrays. Runs with different resources get separate arrays anyway,
-  and `--split-by NAME` also separates the options of one `compare()`.
+  and `--split-by NAME` (repeatable), `split_by=` or `compare(NAME, [...], split=True)` also
+  separate the options of a `compare()`.
 - Each array waits in the queue on its own: on DelftBlue, 1-31 s passed between an array
   finishing and the next one starting. To save those rounds, a chain of stage runs where each
   one only feeds the next (and needs the same cpus and memory) runs back to back in one task,
@@ -135,6 +164,9 @@ bash scripts/delftblue/submit.sh experiments/sweep.py --dag --time 00:30:00 \
   srun -p compute-p1 -n1 -c1 -t 00:10:00 bash scripts/delftblue/submit.sh experiments/sweep.py --dag
   ```
 
+  `submit.sh` warns when it plans a DAG outside a Slurm job, which matters most when the mode
+  comes from the script's `mode="dag"`.
+
 ### When a piece fails
 
 The collect job then stays queued with reason `DependencyNeverSatisfied`. Read the piece's log,
@@ -145,6 +177,9 @@ scancel <collect job id>
 bash scripts/delftblue/submit.sh experiments/sweep.py --pieces 16 --only 3,7 --time 04:00:00
 ```
 
+(Add `--shards` if the script sets `mode="dag"`; the command `submit.sh` prints after submitting
+already has it.)
+
 The other pieces' results are reused from the cache, and a new collect job is queued.
 
 ## Good to know
@@ -153,7 +188,11 @@ The other pieces' results are reused from the cache, and a new collect job is qu
   The saved report's CSV files are permanent, but the `.h5` result files they refer to stay in the
   cache and disappear when `/scratch` is cleaned
   ([#4](https://github.com/dmglushko/poisson/issues/4)).
-- **Threads.** Each job sets `OMP_NUM_THREADS` (and the BLAS equivalents) to its `--cpus`.
+- **Threads.** Each job sets `OMP_NUM_THREADS` (and the BLAS equivalents) to its `--cpus`. A
+  stage run that way is cached whatever its CPU count, so a later run with other resources
+  reuses it. `run_stage(..., threads=N)` instead sets the thread count for that stage and makes
+  it part of the cache key (one entry per thread count, for scaling studies); in DAG mode it also
+  gives the task at least N CPUs. A run with more threads than CPUs gets a warning in the report.
 - **Locking.** `env.sh` sets `POISSON_CACHE_LOCK_MODE=lockfile`, which works across nodes, and
   turns off HDF5's own file locking. The runner also picks `lockfile` by itself inside any Slurm
   job.

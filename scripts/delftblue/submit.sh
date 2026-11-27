@@ -3,14 +3,21 @@
 #
 #   bash scripts/delftblue/submit.sh EXPERIMENT.py [options] [-- extra sbatch options]
 #
+# The experiment's own defaults (experiment_main(pipeline, mode=..., resources=..., shard_order=...,
+# stage_resources=..., split_by=...)) apply unless an option below overrides them; "script" in
+# brackets means that default, with the built-in value after "else".
+#
 # Options (defaults in brackets):
 #   --pieces N          number of parallel pieces [one per branch, from `EXPERIMENT.py --count`]
 #   --shard-order O     how branches are dealt to pieces: stride (every N-th) or block
-#                       (contiguous runs, so branches sharing early steps stay together) [stride]
+#                       (contiguous runs, so branches sharing early steps stay together)
+#                       [script, else stride]
 #   --select NAME=LABEL only branches whose compare(NAME) chose LABEL; repeatable [all branches]
-#   --cpus C            CPUs per piece [1]
-#   --mem-per-cpu M     memory per CPU [3900M] (compute-p1 max is 3996M)
-#   --time T            time limit per piece, e.g. 02:00:00 [01:00:00]
+#   --cpus C            CPUs per piece [script, else 1]
+#   --mem-per-cpu M     memory per CPU [script, else 3900M] (compute-p1 max is 3996M); the
+#                       collect job uses it only when given here [3900M]
+#   --time T            time limit per piece, e.g. 02:00:00 [script, else 01:00:00]
+#   --shards            run as pieces even if the script sets mode="dag"
 #   --partition P       Slurm partition [compute-p1]
 #   --account A         Slurm account [POISSON_SLURM_ACCOUNT from env.sh, or Slurm default]
 #   --warmup            first run the first (selected) branch alone, so shared early steps run once
@@ -25,21 +32,24 @@
 #   --print-id          print only the main job id on stdout (for scripting; messages go to stderr);
 #                       with --dag --no-collect, the comma-separated ids of the last arrays
 #
-# DAG mode (opt-in): every stage run that isn't cached yet becomes a Slurm array task, and
-# each array starts when the arrays it reads from have finished. --cpus/--time/--mem-per-cpu
-# are the defaults for every task.
+# DAG mode (opt-in with --dag or the script's mode="dag"): every stage run that isn't cached yet
+# becomes a Slurm array task, and each array starts when the arrays it reads from have finished.
+# --cpus/--time/--mem-per-cpu are the defaults for every task.
 #   --dag                    plan here, then submit one array per group of tasks (on DelftBlue,
 #                            run this on a compute node: see README "DAG mode")
 #   --stage-resources S:K=V  resources for stage S's tasks, e.g. solve:cpus=8,time=02:00:00
-#                            (repeatable; a pipeline's run_stage(..., resources=) wins)
+#                            (repeatable; wins over the script's stage_resources= and its
+#                            run_stage(..., resources=), key by key)
 #   --split-by NAME          separate arrays per option of compare(NAME), so e.g. coarse never
-#                            waits for fine even with the same resources
-#   --max-array-size N       split arrays larger than this [1000]
-#   --no-fuse                one task per stage call; by default a chain of calls where each
-#                            one only feeds the next (same cpus and memory) runs back to back
-#                            in one task, with the sum of their time limits
-#   --max-fused-time T       don't fuse a chain past this summed time [24:00:00, the education
-#                            account limit; research accounts may set more, e.g. 5-00:00:00]
+#                            waits for fine even with the same resources (repeatable; replaces
+#                            the script's split_by= and compare(..., split=True))
+#   --no-split               ignore the script's split_by= and compare(..., split=True)
+#   --max-array-size N       split arrays larger than this [script, else 1000]
+#   --no-fuse / --fuse       one task per stage call, or fuse; by default a chain of calls where
+#                            each one only feeds the next (same cpus and memory) runs back to back
+#                            in one task, with the sum of their time limits [script, else fuse]
+#   --max-fused-time T       don't fuse a chain past this summed time [script, else 24:00:00, the
+#                            education account limit; research accounts may set more, e.g. 5-00:00:00]
 #   Rerunning the same --dag command after a failure plans and submits only what's still missing.
 #
 # Examples:
@@ -60,14 +70,15 @@ experiment="$1"; shift
 [[ -f "${experiment}" ]] || { echo "submit.sh: no such file: ${experiment}" >&2; exit 1; }
 experiment="$(cd "$(dirname "${experiment}")" && pwd)/$(basename "${experiment}")"
 
-pieces="" cpus=1 mem_per_cpu=3900M time_limit=01:00:00 partition=compute-p1 account="" warmup=0
-only="" out="" name="" print_only=0 extra=() warmup_id= shard_order=stride selects=()
-collect=1 collect_only=0 after="" print_id=0 shard_order_set=0
-dag=0 stage_resources=() split_by=() max_array_size=() no_fuse=() max_fused_time=()
+# cpus, mem_per_cpu, time_limit and shard_order stay empty unless given: the script resolves them.
+pieces="" cpus="" mem_per_cpu="" time_limit="" partition=compute-p1 account="" warmup=0
+only="" out="" name="" print_only=0 extra=() warmup_id= shard_order="" selects=()
+collect=1 collect_only=0 after="" print_id=0 cli_mode="" no_split=0
+stage_resources=() split_by=() max_array_size=() fuse=() max_fused_time=()
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --pieces) require_arg "$@"; pieces="$2"; shift 2 ;;
-        --shard-order) require_arg "$@"; shard_order="$2"; shard_order_set=1; shift 2 ;;
+        --shard-order) require_arg "$@"; shard_order="$2"; shift 2 ;;
         --select) require_arg "$@"; selects+=(--select "$2"); shift 2 ;;
         --cpus) require_arg "$@"; cpus="$2"; shift 2 ;;
         --mem-per-cpu) require_arg "$@"; mem_per_cpu="$2"; shift 2 ;;
@@ -83,11 +94,21 @@ while [[ $# -gt 0 ]]; do
         --name) require_arg "$@"; name="$2"; shift 2 ;;
         --print-only) print_only=1; shift ;;
         --print-id) print_id=1; shift ;;
-        --dag) dag=1; shift ;;
+        --dag|--shards)
+            mode="${1#--}"; mode="${mode%s}"  # dag or shard
+            if [[ -n "${cli_mode}" && "${cli_mode}" != "${mode}" ]]; then
+                echo "submit.sh: --dag and --shards exclude each other" >&2; exit 1
+            fi
+            cli_mode="${mode}"; shift ;;
         --stage-resources) require_arg "$@"; stage_resources+=(--stage-resources "$2"); shift 2 ;;
-        --split-by) require_arg "$@"; split_by=(--split-by "$2"); shift 2 ;;
+        --split-by) require_arg "$@"; split_by+=(--split-by "$2"); shift 2 ;;
+        --no-split) no_split=1; shift ;;
         --max-array-size) require_arg "$@"; max_array_size=(--max-array-size "$2"); shift 2 ;;
-        --no-fuse) no_fuse=(--no-fuse); shift ;;
+        --no-fuse|--fuse)
+            if (( ${#fuse[@]} )) && [[ "${fuse[0]}" != "$1" ]]; then
+                echo "submit.sh: --fuse and --no-fuse exclude each other" >&2; exit 1
+            fi
+            fuse=("$1"); shift ;;
         --max-fused-time) require_arg "$@"; max_fused_time=(--max-fused-time "$2"); shift 2 ;;
         -h|--help) usage 0 ;;
         --) shift; extra=("$@"); break ;;
@@ -105,20 +126,18 @@ for opt in "${extra[@]}"; do
 done
 
 case "${shard_order}" in
-    stride|block) ;;
+    ""|stride|block) ;;
     *) echo "submit.sh: --shard-order must be stride or block, got '${shard_order}'" >&2; exit 1 ;;
 esac
-if (( collect_only )) && { (( ! collect )) || (( warmup )) || [[ -n "${only}${pieces}" ]] || (( ${#selects[@]} )); }; then
-    echo "submit.sh: --collect-only takes no --no-collect, --warmup, --only, --pieces or --select" >&2
-    exit 1
+if (( no_split )); then
+    if (( ${#split_by[@]} )); then echo "submit.sh: --split-by and --no-split exclude each other" >&2; exit 1; fi
+    split_by=(--no-split)
 fi
-if (( dag )) && { (( warmup )) || (( collect_only )) || (( shard_order_set )) || [[ -n "${only}${pieces}" ]]; }; then
-    echo "submit.sh: --dag takes no --warmup, --pieces, --only, --shard-order or --collect-only" >&2
-    exit 1
-fi
-if (( ! dag )) && { (( ${#stage_resources[@]} )) || (( ${#split_by[@]} )) || (( ${#max_array_size[@]} )) \
-    || (( ${#no_fuse[@]} )) || (( ${#max_fused_time[@]} )); }; then
-    echo "submit.sh: --stage-resources, --split-by, --max-array-size, --no-fuse and --max-fused-time need --dag" >&2
+dag_options=$(( ${#stage_resources[@]} + ${#split_by[@]} + ${#max_array_size[@]} + ${#fuse[@]} + ${#max_fused_time[@]} ))
+if (( collect_only )) && { (( ! collect )) || (( warmup )) || [[ -n "${only}${pieces}${cli_mode}${shard_order}" ]] \
+    || (( ${#selects[@]} )) || (( dag_options )); }; then
+    echo "submit.sh: --collect-only takes no --no-collect, --warmup, --only, --pieces, --select, --dag, --shards," \
+        "--shard-order or DAG options" >&2
     exit 1
 fi
 if [[ -n "${after}" ]] && (( ! collect_only )); then
@@ -127,11 +146,14 @@ if [[ -n "${after}" ]] && (( ! collect_only )); then
 fi
 after_ids=()
 if [[ -n "${after}" ]]; then
-    if [[ ! "${after}" =~ ^[0-9]+([,:][0-9]+)*$ ]]; then
+    # Empty items are skipped, so "$a,$b" works when one submission was all cached (empty --print-id).
+    if [[ ! "${after}" =~ ^[,:]*[0-9]+([,:]+[0-9]+)*[,:]*$ ]]; then
         echo "submit.sh: --after needs job ids like 4101,4102, got '${after}'" >&2
         exit 1
     fi
-    IFS=',:' read -r -a after_ids <<<"${after}"
+    IFS=',:' read -r -a parts <<<"${after}"
+    for id in "${parts[@]}"; do [[ -n "${id}" ]] && after_ids+=("${id}"); done
+    after="$(IFS=,; echo "${after_ids[*]}")"
 fi
 
 source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/env.sh"
@@ -141,6 +163,19 @@ name="${name:-$(basename "${experiment}" .py)}"
 if [[ -n "${only}" && -z "${pieces}" ]]; then
     echo "submit.sh: --only needs --pieces with the same number as the original submission" >&2
     exit 1
+fi
+if [[ -n "${only}" ]]; then
+    if [[ ! "${only}" =~ ^[0-9]{1,9}(-[0-9]{1,9})?(,[0-9]{1,9}(-[0-9]{1,9})?)*$ ]]; then
+        echo "submit.sh: --only needs piece numbers like 5 or 3,7-9, got '${only}'" >&2
+        exit 1
+    fi
+    IFS=',' read -r -a only_items <<<"${only}"
+    for item in "${only_items[@]}"; do
+        if [[ "${item}" == *-* ]] && (( 10#${item%-*} > 10#${item#*-} )); then
+            echo "submit.sh: --only ${only}: range ${item} runs backwards" >&2
+            exit 1
+        fi
+    done
 fi
 
 logs="${POISSON_REPO}/logs/${name}"
@@ -175,12 +210,12 @@ submit_collect() {  # submit_collect DEPENDENCY_IDS... ; prints the collect job 
     local dep=()
     if (( $# )); then dep=(--dependency="afterok:$(IFS=:; echo "$*")"); fi
     submit collect "${common[@]}" --job-name="${name}-collect" "${dep[@]}" \
-        --cpus-per-task=1 --mem-per-cpu="${mem_per_cpu}" --time=00:30:00 --output="${logs}/collect_%j.out" \
+        --cpus-per-task=1 --mem-per-cpu="${mem_per_cpu:-3900M}" --time=00:30:00 --output="${logs}/collect_%j.out" \
         "${extra[@]}" "${job}" --repo "${POISSON_REPO}" "${experiment}" --collect --out "${out}" --overwrite \
         "${selects[@]}"
 }
 
-if (( collect_only )); then
+if (( collect_only )); then  # needs nothing from the script, whatever its mode
     out="${out:-${POISSON_REPO}/results/${name}/collect_$(date +%Y%m%d_%H%M%S)}"
     collect_id="$(submit_collect "${after_ids[@]}")"
     if (( print_id )); then echo "${collect_id}"; exit 0; fi
@@ -189,12 +224,49 @@ if (( collect_only )); then
     exit 0
 fi
 
-if (( dag )); then
+# The resources given here, for the script to merge over its own; empty when none were given.
+given=()
+[[ -n "${cpus}" ]] && given+=("cpus=${cpus}")
+[[ -n "${time_limit}" ]] && given+=("time=${time_limit}")
+[[ -n "${mem_per_cpu}" ]] && given+=("mem-per-cpu=${mem_per_cpu}")
+resources=()
+if (( ${#given[@]} )); then resources=(--resources "$(IFS=,; echo "${given[*]}")"); fi
+order=()
+if [[ -n "${shard_order}" ]]; then order=(--shard-order "${shard_order}"); fi
+
+# The script decides its mode and fills in what wasn't given, so nothing here repeats its defaults.
+settings="$(cd "${POISSON_REPO}" && python3 "${experiment}" --show-settings "${resources[@]}" "${order[@]}")" || {
+    echo "submit.sh: '${experiment} --show-settings' failed (does the script call experiment_main?)" >&2
+    exit 1
+}
+setting() { sed -n "s/^setting $1=//p" <<<"${settings}" | tail -n 1; }
+mode="${cli_mode:-$(setting mode)}"
+case "${mode}" in
+    shard|dag) ;;
+    *) echo "submit.sh: could not read the experiment's mode from --show-settings" >&2; exit 1 ;;
+esac
+
+if [[ "${mode}" == dag ]] && { (( warmup )) || [[ -n "${only}${pieces}${shard_order}" ]]; }; then
+    echo "submit.sh: DAG mode (--dag, or the script's mode=\"dag\") takes no --warmup, --pieces, --only or" \
+        "--shard-order; pass --shards to run it as pieces" >&2
+    exit 1
+fi
+if [[ "${mode}" == shard ]] && (( dag_options )); then
+    echo "submit.sh: --stage-resources, --split-by, --no-split, --max-array-size, --fuse, --no-fuse and" \
+        "--max-fused-time need DAG mode (--dag, or mode=\"dag\" in the script)" >&2
+    exit 1
+fi
+
+if [[ "${mode}" == dag ]]; then
+    if [[ -z "${SLURM_JOB_ID:-}" ]] && command -v srun >/dev/null 2>&1; then
+        echo "submit.sh: warning: planning a DAG outside a Slurm job. On DelftBlue a plan made on a login node" \
+            "makes every task refuse with \"Plan mismatch\"; plan on a compute node instead:" \
+            "srun -p compute-p1 -n1 -c1 -t 00:10:00 bash scripts/delftblue/submit.sh ... (README \"DAG mode\")" >&2
+    fi
     plan="${logs}/plan_$(date +%Y%m%d_%H%M%S)_$$.json"
     say "Planning ${experiment} ..."
-    plan_output="$(cd "${POISSON_REPO}" && python3 "${experiment}" --dag-plan "${plan}" \
-        --resources "cpus=${cpus},time=${time_limit},mem-per-cpu=${mem_per_cpu}" \
-        "${stage_resources[@]}" "${split_by[@]}" "${max_array_size[@]}" "${no_fuse[@]}" "${max_fused_time[@]}" "${selects[@]}")" || {
+    plan_output="$(cd "${POISSON_REPO}" && python3 "${experiment}" --dag-plan "${plan}" "${resources[@]}" \
+        "${stage_resources[@]}" "${split_by[@]}" "${max_array_size[@]}" "${fuse[@]}" "${max_fused_time[@]}" "${selects[@]}")" || {
         echo "submit.sh: '${experiment} --dag-plan' failed; fix the experiment before submitting" >&2
         exit 1
     }
@@ -251,6 +323,12 @@ EOF
     exit 0
 fi
 
+cpus="$(setting cpus)" time_limit="$(setting time)" piece_mem="$(setting mem_per_cpu)" shard_order="$(setting shard_order)"
+if [[ -z "${cpus}" || -z "${time_limit}" || -z "${piece_mem}" || -z "${shard_order}" ]]; then
+    echo "submit.sh: could not read the experiment's resources from --show-settings" >&2
+    exit 1
+fi
+
 # Dry run on the login node: catches errors in the script before anything waits in the queue.
 say "Checking ${experiment} ..."
 count_output="$(cd "${POISSON_REPO}" && python3 "${experiment}" --count "${selects[@]}")" || {
@@ -263,14 +341,27 @@ branches="$(sed -n 's/^branches: \([0-9][0-9]*\)$/\1/p' <<<"${count_output}" | t
 pieces="${pieces:-${branches}}"
 if (( pieces < 1 )); then echo "submit.sh: nothing to run (0 branches)" >&2; exit 1; fi
 if (( pieces > branches )); then
+    if [[ -n "${only}" ]]; then  # shrinking would deal the branches to the pieces differently
+        echo "submit.sh: --pieces ${pieces} is more than the ${branches} branches; rerun with the piece count" \
+            "of the original submission (submit.sh caps it at the branch count)" >&2
+        exit 1
+    fi
     say "Only ${branches} branches: using ${branches} pieces instead of ${pieces}"
     pieces="${branches}"
+fi
+if [[ -n "${only}" ]]; then
+    for n in ${only//[,-]/ }; do
+        if (( 10#${n} >= pieces )); then
+            echo "submit.sh: --only ${only}: there is no piece ${n} of ${pieces} (pieces are 0-$(( pieces - 1 )))" >&2
+            exit 1
+        fi
+    done
 fi
 
 dependency=()
 if (( warmup )); then
     warmup_id="$(submit warmup "${common[@]}" --job-name="${name}-warmup" \
-        --cpus-per-task="${cpus}" --mem-per-cpu="${mem_per_cpu}" --time="${time_limit}" \
+        --cpus-per-task="${cpus}" --mem-per-cpu="${piece_mem}" --time="${time_limit}" \
         --output="${logs}/warmup_%j.out" \
         "${extra[@]}" "${job}" --repo "${POISSON_REPO}" "${experiment}" --warmup "${selects[@]}")"
     dependency=(--dependency="afterok:${warmup_id}")
@@ -278,7 +369,7 @@ fi
 
 array="${only:-0-$(( pieces - 1 ))}"
 pieces_id="$(submit pieces "${common[@]}" "${dependency[@]}" --job-name="${name}" --array="${array}" \
-    --cpus-per-task="${cpus}" --mem-per-cpu="${mem_per_cpu}" --time="${time_limit}" \
+    --cpus-per-task="${cpus}" --mem-per-cpu="${piece_mem}" --time="${time_limit}" \
     --output="${logs}/piece_%A_%a.out" \
     "${extra[@]}" "${job}" --repo "${POISSON_REPO}" --shard-total "${pieces}" "${experiment}" \
     --shard-order "${shard_order}" "${selects[@]}")"
@@ -291,7 +382,7 @@ fi
 
 if (( print_id )); then echo "${pieces_id}"; exit 0; fi
 if (( print_only )); then echo; echo "(--print-only: nothing was submitted)"; exit 0; fi
-again="bash scripts/delftblue/submit.sh ${experiment} --pieces ${pieces} --shard-order ${shard_order}"
+again="bash scripts/delftblue/submit.sh ${experiment} --shards --pieces ${pieces} --shard-order ${shard_order}"
 for s in "${selects[@]}"; do [[ "${s}" == --select ]] || again+=" --select ${s}"; done
 if (( collect )); then
     cat <<EOF

@@ -13,11 +13,14 @@ import tempfile
 import textwrap
 import unittest
 from pathlib import Path
+from unittest import mock
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO_ROOT / "python"))
 
 from poisson_runner import Artifact, Cache, RunContext, Stage, compare, experiment_main  # noqa: E402
+from poisson_runner import executor as executor_module  # noqa: E402
+from poisson_runner import Compare, run_experiment  # noqa: E402
 from poisson_runner.dag import parse_resources, plan_dag, run_dag_task  # noqa: E402
 
 
@@ -140,9 +143,15 @@ pathlib.Path(a.info_out).write_text("{{}}")
 
         split = plan_dag(self._pipeline(), cache=self.cache, split_by="mesh")
         self.assertEqual([(g.stage, g.split, g.parents) for g in split.groups], [
-            ("mesh", "coarse", []), ("assemble", "coarse", [0]), ("solve", "coarse", [1]),
-            ("mesh", "fine", []), ("assemble", "fine", [3]), ("solve", "fine", [4]),
+            ("mesh", ("coarse",), []), ("assemble", ("coarse",), [0]), ("solve", ("coarse",), [1]),
+            ("mesh", ("fine",), []), ("assemble", ("fine",), [3]), ("solve", ("fine",), [4]),
         ])
+        # Two names: a task's label per name is the one all its branches agree on.
+        two = plan_dag(self._pipeline(), cache=self.cache, split_by=["mesh", "order"])
+        self.assertEqual(two.split_by, ["mesh", "order"])
+        self.assertEqual([(g.stage, g.split) for g in two.groups][:3],
+                         [("mesh", ("coarse", None)), ("assemble", ("coarse", "1")), ("solve", ("coarse", "1"))])
+        self.assertEqual(len(two.groups), 2 + 4 + 4)
         with self.assertRaises(ValueError):
             plan_dag(self._pipeline(), cache=self.cache, split_by="meshes")
 
@@ -580,6 +589,261 @@ pathlib.Path(a.info_out).write_text("{{}}")
         self.assertEqual(main("--dag-plan", str(plan_file), "--count")[0], 2)
         self.assertEqual(main("--dag-plan", str(plan_file), "--dag-task", "0/0", "--select", "mesh=fine")[0], 2)
 
+    # ------------------------------------------------------------------ script defaults, split=True, threads
+
+    def _main(self, pipe, *argv: str, **defaults) -> tuple[int, str, str]:
+        out, err = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            code = experiment_main(pipe, argv=list(argv), cache=self.cache, **defaults)
+        return code, out.getvalue(), err.getvalue()
+
+    @staticmethod
+    def _groups(out: str) -> list[str]:
+        return [ln.split(" ", 1)[1] for ln in out.splitlines() if ln.startswith("dag-group ")]
+
+    def test_script_defaults_and_command_line_overrides(self) -> None:
+        pipe = self._pipeline()
+        plan_file = str(self.tmp / "plan.json")
+        defaults = dict(resources={"cpus": 2, "time": "00:20:00"}, stage_resources={"solve": {"cpus": 4}},
+                        split_by="mesh", fuse=False)
+        code, out, err = self._main(pipe, "--dag-plan", plan_file, **defaults)
+        self.assertEqual(code, 0, err)
+        groups = self._groups(out)
+        self.assertEqual(len(groups), 6)  # split by mesh, unfused
+        self.assertIn("0|1|-|2|00:20:00|3900M|mesh|0", groups)
+        self.assertIn("2|4|1|4|00:20:00|3900M|solve|1", groups)
+        self.assertEqual(json.loads(Path(plan_file).read_text())["split_by"], ["mesh"])
+
+        # Flags win, key by key: --resources keeps the script's cpus; --no-split and --fuse undo the script.
+        code, out, err = self._main(pipe, "--dag-plan", plan_file, "--resources", "time=00:10:00", "--no-split",
+                                    "--fuse", "--stage-resources", "solve:mem-per-cpu=8G", **defaults)
+        self.assertEqual(code, 0, err)
+        self.assertEqual(self._groups(out), ["0|2|-|2|00:10:00|3900M|mesh|0", "1|4|0|2|00:10:00|3900M|assemble|0",
+                                             "2|8|1|4|00:10:00|8G|solve|1"])
+        code, out, _ = self._main(pipe, "--dag-plan", plan_file, "--split-by", "order", **defaults)
+        self.assertEqual(json.loads(Path(plan_file).read_text())["split_by"], ["order"])  # replaces the script's
+
+        # The script's shard_order is used by --shard unless --shard-order is given.
+        code, out, _ = self._main(pipe, "--show-settings", shard_order="block", mode="dag", **defaults)
+        self.assertEqual(code, 0)
+        self.assertEqual([ln for ln in out.splitlines() if ln.startswith("setting ")], [
+            "setting mode=dag", "setting cpus=2", "setting time=00:20:00", "setting mem_per_cpu=3900M",
+            "setting shard_order=block"])
+        code, out, _ = self._main(pipe, "--show-settings", "--resources", "cpus=8", "--shard-order", "stride")
+        self.assertIn("setting cpus=8", out)
+        self.assertIn("setting mode=shard", out)
+        self.assertIn("setting shard_order=stride", out)
+        self.assertEqual(self._main(pipe, "--show-settings", "--split-by", "mesh")[0], 2)
+        self.assertEqual(self._main(pipe, "--resources", "cpus=2")[0], 2)  # needs --dag-plan or --show-settings
+
+        # --show-settings never creates the cache.
+        fresh = self.tmp / "never_created"
+        with contextlib.redirect_stdout(io.StringIO()), mock.patch.dict(os.environ, {"POISSON_CACHE_DIR": str(fresh)}):
+            self.assertEqual(experiment_main(pipe, argv=["--show-settings"]), 0)
+        self.assertFalse(fresh.exists())
+
+        for bad in (dict(mode="slurm"), dict(shard_order="random"), dict(resources={"gpus": 1}),
+                    dict(stage_resources={"solve": {"cpus": 0}}), dict(max_fused_time="0"), dict(max_array_size=0),
+                    dict(split_by=[""]), dict(fuse="yes")):
+            with self.assertRaises(ValueError, msg=str(bad)):
+                experiment_main(pipe, argv=["--show-settings"], **bad)
+        with self.assertRaises(TypeError):
+            experiment_main(pipe, argv=["--count"], shard=(0, 1))
+
+    def test_stage_resources_precedence(self) -> None:
+        # Python: per-call > stage_resources > resources. CLI --stage-resources beats per-call.
+        fine = {"cpus": 16, "time": "04:00:00"}
+        pipe = self._pipeline(fine_resources=fine)
+        plan = plan_dag(pipe, cache=self.cache, resources={"cpus": 2}, stage_resources={"solve": {"cpus": 4}})
+        by = {(g.stage, g.resources["cpus"]) for g in plan.groups}
+        self.assertEqual(by, {("mesh", 2), ("assemble", 2), ("solve", 4), ("mesh", 16), ("assemble", 16), ("solve", 16)})
+        plan = plan_dag(pipe, cache=self.cache, stage_resources={"solve": {"cpus": 4}},
+                        stage_resource_overrides={"solve": {"time": "06:00:00"}})
+        solves = [g.resources for g in plan.groups if g.stage == "solve"]
+        self.assertEqual(sorted((r["cpus"], r["time"]) for r in solves), [(4, "06:00:00"), (16, "06:00:00")])
+        plan = plan_dag(pipe, cache=self.cache, stage_resource_overrides={"solve": {"cpus": 8}})
+        self.assertEqual({g.resources["cpus"] for g in plan.groups if g.stage == "solve"}, {8})
+
+    def test_compare_split_true_and_its_overrides(self) -> None:
+        def pipe(run: RunContext) -> None:
+            m = compare("mesh", ["coarse", "fine"], split=True)
+            msh = run.run_stage(self.mesh, settings={"tag": m})
+            s = run.compare(Compare(["cg", "lu"], name="solver"))
+            run.run_stage(self.solve, inputs={"inp": msh}, settings={"tag": m + s})
+
+        plan = plan_dag(pipe, cache=self.cache)
+        self.assertEqual(plan.split_by, ["mesh"])
+        self.assertEqual([(g.stage, g.split) for g in plan.groups],
+                         [("mesh", ("coarse",)), ("solve", ("coarse",)), ("mesh", ("fine",)), ("solve", ("fine",))])
+        self.assertEqual(plan_dag(pipe, cache=self.cache, compare_splits=False).split_by, [])
+        self.assertEqual(plan_dag(pipe, cache=self.cache, split_by="solver").split_by, ["solver", "mesh"])
+        code, out, err = self._main(pipe, "--dag-plan", str(self.tmp / "p.json"), "--no-split")
+        self.assertEqual((code, len(self._groups(out))), (0, 2), err)  # one mesh array, one solve array
+        # split=True is ignored outside DAG mode, and keeps replay checks unchanged.
+        self.assertEqual(len(run_experiment(pipe, cache=self.cache, dry_run=True).branches), 4)
+
+        def both(run: RunContext) -> None:
+            run.compare(Compare(["a", "b"], name="x"), split=True)
+
+        with self.assertRaisesRegex(TypeError, "split=True to Compare"):
+            run_experiment(both, cache=self.cache, dry_run=True, continue_on_error=False)
+        with self.assertRaises(TypeError):
+            Compare(["a"], name="x", split="yes")
+
+    def test_threads_set_env_key_and_cpus_floor(self) -> None:
+        def pipe_for(threads=None, resources=None, env=None):
+            def pipe(run: RunContext) -> None:
+                t = compare("threads", [1, 4])
+                run.run_stage(self.solve, settings={"tag": "same"}, threads=t if threads is None else threads, resources=resources, env=env)
+            return pipe
+
+        plan = plan_dag(pipe_for(), cache=self.cache)
+        self.assertEqual(len(plan.tasks), 2)  # thread count is part of the request key
+        self.assertEqual([t.resources["cpus"] for t in plan.tasks], [1, 4])  # raised to the thread count
+        plan = plan_dag(pipe_for(), cache=self.cache, stage_resources={"solve": {"cpus": 16}})
+        self.assertEqual([t.resources["cpus"] for t in plan.tasks], [16, 16])  # a fixed allocation stays
+        with self.assertRaisesRegex(ValueError, "--stage-resources"):
+            plan_dag(pipe_for(), cache=self.cache, stage_resource_overrides={"solve": {"cpus": 2}})
+        with self.assertRaisesRegex(ValueError, "at least as many cpus"):
+            run_experiment(pipe_for(resources={"cpus": 2}), cache=self.cache, dry_run=True, continue_on_error=False)
+        for env in ({"OMP_NUM_THREADS": "2"}, {"OMP_NUM_THREADS": "4,2"}):
+            with self.assertRaisesRegex(ValueError, "contradicts"):
+                run_experiment(pipe_for(threads=4, env=env), cache=self.cache, dry_run=True, continue_on_error=False)
+
+        def raw(run: RunContext) -> None:  # a raw env thread count isn't a floor: the desync is refused
+            run.run_stage(self.solve, settings={"tag": "raw"}, env={"OMP_NUM_THREADS": "8", "OPENBLAS_NUM_THREADS": "1"})
+
+        with self.assertRaisesRegex(ValueError, "default resources"):
+            plan_dag(raw, cache=self.cache)
+        self.assertEqual(plan_dag(raw, cache=self.cache, resources={"cpus": 8}).tasks[0].resources["cpus"], 8)
+        for bad in (0, True, "4"):
+            with self.assertRaisesRegex(ValueError, "positive integer"):
+                run_experiment(pipe_for(threads=bad), cache=self.cache, dry_run=True, continue_on_error=False)
+
+        # Running: the env reaches the stage; too many threads for the CPUs is a stored warning.
+        def once(run: RunContext) -> Artifact:
+            return run.run_stage(self.solve, settings={"tag": "warn"}, threads=3)
+
+        with mock.patch.object(executor_module, "_usable_cpu_count", return_value=2):
+            report = run_experiment(once, cache=self.cache, continue_on_error=False)
+        trace = report.branches[0].stages[0]
+        self.assertTrue(any("requested 3 threads on 2 usable CPUs" in w for w in trace.warnings), trace.warnings)
+        # An inherited thread count above the CPUs warns too (from the executor's host metadata).
+        def inherited(run: RunContext) -> Artifact:
+            return run.run_stage(self.solve, settings={"tag": "inherited"})
+
+        with mock.patch.object(executor_module, "_usable_cpu_count", return_value=2), \
+                mock.patch.dict(os.environ, {"OMP_NUM_THREADS": "4", "OPENBLAS_NUM_THREADS": "1", "MKL_NUM_THREADS": "1"}):
+            report = run_experiment(inherited, cache=self.cache, continue_on_error=False)
+        self.assertTrue(any("4 threads on 2" in w for w in report.branches[0].stages[0].warnings))
+        cached = run_experiment(once, cache=self.cache, continue_on_error=False).branches[0].stages[0]
+        self.assertTrue(cached.cached)
+        self.assertTrue(any("3 threads on 2 usable CPUs" in w for w in cached.warnings), cached.warnings)
+        self.assertEqual(cached.execution["environment"]["threading"]["OMP_NUM_THREADS"], "3")
+
+    def test_shared_request_resources_do_not_depend_on_branch_order(self) -> None:
+        # The same request in two branches; only one call gives resources, in either order.
+        for first in (0, 1):
+            def pipe(run: RunContext) -> None:
+                k = compare("k", [0, 1])
+                res = {"cpus": 4} if k != first else None
+                run.run_stage(self.solve, settings={"tag": "shared"}, env={"OMP_NUM_THREADS": "4"}, resources=res)
+
+            plan = plan_dag(pipe, cache=self.cache)
+            self.assertEqual([t.resources["cpus"] for t in plan.tasks], [4], first)
+        # A threads= floor survives a later equivalent call that only gives a time.
+        def floor(run: RunContext) -> None:
+            k = compare("k", [0, 1])
+            if k == 0:
+                run.run_stage(self.solve, settings={"tag": "floor"}, threads=4)
+            else:
+                run.run_stage(self.solve, settings={"tag": "floor"}, resources={"time": "00:10:00"},
+                              env={"OMP_NUM_THREADS": "4", "OPENBLAS_NUM_THREADS": "4", "MKL_NUM_THREADS": "4"})
+
+        plan = plan_dag(floor, cache=self.cache)
+        self.assertEqual([(t.resources["cpus"], t.resources["time"]) for t in plan.tasks], [(4, "00:10:00")])
+
+        # Calls of one request disagreeing on cpus are refused, unless --stage-resources sets cpus.
+        def conflict(run: RunContext) -> None:
+            k = compare("k", [8, 16])
+            run.run_stage(self.solve, settings={"tag": "conflict"}, resources={"cpus": k})
+
+        with self.assertRaisesRegex(ValueError, "same resources"):
+            plan_dag(conflict, cache=self.cache)
+        plan = plan_dag(conflict, cache=self.cache, stage_resource_overrides={"solve": {"cpus": 12}})
+        self.assertEqual([t.resources["cpus"] for t in plan.tasks], [12])
+
+    def test_split_names_missing_from_the_selection_get_no_label(self) -> None:
+        def pipe(run: RunContext) -> None:
+            m = compare("mesh", ["coarse", "fine"])
+            tag = m
+            if m == "fine":
+                tag += compare("solver", ["cg", "lu"])
+            run.run_stage(self.solve, settings={"tag": tag})
+
+        plan = plan_dag(pipe, cache=self.cache, split_by=["mesh", "solver"], select={"mesh": "coarse"})
+        self.assertEqual([g.split for g in plan.groups], [("coarse", None)])
+        with self.assertRaisesRegex(ValueError, "no compare"):
+            plan_dag(pipe, cache=self.cache, split_by="solvers", select={"mesh": "coarse"})
+
+    def test_plan_v3_round_trip_with_splits_and_threads(self) -> None:
+        env_bin = _write_executable(self.tmp / "envsolve_bin", """
+import argparse, os, pathlib
+p = argparse.ArgumentParser()
+p.add_argument("--tag", required=True)
+p.add_argument("--in", dest="inp", default=None)
+p.add_argument("--out", required=True)
+p.add_argument("--info-out", required=True)
+a = p.parse_args()
+seen = ",".join(os.environ.get(k, "-") for k in ("OMP_NUM_THREADS", "OPENBLAS_NUM_THREADS", "MKL_NUM_THREADS"))
+pathlib.Path(a.out).write_text(a.tag + ":" + seen)
+pathlib.Path(a.info_out).write_text("{}")
+""")
+        solve = Stage.from_cli("solve", binary=env_bin, input_flags={"inp": "--in"}, setting_flags={"tag": "--tag"},
+                               output_flags={"out": "--out"}, output_specs={"out": ".txt"}, info_flag="--info-out")
+
+        def pipe_for(threads: int):
+            def pipe(run: RunContext) -> dict[str, Artifact]:
+                m = compare("mesh", ["coarse", "fine"], split=True)
+                o = compare("order", [1, 2])
+                msh = run.run_stage(self.mesh, settings={"tag": m})
+                return {"sol": run.run_stage(solve, inputs={"inp": msh}, settings={"tag": f"{m}{o}"},
+                                             threads=threads)}
+            return pipe
+
+        pipe = pipe_for(2)
+        plan_file = self.tmp / "v3.json"
+        code, out, err = self._main(pipe, "--dag-plan", str(plan_file), "--split-by", "mesh", "--split-by", "order")
+        self.assertEqual(code, 0, err)
+        payload = json.loads(plan_file.read_text())
+        self.assertEqual((payload["format_version"], payload["split_by"]), (3, ["mesh", "order"]))
+        self.assertIn(["fine", "2"], [t["split"] for t in payload["tasks"]])
+        self.assertTrue(all(t["resources"]["cpus"] == 2 for t in payload["tasks"] if t["stage"] == "solve"))
+
+        # Planned with threads=2, replayed with threads=4: the guard refuses the task.
+        solve_group = next(g["id"] for g in payload["groups"] if g["stages"] == ["solve"])
+        mesh_group = payload["groups"][0]["id"]
+        self.assertEqual(self._main(pipe, "--dag-plan", str(plan_file), "--dag-task", f"{mesh_group}/0")[0], 0)
+        with self.assertRaisesRegex(RuntimeError, "Plan mismatch"):
+            run_dag_task(pipe_for(4), payload, solve_group, 0, cache=self.cache)
+
+        for g in payload["groups"]:
+            for e in range(len(g["units"])):
+                code, _, err = self._main(pipe, "--dag-plan", str(plan_file), "--dag-task", f"{g['id']}/{e}")
+                self.assertEqual(code, 0, err)
+        code, _, err = self._main(pipe, "--collect", "--out", str(self.tmp / "res"))
+        self.assertEqual(code, 0, err)
+        report = run_experiment(pipe, cache=self.cache, force_cache_mode="read_only", require_cached=True)
+        solves = [s for b in report.branches for s in b.stages if s.stage == "solve"]
+        self.assertEqual(len(solves), 4)
+        for s in solves:  # the stage process itself saw the planned thread count
+            self.assertTrue(s.cached)
+            self.assertTrue(Path(s.outputs["out"].path).read_text().endswith(":2,2,2"))
+
+        old = dict(payload, format_version=2)
+        with self.assertRaisesRegex(ValueError, "format version 3"):
+            run_dag_task(pipe, old, 0, 0, cache=self.cache)
+
     def test_submit_sh_dag_dependencies_and_collect_on_leaves(self) -> None:
         fake_bin = self.tmp / "fake_bin"
         fake_bin.mkdir()
@@ -676,6 +940,111 @@ print(f"{{2000 + len(pathlib.Path({str(sbatch_log)!r}).read_text().splitlines())
                     ["--collect-only", "--after", ","], ["--collect-only", "--after", "1 2"],
                     ["--dag", "--shard-order", "block"], ["--no-fuse"]):
             r = subprocess.run(["bash", submit_sh, str(exp), *bad], env=env, capture_output=True, text=True, check=False)
+            self.assertNotEqual(r.returncode, 0, bad)
+
+
+    def test_submit_sh_follows_the_scripts_mode_and_resources(self) -> None:
+        fake_bin = self.tmp / "fake_bin"
+        fake_bin.mkdir()
+        sbatch_log = self.tmp / "sbatch.log"
+        _write_executable(
+            fake_bin / "sbatch",
+            f"""
+import pathlib, sys
+with open({str(sbatch_log)!r}, "a") as f:
+    f.write(" ".join(sys.argv[1:]) + "\\n")
+print(f"{{3000 + len(pathlib.Path({str(sbatch_log)!r}).read_text().splitlines())}};delftblue")
+""",
+        )
+        exp = self.tmp / "dag_exp.py"
+        exp.write_text(
+            textwrap.dedent(
+                f"""
+                from pathlib import Path
+                from poisson_runner import RunContext, Stage, compare, experiment_main
+                BIN = Path({str(self.tmp)!r})
+                def stage(name):
+                    return Stage.from_cli(name, binary=BIN / f"{{name}}_bin", input_flags={{"inp": "--in"}},
+                        setting_flags={{"tag": "--tag"}}, output_flags={{"out": "--out"}},
+                        output_specs={{"out": ".txt"}}, info_flag="--info-out")
+                def pipe(run: RunContext):
+                    m = compare("mesh", ["coarse", "fine"], split=True)
+                    msh = run.run_stage(stage("mesh"), settings={{"tag": m}})
+                    s = compare("solver", ["cg", "lu"])
+                    run.run_stage(stage("solve"), inputs={{"inp": msh}}, settings={{"tag": m + s}})
+                if __name__ == "__main__":
+                    raise SystemExit(experiment_main(pipe, mode="dag", resources={{"cpus": 3, "time": "00:05:00"}},
+                                                     stage_resources={{"solve": {{"mem_per_cpu": "2G"}}}}))
+                """
+            ),
+            encoding="utf-8",
+        )
+        env = {
+            **os.environ,
+            "PATH": f"{fake_bin}:{os.environ.get('PATH', '')}",
+            "POISSON_CACHE_DIR": str(self.tmp / "sub_cache"),
+            "POISSON_REPO": str(REPO_ROOT),
+            "PYTHONPATH": str(REPO_ROOT / "python"),
+        }
+        submit_sh = str(REPO_ROOT / "scripts/delftblue/submit.sh")
+
+        def submit(*args: str) -> subprocess.CompletedProcess[str]:
+            if sbatch_log.exists():
+                sbatch_log.unlink()
+            return subprocess.run(["bash", submit_sh, str(exp), *args], env=env, capture_output=True, text=True,
+                                  check=False)
+
+        _write_executable(fake_bin / "srun", "")  # a Slurm host either way; SLURM_JOB_ID decides the warning
+        env["SLURM_JOB_ID"] = "1"
+
+        # No --dag: the script's mode, resources and split=True; --stage-resources needs no --dag here.
+        r = submit("--stage-resources", "solve:cpus=8", "--name", "dagdef")
+        self.assertEqual(r.returncode, 0, r.stderr + r.stdout)
+        lines = sbatch_log.read_text().splitlines()
+        self.assertEqual(len(lines), 5)  # mesh + solve per mesh (split), then collect
+        self.assertIn("--dag ", lines[0])
+        self.assertIn("--cpus-per-task=3", lines[0])
+        self.assertIn("--time=00:05:00", lines[0])
+        self.assertIn("--cpus-per-task=8", lines[1])
+        self.assertIn("--mem-per-cpu=2G", lines[1])
+        self.assertIn("--mem-per-cpu=3900M", lines[4])  # the collect job keeps its own default
+        self.assertNotIn("warning", r.stderr)
+
+        # --shards runs it as pieces with the script's resources; flags given here win.
+        r = submit("--shards", "--time", "00:07:00")
+        self.assertEqual(r.returncode, 0, r.stderr + r.stdout)
+        lines = sbatch_log.read_text().splitlines()
+        self.assertEqual(len(lines), 2)
+        self.assertIn("--array=0-3", lines[0])
+        self.assertIn("--cpus-per-task=3", lines[0])
+        self.assertIn("--time=00:07:00", lines[0])
+        self.assertIn("--shard-order stride", lines[0])
+        self.assertIn("--shards --pieces 4 --shard-order stride", r.stdout)  # the rerun hint keeps --shards
+        r = submit("--shards", "--mem-per-cpu", "1000M", "--print-only")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(r.stderr.count("--mem-per-cpu=1000M"), 2)  # pieces and collect
+
+        r = submit("--collect-only", "--after", ",5,,6")  # mode-independent; empty ids (all cached) skipped
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn("--dependency=afterok:5:6", sbatch_log.read_text())
+        r = submit("--shards", "--pieces", "4", "--only", "1,3", "--print-only")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn("--array=1,3", r.stderr)
+
+        # Planning a DAG outside a Slurm job where srun exists warns about login nodes.
+        del env["SLURM_JOB_ID"]
+        r = submit("--print-only")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn("outside a Slurm job", r.stderr)
+
+        for bad in (["--dag", "--shards"], ["--warmup"], ["--pieces", "2"], ["--shard-order", "block"],
+                    ["--shards", "--split-by", "mesh"], ["--split-by", "mesh", "--no-split"],
+                    ["--collect-only", "--dag"], ["--collect-only", "--no-fuse"], ["--no-fuse", "--fuse"],
+                    ["--shards", "--pieces", "4", "--only", "4"], ["--shards", "--pieces", "4", "--only", "2-7"],
+                    ["--shards", "--pieces", "9", "--only", "1"], ["--shards", "--pieces", "4", "--only", "x"],
+                    ["--collect-only", "--after", ",,"], ["--shards", "--pieces", "4", "--only", "3-1"],
+                    ["--shards", "--pieces", "4", "--only", "18446744073709551616"]):
+            r = submit(*bad)
             self.assertNotEqual(r.returncode, 0, bad)
 
 

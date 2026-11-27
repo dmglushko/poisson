@@ -61,12 +61,16 @@ InputValue = Optional[Union[_PathLike, Sequence[_PathLike]]]
 
 @dataclass(frozen=True)
 class _ChoiceStep:
-    """Recorded choice-site expectation used to detect non-deterministic replays."""
+    """Recorded choice-site expectation used to detect non-deterministic replays.
+
+    `split` is the site's `compare(..., split=True)` flag (DAG array grouping only); it takes no
+    part in the replay check or in equality."""
 
     name: str
     index: int
     label: str
     num_options: int
+    split: bool = field(default=False, compare=False)
 
 
 class Compare(Generic[T]):
@@ -75,10 +79,18 @@ class Compare(Generic[T]):
     Examples:
         Compare(["P1", "P2"], name="assembly")
         Compare({"coarse": ("coarse.msh", 1e-4), "fine": ("fine.msh", 1e-6)}, name="case")
+
+    `split=True` gives each option its own DAG arrays (as `experiment_main(split_by=name)` does);
+    it changes nothing in shard mode or local runs.
     """
 
-    def __init__(self, options: Sequence[T] | Mapping[str, T], *, name: str | None = None) -> None:
+    def __init__(
+        self, options: Sequence[T] | Mapping[str, T], *, name: str | None = None, split: bool = False
+    ) -> None:
+        if not isinstance(split, bool):
+            raise TypeError(f"Compare split must be True or False, got {split!r}")
         self.name = name
+        self.split = split
         if isinstance(options, Mapping):
             self.labels = [str(k) for k in options.keys()]
             self.values: list[T] = list(options.values())
@@ -144,6 +156,8 @@ class _StageCallRecord:
     mode: str
     repeats: int
     warmup: int
+    threads: int | None = None  # the most threads the call's env asks for (`threads=` or *_NUM_THREADS)
+    threads_floor: bool = False  # from `threads=`: raises a default cpus count instead of conflicting
 
 
 @dataclass(frozen=True)
@@ -202,6 +216,65 @@ def _single_or_dict(artifacts: dict[str, Artifact]) -> Artifact | dict[str, Arti
 
 def _is_dry_run_placeholder(art: Artifact) -> bool:
     return art.content_id.startswith("dryrun:")
+
+
+THREAD_ENV_KEYS = ("OMP_NUM_THREADS", "OPENBLAS_NUM_THREADS", "MKL_NUM_THREADS")
+"""The thread-count variables `run_stage(..., threads=N)` sets (the ones `job.sbatch` exports)."""
+
+
+def _thread_count(key: str, value: str) -> int:
+    """A `*_NUM_THREADS` value as a thread count; `OMP_NUM_THREADS` may list nested levels (`4,2`),
+    of which the first is the count started at once."""
+    parts = [p.strip() for p in value.split(",")] if key == "OMP_NUM_THREADS" else [value.strip()]
+    if not all(p.isdigit() and int(p) > 0 for p in parts):
+        raise ValueError(f"Stage env {key} must be a positive integer, got {value!r}")
+    return int(parts[0])
+
+
+def _apply_threads(env: dict[str, str] | None, threads: int | None) -> tuple[dict[str, str] | None, int | None]:
+    """Add `threads=` to a stage's env and return it with the most threads any of its
+    `THREAD_ENV_KEYS` asks for (`None` when it sets none: the stage inherits the job's)."""
+    if threads is not None:
+        if isinstance(threads, bool) or not isinstance(threads, int) or threads < 1:
+            raise ValueError(f"threads must be a positive integer, got {threads!r}")
+        env = dict(env or {})
+        for key in THREAD_ENV_KEYS:
+            if key in env and env[key].strip() != str(threads):
+                raise ValueError(f"threads={threads} contradicts env {key}={env[key]!r}; set the thread count once")
+            env[key] = str(threads)
+    counts = [_thread_count(k, env[k]) for k in THREAD_ENV_KEYS if env and k in env]
+    return env, (max(counts) if counts else None)
+
+
+def _oversubscription(execution: Mapping[str, Any]) -> tuple[int, int] | None:
+    """`(threads, cpus)` when the measured run started more threads than it had CPUs, from the
+    executor's own host metadata (the stage's effective env, inherited or set)."""
+    host = execution.get("environment")
+    if not isinstance(host, Mapping):
+        return None
+    cpus = host.get("cpu_count")
+    threading_env = host.get("threading")
+    if not isinstance(cpus, int) or isinstance(cpus, bool) or cpus < 1 or not isinstance(threading_env, Mapping):
+        return None
+    counts = []
+    for key in THREAD_ENV_KEYS:
+        try:
+            counts.append(_thread_count(key, str(threading_env[key])))
+        except (KeyError, ValueError):
+            continue
+    threads = max(counts, default=0)
+    return (threads, cpus) if threads > cpus else None
+
+
+def _explicit_cpus(resources: Mapping[str, Any] | None) -> int | None:
+    """The `cpus` a call's own `resources=` asks for, if it is a valid count (`dag.py` validates)."""
+    value = (resources or {}).get("cpus")
+    if value is None or isinstance(value, bool):
+        return None
+    try:
+        return int(str(value).strip())
+    except ValueError:
+        return None
 
 
 class RunContext:
@@ -289,14 +362,22 @@ class RunContext:
         self,
         name_or_options: str | Sequence[Any] | Mapping[str, Any] | Compare[Any],
         options: Sequence[Any] | Mapping[str, Any] | None = None,
+        *,
+        split: bool = False,
     ) -> Any:
-        """Select one option on this branch and automatically schedule all remaining options."""
+        """Select one option on this branch and automatically schedule all remaining options.
+
+        `split=True` gives each option its own DAG arrays (see `Compare`)."""
         if isinstance(name_or_options, Compare):
+            if options is not None:
+                raise TypeError("Expected compare(Compare(...)), compare(options), or compare(name, options)")
+            if split:
+                raise TypeError("compare(Compare(...), split=True): pass split=True to Compare(...) instead")
             spec = name_or_options
         elif isinstance(name_or_options, str) and options is not None:
-            spec = Compare(options, name=name_or_options)
+            spec = Compare(options, name=name_or_options, split=split)
         elif options is None:
-            spec = Compare(name_or_options)  # type: ignore[arg-type]
+            spec = Compare(name_or_options, split=split)  # type: ignore[arg-type]
         else:
             raise TypeError("Expected compare(Compare(...)), compare(options), or compare(name, options)")
 
@@ -320,13 +401,13 @@ class RunContext:
                     f"got ({choice_name!r}, n={len(spec.values)}, labels={spec.labels!r})"
                 )
             idx = expected.index
-            chosen_step = expected
+            chosen_step = dataclasses.replace(expected, split=spec.split)
         else:
             idx = 0
-            chosen_step = _ChoiceStep(choice_name, 0, spec.labels[0], len(spec.values))
+            chosen_step = _ChoiceStep(choice_name, 0, spec.labels[0], len(spec.values), spec.split)
             # Push remaining options in reverse order so DFS pops them in natural user order.
             for other_idx in range(len(spec.values) - 1, 0, -1):
-                other_step = _ChoiceStep(choice_name, other_idx, spec.labels[other_idx], len(spec.values))
+                other_step = _ChoiceStep(choice_name, other_idx, spec.labels[other_idx], len(spec.values), spec.split)
                 self._todo_stack.append(tuple(self._prefix) + (other_step,))
 
         self._prefix.append(chosen_step)
@@ -495,12 +576,19 @@ class RunContext:
         warmup: int | None = None,
         env: Mapping[str, str] | None = None,
         resources: Mapping[str, Any] | None = None,
+        threads: int | None = None,
     ) -> Artifact | dict[str, Artifact]:
         """Run a stage with content-addressed caching, 4-mode control, repeats, and dry-run.
 
         Lookup order: persistent cache (if the mode reads it) -> outputs of the same request
         already executed earlier in this experiment -> execute. A cache hit is used whatever
         `repeats` it was measured with; pass `cache="refresh"` to re-measure.
+
+        `threads=N` sets `OMP_NUM_THREADS`, `OPENBLAS_NUM_THREADS` and `MKL_NUM_THREADS` to N in
+        the stage's `env`, so the thread count is part of the request key, and in DAG mode makes
+        the task's cpus at least N. Without it (and without those keys in `env`) the stage inherits
+        the job's thread count and its cache entry is reused whatever that count was. A call whose
+        own `resources=` gives fewer cpus than its env's thread count is refused.
         """
         step = self._stage_calls
         self._stage_calls += 1
@@ -510,7 +598,8 @@ class RunContext:
             forced = CacheMode.READ_ONLY if targets is not None else None  # other calls of a DAG task only look up
             return self._run_stage(
                 stage, inputs=inputs, settings=settings, cache=cache, use_cache=use_cache, repeats=repeats,
-                warmup=warmup, env=env, resources=resources, step=step, forced_mode=forced, target=None,
+                warmup=warmup, env=env, resources=resources, threads=threads, step=step, forced_mode=forced,
+                target=None,
             )
         assert targets is not None
         if any(s < step and s not in self._dag_done for s in targets):
@@ -519,7 +608,8 @@ class RunContext:
             raise _DagTaskDone(dict(self._dag_done))
         result = self._run_stage(
             stage, inputs=inputs, settings=settings, cache=cache, use_cache=use_cache, repeats=repeats,
-            warmup=warmup, env=env, resources=resources, step=step, forced_mode=None, target=target,
+            warmup=warmup, env=env, resources=resources, threads=threads, step=step, forced_mode=None,
+            target=target,
         )
         self._dag_done[step] = self.trace[-1]
         if step == max(targets):
@@ -538,6 +628,7 @@ class RunContext:
         warmup: int | None,
         env: Mapping[str, str] | None,
         resources: Mapping[str, Any] | None,
+        threads: int | None,
         step: int,
         forced_mode: CacheMode | None,
         target: _DagTarget | None,
@@ -557,7 +648,13 @@ class RunContext:
         pre_signatures = {p: file_signature(p) for p in watched}
 
         settings_dict = dict(settings) if settings is not None else {}
-        env_dict = self._normalize_env(env)
+        env_dict, env_threads = _apply_threads(self._normalize_env(env), threads)
+        cpus = _explicit_cpus(resources)
+        if env_threads is not None and cpus is not None and cpus < env_threads:
+            raise ValueError(
+                f"Stage '{stage.name}' asks for {env_threads} threads but resources cpus={cpus}; "
+                "give it at least as many cpus as threads"
+            )
         code_hash = stage.compute_code_hash(self.cache)
         request_key = Cache.compute_request_key(
             stage.name,
@@ -598,6 +695,8 @@ class RunContext:
                     mode=mode.value,
                     repeats=n_repeats,
                     warmup=n_warmup,
+                    threads=env_threads,
+                    threads_floor=threads is not None,
                 )
             )
 
@@ -777,6 +876,12 @@ class RunContext:
                 info_path=info_tmp,
                 hash_file=blake3_file,
             )
+            over = _oversubscription(m.execution)
+            if over is not None:
+                m.execution.setdefault("warnings", []).append(
+                    f"Stage '{stage.name}' requested {over[0]} threads on {over[1]} usable CPUs; "
+                    "its timings are oversubscribed (give the job more CPUs, or fewer threads)"
+                )
 
             if not mode.writes:
                 expected = {p.resolve() for p in output_paths.values()}
@@ -885,12 +990,14 @@ class RunContext:
 def compare(
     name_or_options: str | Sequence[Any] | Mapping[str, Any] | Compare[Any],
     options: Sequence[Any] | Mapping[str, Any] | None = None,
+    *,
+    split: bool = False,
 ) -> Any:
     """Module-level `compare(...)` usable inside any function executed by `run_experiment`."""
     ctx = _ACTIVE_RUN.get()
     if ctx is None:
         raise RuntimeError("compare() can only be called inside run_experiment(...)")
-    return ctx.compare(name_or_options, options)
+    return ctx.compare(name_or_options, options, split=split)
 
 
 def resolve_slurm_shard(env: Mapping[str, str] | None = None) -> tuple[int, int] | None:
