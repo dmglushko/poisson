@@ -270,7 +270,10 @@ class CacheStats:
 
 
 class CacheLease:
-    """Cross-process lease protecting active cache objects from eviction."""
+    """Cross-process lease protecting active cache objects from eviction.
+
+    Thread-safe: the branches of a parallel local run share one lease. Its own lock guards the
+    pin set and the lease file and is always taken after the cache lock, never before it."""
 
     def __init__(self, cache: Cache) -> None:
         self._cache = cache
@@ -280,9 +283,11 @@ class CacheLease:
         self._active = False
         self._uses_flock = False
         self._object_names: set[str] = set()
+        self._synced_names: frozenset[str] = frozenset()  # what the lease file holds
         self._replace_on_next_pin = False
         self._stop_heartbeat: threading.Event | None = None
         self._heartbeat_thread: threading.Thread | None = None
+        self._lock = threading.RLock()
 
     def _start_heartbeat(self) -> None:
         interval = max(0.05, self._cache.lock_stale_s / 3.0)
@@ -317,8 +322,9 @@ class CacheLease:
                         if exc.errno not in _FLOCK_UNSUPPORTED_ERRNOS:
                             raise
                         self._uses_flock = False
-                self._active = True
-                self._sync()
+                with self._lock:
+                    self._active = True
+                    self._sync()
             if not self._uses_flock:
                 self._start_heartbeat()
         except BaseException:
@@ -331,33 +337,52 @@ class CacheLease:
 
     def begin_ephemeral_scope(self) -> None:
         """Replace pinned objects on the next `pin()` call instead of accumulating across branches."""
-        self._replace_on_next_pin = True
+        with self._lock:
+            self._replace_on_next_pin = True
 
     def pin(self, object_names: Iterable[str], *, _locked: bool = False) -> None:
+        """Add objects to the lease; returns once they are in the lease file. `_locked=True`: the
+        caller holds the cache lock."""
+        names = list(object_names)
+        with self._lock:
+            if self._pinned(names):
+                return
+            if _locked or not self._active or self._fp is None:
+                self._apply(names)  # an inactive lease only keeps the set (no file to write)
+                return
+        # Lock order is cache lock, then lease lock: release ours before taking the cache's, and
+        # change the pin set only while holding both, so a concurrent `pin` of the same name
+        # can't return before the file holds it.
+        with self._cache._locked(), self._lock:
+            if not self._pinned(names):
+                self._apply(names)
+
+    def _pinned(self, names: list[str]) -> bool:
+        """Whether `pin(names)` has nothing left to do (caller holds `self._lock`)."""
+        return not self._replace_on_next_pin and (
+            self._synced_names.issuperset(names)
+            if self._active and self._fp is not None
+            else self._object_names.issuperset(names)
+        )
+
+    def _apply(self, names: list[str]) -> None:
+        """Change the pin set and write it (caller holds both locks, or the lease is inactive)."""
         if self._replace_on_next_pin:
             self._replace_on_next_pin = False
-            new_names = set(object_names)
-            changed = new_names != self._object_names
-            self._object_names = new_names
+            self._object_names = set(names)
         else:
-            changed = False
-            for name in object_names:
-                if name not in self._object_names:
-                    self._object_names.add(name)
-                    changed = True
-        if changed and self._active and self._fp is not None:
-            if _locked:
-                self._sync()
-            else:
-                with self._cache._locked():
-                    self._sync()
+            self._object_names.update(names)
+        self._sync()
 
     @property
     def object_names(self) -> frozenset[str]:
-        return frozenset(self._object_names)
+        with self._lock:
+            return frozenset(self._object_names)
 
     def _sync(self) -> None:
-        assert self._fp is not None
+        """Rewrite the lease file (caller holds `self._lock`); a closed lease writes nothing."""
+        if self._fp is None or not self._active:
+            return
         self._fp.seek(0)
         self._fp.truncate()
         json.dump(
@@ -370,26 +395,29 @@ class CacheLease:
             self._fp,
         )
         self._fp.flush()
+        self._synced_names = frozenset(self._object_names)
 
     def close(self) -> None:
-        self._active = False
+        with self._lock:
+            self._active = False
         if self._stop_heartbeat is not None:
             self._stop_heartbeat.set()
             if self._heartbeat_thread is not None:
                 self._heartbeat_thread.join(timeout=1.0)
             self._stop_heartbeat = None
             self._heartbeat_thread = None
-        if self._fp is not None:
-            try:
-                self._path.unlink(missing_ok=True)
-            finally:
+        with self._lock:
+            if self._fp is not None:
                 try:
-                    if self._uses_flock:
-                        fcntl.flock(self._fp.fileno(), fcntl.LOCK_UN)
+                    self._path.unlink(missing_ok=True)
                 finally:
-                    self._fp.close()
-                    self._fp = None
-                    self._uses_flock = False
+                    try:
+                        if self._uses_flock:
+                            fcntl.flock(self._fp.fileno(), fcntl.LOCK_UN)
+                    finally:
+                        self._fp.close()
+                        self._fp = None
+                        self._uses_flock = False
 
 
 class Cache:
@@ -501,6 +529,12 @@ class Cache:
 
         # In-process memoization keyed by (resolved_path, st_ino, st_size, st_mtime_ns, st_ctime_ns).
         self._stat_hash_memo: dict[tuple[str, int, int, int, int], str] = {}
+        self._memo_lock = threading.Lock()
+        # Serializes the threads of this process (a parallel local run) before they take the
+        # cross-process lock: `lock_mode="none"` has no lock at all, and a lockfile's
+        # same-pid ownership checks are not meant to arbitrate between threads.
+        self._thread_lock = threading.RLock()
+        self._lock_depth = 0
 
     def _read_lock_mode_marker(self) -> LockMode | None:
         if not self._lock_mode_marker.is_file():
@@ -763,6 +797,23 @@ class Cache:
 
     @contextlib.contextmanager
     def _locked(self) -> Iterator[None]:
+        with self._thread_lock:
+            if self._lock_depth > 0:
+                self._lock_depth += 1
+                try:
+                    yield
+                finally:
+                    self._lock_depth -= 1
+                return
+            with self._locked_across_processes():
+                self._lock_depth = 1
+                try:
+                    yield
+                finally:
+                    self._lock_depth = 0
+
+    @contextlib.contextmanager
+    def _locked_across_processes(self) -> Iterator[None]:
         if self.lock_mode == LockMode.NONE:
             yield
             return
@@ -794,13 +845,15 @@ class Cache:
     def hash_file(self, path: str | os.PathLike[str]) -> str:
         """Hash a file with BLAKE3, memoized by `(path, inode, size, mtime_ns, ctime_ns)`."""
         sig = file_signature(path)
-        cached = self._stat_hash_memo.get(sig)
+        with self._memo_lock:
+            cached = self._stat_hash_memo.get(sig)
         if cached is not None:
             return cached
-        digest = blake3_file(sig[0])
+        digest = blake3_file(sig[0])  # outside the lock: two threads may hash one file, both get the same digest
         # Re-verify file didn't change while hashing before memoizing.
         if file_signature(sig[0]) == sig:
-            self._stat_hash_memo[sig] = digest
+            with self._memo_lock:
+                self._stat_hash_memo[sig] = digest
         return digest
 
     def raw_file(self, path: str | os.PathLike[str], *, name: str = "file") -> Artifact:
@@ -1444,7 +1497,8 @@ class Cache:
                     for p in self.requests_dir.glob("*.json"):
                         p.unlink(missing_ok=True)
                         removed_requests += 1
-                self._stat_hash_memo.clear()
+                with self._memo_lock:
+                    self._stat_hash_memo.clear()
                 return {
                     "removed_objects": removed_objects,
                     "removed_requests": removed_requests,

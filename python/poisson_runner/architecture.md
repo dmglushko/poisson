@@ -7,7 +7,7 @@
 
 | Module | Responsibility |
 |---|---|
-| `driver.py` | `compare(...)` replay, `RunContext.run_stage` (inputs -> request key -> lookup -> reuse -> execute -> publish), `run_experiment`, SLURM sharding |
+| `driver.py` | `compare(...)` replay, `RunContext.run_stage` (inputs -> request key -> lookup -> reuse -> execute -> publish), `run_experiment`, SLURM sharding, parallel local runs (`cores=`) |
 | `benchmark.py` | `measure(...)`: warmup + repeated executions, per-metric statistics, output determinism check |
 | `report.py` | `StageTrace`, `BranchResult`, `ExperimentReport` (table, JSON, wide/long CSV, DataFrame, `save`), `info_scalars` |
 | `records.py` | Tagged JSON encoding of branch outputs and choice values; explicit `register_record` registry |
@@ -19,7 +19,7 @@
 | `cache.py` | Two-layer content-addressed cache, locking, leases, eviction, dry-run placeholder types |
 | `executor.py` | `Executor` backends and per-process OS metrics |
 | `dag.py` | DAG mode: `plan_dag` (stage calls -> tasks -> Slurm array groups, plan file) and `run_dag_task` |
-| `experiment_cli.py` | `experiment_main`: standard CLI for experiment scripts (`--count`, `--shard`, `--collect`, `--bundle`, `--dag-plan`, `--dag-task`) |
+| `experiment_cli.py` | `experiment_main`: standard CLI for experiment scripts (`--count`, `--shard`, `--collect`, `--bundle`, `--dag-plan`, `--dag-task`, `--cores`) |
 | `cli.py` | `python3 -m poisson_runner` CLI for cache management (`cache status\|inspect\|clean`), saved-run bundling (`run bundle\|status`), and file hashing |
 | `hashing.py` | BLAKE3 bindings and canonical JSON |
 
@@ -155,22 +155,13 @@ value = load_value(norms)                      # placeholder in a dry run: check
   Integral floats in `settings` hash as ints (`1.0` and `1` share an entry; not for Python function
   stages, `Stage(normalize_settings=False)`); the settings passed
   to the binary are unchanged.
-<<<<<<< HEAD
-- **Code hash:** BLAKE3 of the stage executable (unless `Stage(hash_executable=False)`), any `code_files` / `version`, and the shared
-  libraries the executable links *directly* (`readelf -d` `NEEDED` entries resolved via `ldd`,
-  keyed by soname, e.g. HDF5, libstdc++, libc). Transitive dependencies (libcurl, krb5, ...) are
-  not tracked. Disable per stage with `track_shared_libs=False` (e.g. when cluster nodes carry
-  different but compatible library builds and should share a cache). Scripts, static binaries,
-  and hosts without `ldd` track no libraries.
-=======
-- **Code hash:** BLAKE3 of the stage executable, any `code_files` / `version`, and the non-OS
-  shared libraries the executable links *directly* (`readelf -d` `NEEDED` entries resolved via
-  `ldd`, keyed by soname, e.g. HDF5, `libstdc++`, `libgcc_s`). OS base libraries (`libc`, `libm`,
-  `ld-linux`, `libpthread`, ...) are skipped by default so cluster nodes at different OS patch
-  levels share a cache, and transitive dependencies (`libcurl`, `krb5`, ...) are not tracked.
-  Disable per stage with `track_shared_libs=False`. Scripts, static binaries, and hosts without
-  `ldd` track no libraries.
->>>>>>> 0aaddef (Fix AMR all-excluded convergence, OS lib hashing, dry-run reads, and run bundling)
+- **Code hash:** BLAKE3 of the stage executable (unless `Stage(hash_executable=False)`), any
+  `code_files` / `version`, and the non-OS shared libraries the executable links *directly*
+  (`readelf -d` `NEEDED` entries resolved via `ldd`, keyed by soname, e.g. HDF5, `libstdc++`,
+  `libgcc_s`). OS base libraries (`libc`, `libm`, `ld-linux`, `libpthread`, ...) are skipped by
+  default so cluster nodes at different OS patch levels share a cache, and transitive
+  dependencies (`libcurl`, `krb5`, ...) are not tracked. Disable per stage with
+  `track_shared_libs=False`. Scripts, static binaries, and hosts without `ldd` track no libraries.
 - **Content deduplication:** Upstream refactors or binary edits invalidate that stage's
   `request_key`, but if it produces identical output bytes, its `content_id` is unchanged and
   all downstream stages still get cache hits.
@@ -194,14 +185,20 @@ value = load_value(norms)                      # placeholder in a dry run: check
     leases so live multi-hour jobs are never pruned by age.
   - `"none"`: Lock-free reads/writes via unique temp files + atomic `os.replace` (requires
     `max_bytes=None` during sweeps; trim between sweeps with `cache clean --max-gb`).
+- **Threads:** one `Cache` and one `CacheLease` may be used from several threads (a parallel
+  local run). `Cache._locked()` takes an in-process `RLock` before the cross-process lock, so
+  threads of one process are serialized in every lock mode (`"none"` included). A lease has its
+  own lock for its pin set and file, always taken after the cache lock; a pin on a closed lease
+  is ignored. The file-hash memo has its own lock (two threads may hash one file at once; both
+  get the same digest).
 
 ## 4-Mode Layered Cache Control
 
 | Mode | Reads cache | Writes cache | Shorthand |
 |---|:---:|:---:|---|
 | `"use"` *(default)* | Yes | Yes | `True` |
-| `"read_only"` | Yes | No | — |
-| `"refresh"` | No | Yes | — |
+| `"read_only"` | Yes | No | None |
+| `"refresh"` | No | Yes | None |
 | `"off"` | No | No | `False` |
 
 Precedence (most specific wins):
@@ -251,6 +248,8 @@ SLURM shard is a separate process and keeps its own record.
   for siblings, stride balances load when cost follows the outermost choice. A final
   `cache_mode="read_only", require_cached=True` run collects the complete `ExperimentReport`
   with guaranteed zero recomputation.
+- **Parallel local runs (`cores=`):** see the section below. Shards and DAG tasks always run
+  their branches one after another inside a job.
 - **Collect mode (`force_cache_mode=`):** `run_experiment(..., force_cache_mode="read_only")`
   overrides every cache mode, per-call ones included; `--collect` uses it, so a call that asks
   for `refresh` still finds the result a piece or DAG task published.
@@ -285,7 +284,9 @@ SLURM shard is a separate process and keeps its own record.
   always runs every branch. Shard pieces use only `resources`. `--show-settings [--resources ...]
   [--shard-order ...]` prints `setting mode=|cpus=|time=|mem_per_cpu=|shard_order=` lines with
   the flags applied, without creating a cache or running the pipeline, so `submit.sh` keeps no
-  copy of these defaults.
+  copy of these defaults. `cores=` and `exclusive_stages=` sit next to them but only apply to a
+  plain run on a personal machine (`--cores N` wins); `--show-settings` doesn't print them
+  (see "Personal machine vs. cluster" below).
 - **Stage registration:** `Stage.from_cli(...)` declaratively maps input flags, flat setting
   flags, and/or `--config <settings.json>` (for deeply nested configs like AMR) with minimal
   boilerplate.
@@ -310,6 +311,96 @@ SLURM shard is a separate process and keeps its own record.
   `HIT` vs `WOULD_RUN` without launching binaries. `ExperimentReport.save_csv(..., layout="long")`
   writes a loop-friendly tidy CSV (one row per `(branch, step_index, stage)` including HPC
   metadata), while `layout="wide"` disambiguates repeated stage calls (`stage#0`, `stage#1`, ...).
+
+## Personal Machine vs. Cluster
+
+Parallelism is set up differently on a personal machine and on DelftBlue, and the two never mix:
+
+| | Personal machine | Cluster (DelftBlue, Slurm) |
+|---|---|---|
+| How branches run in parallel | `run_experiment(cores=N)`, `experiment_main(cores=N)` or `python3 sweep.py --cores N`: threads in one process, at most N cores busy | Shard pieces (`--shard I/N`, array tasks) or DAG tasks (`--dag-plan`, `--dag-task`), one Slurm job each |
+| Settings | `cores`, `exclusive_stages`, `run_stage(..., exclusive=True)` | `mode`, `split_by`, `fuse`, `max_fused_time`, `max_array_size`, `shard_order` |
+| Shared declarations | `resources`, `stage_resources`, `run_stage(..., resources=, threads=)` | the same |
+
+The shared declarations are written once in Python, e.g.
+`experiment_main(pipeline, stage_resources={"solve": {"cpus": 8}}, cores=8)`, and both sides read
+them: a DAG task gets 8 cpus from Slurm, and on the laptop the solve holds 8 of the 8 cores.
+
+`experiment_main` keeps the cluster safe from the script's `cores`: `--count`, `--shard`,
+`--warmup`, `--collect`, `--dag-plan`, `--dag-task`, an array task (`SLURM_ARRAY_TASK_ID`) and any
+run inside a Slurm job (`SLURM_JOB_ID`) ignore it and run one branch at a time, so a script with
+`cores=8` submitted to a 1-cpu job never starts 8 stages. `--cores` is refused next to those
+flags and in an array task, and `--cores N` (N > 1) is refused inside any Slurm job, interactive
+ones included. `run_experiment` refuses `cores > 1` together with `shard`.
+
+### Parallel local runs (`driver.py`)
+
+With `cores=1` (the default) and in every dry run nothing changes: branches run in DFS order, no
+thread env is added. Use `cores=1` for clean timing benchmarks, since parallel stages share
+memory bandwidth and caches. With `cores > 1`:
+
+- **Branches:** the same dry-run discovery as shards (`_discover_branch_paths`, then `select`
+  and `max_branches`) lists the branches first, so a branch that meets a `compare()` the
+  discovery didn't see (its choices depend on uncached stage outputs) fails with a message
+  pointing to `cores=1` (`RunContext.compare` refuses any `compare()` past the planned path,
+  one with a single option included; sharded and selected runs do the same). Loops whose stage calls depend on outputs but contain no `compare()`
+  (an AMR loop reading `info["status"]`) work. `ExperimentReport.branches` keeps the branch
+  order; branch indices are those of the full experiment.
+- **Dispatch (`_run_parallel`):** one daemon thread per running branch. A new branch starts while
+  fewer than `cores` branch threads are busy; threads waiting for another branch's stage (below)
+  don't count, so while four branches wait for mesh A, the next branch starts mesh B. At most
+  512 branch threads exist at once.
+- **Core budget (`_LocalScheduler`):** a stage's `cpus` resolve as in DAG mode: 1 <
+  `resources["cpus"]` < `stage_resources[stage]["cpus"]` < the call's `resources={"cpus": ...}`;
+  `threads=N` raises them to N unless the call's own `resources=` sets cpus (which must then be at
+  least N); a raw env `*_NUM_THREADS` above cpus that were configured somewhere is refused, and
+  without configured cpus it raises the stage's cpus to that count. An explicit thread count
+  (`threads=` or a raw `*_NUM_THREADS`) above `cores` is refused: it is part of the request key,
+  so it can't be lowered to fit (raise `cores` or lower the threads). These checks run before
+  the cache lookup, so a warm cache refuses the same calls as a cold one. The stage gets `min(cpus, cores)` threads and holds as many
+  cores while it executes (cache lookups and reuse hold none), or all `cores` if it is named in
+  `exclusive_stages` or called with `exclusive=True` (it then runs alone, still with its own
+  thread count). So `cpus=16` on `cores=8` runs alone with 8 threads instead of deadlocking.
+  Requests are served strictly in arrival order (a `threading.Condition` with a FIFO queue), so a
+  waiting 8-core solve is never overtaken by a stream of 1-core stages.
+- **Runtime thread env:** `OMP_NUM_THREADS`, `OPENBLAS_NUM_THREADS` and `MKL_NUM_THREADS` are set
+  to the stage's thread count for every one of them its env doesn't set. Like `job.sbatch`'s
+  exports, they are not part of the request key, so cache entries match sequential runs and the
+  cluster. The cache entry's `execution.environment` records them, as it records the job's.
+- **Shared requests (`_ExperimentState.in_flight`):** lookup order is in-flight publishing
+  execution (if the mode reads) -> persistent cache -> in-experiment reuse (`executed`) ->
+  in-flight map -> claim it -> wait for cores -> execute -> publish -> record in `executed` ->
+  release the waiters. A branch making a request another branch is executing waits for it
+  holding no cores, then reuses its outputs (`REUSED`); `refresh` and `off` requests run once the
+  same way. The in-flight map is keyed by request key and whether the execution writes the
+  cache: a call whose mode writes (`use`, `refresh`) waits for and reuses only an execution that
+  published, so it still publishes when an `off` or `read_only` branch ran the request first,
+  and a `use` call joins a running `refresh` instead of reading the old cache entry. A call
+  that doesn't write takes either (and never overwrites an already-published `executed` entry).
+  If a shared execution fails, every waiter receives the error (`failed in another branch running
+  the same request`), carrying the producer's original exception so fail-fast always reports the
+  producer's error. A pipeline that catches a stage failure with `try/except` can recover, as in
+  a sequential run, while cancellation (`_Cancelled`) is a `BaseException` so `except Exception:`
+  cannot swallow it. `_ExperimentState.lock` guards `executed`, `in_flight` and `stages`.
+- **Failures and interrupts:** with `continue_on_error=False` the first failing branch cancels
+  the run: no stage or branch starts any more, waiters stop, running stages are killed
+  (`Executor.cancel(token)`; `LocalExecutor` tracks its children and kills those started with the
+  run's `ExecutionRequest.cancel_token`), every thread is joined (so the staging and ephemeral
+  directories of the stages it stopped are gone and nothing half-done is published), and the
+  first error is raised. Outputs of `cache="off"` stages that already finished stay in
+  `ephemeral/`, as after a sequential run. With `continue_on_error=True` a failed branch records
+  its error and the others go on. Ctrl-C or SIGTERM (`SystemExit`) in the main thread cancels the
+  same way before the leases close. Each stage of a parallel run starts in its own session, and
+  a cancel kills its whole process group, so processes the stage started die with it (a
+  terminal Ctrl-C reaches only the runner, which then kills them). `LocalExecutor` waits for a
+  child with `waitid(WNOWAIT)` and stops tracking it before reaping it (without `WNOWAIT` it reaps
+  with `WNOHANG` under its lock), and only drops its own entry, so a kill never hits a reused pid.
+- **Threads elsewhere:** `RunContext` is per branch; branches share the cache, one experiment
+  lease, the executor and `_ExperimentState`. Each branch thread runs in a copy of the caller's
+  `contextvars` context, so a `ContextVar` the caller set is visible in the pipeline. A lease's
+  `pin` returns only once the names are in the lease file, also when another thread pinned them
+  first. `Stage.compute_code_hash` is a pure function of
+  `Cache.hash_file` and an `lru_cache`d library scan, both thread-safe.
 
 ## DAG Mode (`dag.py`)
 

@@ -7,8 +7,10 @@ import functools
 import os
 import platform
 import socket
+import signal
 import subprocess
 import tempfile
+import threading
 import time
 from collections.abc import Mapping
 from dataclasses import dataclass, field
@@ -92,6 +94,9 @@ class ExecutionRequest:
     cwd: Path | None = None
     env: dict[str, str] | None = None
     resources: dict[str, Any] = field(default_factory=dict)
+    # Set by a parallel local run (`run_experiment(cores=N)`): `Executor.cancel(token)` stops the
+    # processes started for requests carrying this token, and none start once it is set.
+    cancel_token: threading.Event | None = field(default=None, compare=False)
 
 
 @dataclass(frozen=True)
@@ -114,16 +119,107 @@ class ExecutionResult:
     environment: dict[str, Any] = field(default_factory=dict)
 
 
+class StageCancelled(RuntimeError):
+    """A stage was not started (or was stopped) because its run was cancelled."""
+
+
 class Executor(abc.ABC):
-    """Abstract execution backend. Subclass to add DelftBlue SLURM (srun/sbatch)."""
+    """Abstract execution backend. Subclass to add DelftBlue SLURM (srun/sbatch).
+
+    `run` may be called from several threads at once (a parallel local run)."""
 
     @abc.abstractmethod
     def run(self, request: ExecutionRequest) -> ExecutionResult:
         """Execute a stage command and return its exit status and resource metrics."""
 
+    def cancel(self, token: threading.Event) -> None:
+        """Stop every running stage whose request carries `token` (already set by the caller).
+
+        The default does nothing; a backend that can stop its stages overrides it."""
+
+
+_EXECUTOR_INIT_LOCK = threading.Lock()
+
 
 class LocalExecutor(Executor):
-    """Runs each stage in an isolated local subprocess and measures wall time, CPU, and RSS."""
+    """Runs each stage in an isolated local subprocess and measures wall time, CPU, and RSS.
+
+    Thread-safe: it tracks the children started for a cancellable request (one carrying a
+    `cancel_token`), so `cancel(token)` can kill them. Each of those starts in its own session,
+    and `cancel` kills its whole process group, so whatever the stage started dies with it.
+    Other children stay in this process group, so a terminal Ctrl-C reaches them directly."""
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._active: dict[int, tuple[subprocess.Popen[bytes], threading.Event]] = {}
+
+    def _state(self) -> tuple[threading.Lock, dict[int, Any]]:
+        # Subclasses that don't call `__init__` still work.
+        if "_lock" not in self.__dict__:
+            with _EXECUTOR_INIT_LOCK:
+                if "_lock" not in self.__dict__:
+                    self._active = {}
+                    self._lock = threading.Lock()
+        return self._lock, self._active
+
+    @staticmethod
+    def _kill_group(proc: subprocess.Popen[bytes]) -> None:
+        """SIGKILL the process group a cancellable child leads (it is not reaped yet, so its pid
+        and group id are still its own), or the child alone if the group is gone."""
+        try:
+            os.killpg(proc.pid, signal.SIGKILL)
+        except (ProcessLookupError, PermissionError):
+            try:
+                proc.kill()
+            except ProcessLookupError:
+                pass
+
+    def _forget(self, proc: subprocess.Popen[bytes]) -> None:
+        """Stop tracking `proc` (caller holds the lock); a reused pid another run registered stays."""
+        _, active = self._state()
+        if active.get(proc.pid, (None, None))[0] is proc:
+            del active[proc.pid]
+
+    def cancel(self, token: threading.Event) -> None:
+        lock, active = self._state()
+        with lock:
+            for proc, owner in list(active.values()):
+                if owner is token:
+                    self._kill_group(proc)
+
+    def _reap(self, proc: subprocess.Popen[bytes], tracked: bool) -> tuple[int, Any]:
+        """Wait for `proc` to exit and reap it: `(exit code, rusage or None)`. A tracked child
+        leaves the tracking table before its pid is freed, so `cancel` never signals a reused pid."""
+        lock, _ = self._state()
+        if tracked and hasattr(os, "waitid") and hasattr(os, "WNOWAIT"):
+            os.waitid(os.P_PID, proc.pid, os.WEXITED | os.WNOWAIT)  # exited, not reaped yet
+            with lock:
+                self._forget(proc)
+        elif tracked:
+            # No WNOWAIT: reap without blocking under the lock, so `cancel` can't come in between.
+            delay = 0.001
+            while True:
+                with lock:
+                    if hasattr(os, "wait4"):
+                        pid, status, rusage = os.wait4(proc.pid, os.WNOHANG)
+                        done = pid != 0
+                        if done:
+                            proc.returncode = os.waitstatus_to_exitcode(status)
+                    else:
+                        rusage = None
+                        done = proc.poll() is not None
+                    if done:
+                        self._forget(proc)
+                        assert proc.returncode is not None
+                        return proc.returncode, rusage
+                time.sleep(delay)
+                delay = min(2 * delay, 0.01)
+        if hasattr(os, "wait4"):
+            _, status, rusage = os.wait4(proc.pid, 0)
+            # Prevent subprocess.Popen.__del__ from attempting a second wait on the reaped pid.
+            proc.returncode = os.waitstatus_to_exitcode(status)
+            return proc.returncode, rusage
+        return proc.wait(), None
 
     def run(self, request: ExecutionRequest) -> ExecutionResult:
         env = None
@@ -140,21 +236,29 @@ class LocalExecutor(Executor):
         voluntary_ctx_switches: int | None = None
         involuntary_ctx_switches: int | None = None
 
+        lock, active = self._state()
+        token = request.cancel_token
+        tracked = token is not None
         with tempfile.TemporaryFile() as out_fp, tempfile.TemporaryFile() as err_fp:
-            start = time.perf_counter()
-            proc = subprocess.Popen(
-                request.command,
-                cwd=str(request.cwd) if request.cwd is not None else None,
-                env=env,
-                stdout=out_fp,
-                stderr=err_fp,
-            )
+            # Start under the lock, so a `cancel` either sees this child or comes first and
+            # leaves the token set, which is checked here.
+            with lock:
+                if token is not None and token.is_set():
+                    raise StageCancelled(f"Stage '{request.stage_name}' not started: the run was cancelled")
+                start = time.perf_counter()
+                proc = subprocess.Popen(
+                    request.command,
+                    cwd=str(request.cwd) if request.cwd is not None else None,
+                    env=env,
+                    stdout=out_fp,
+                    stderr=err_fp,
+                    start_new_session=tracked,
+                )
+                if token is not None:
+                    active[proc.pid] = (proc, token)
             try:
-                if hasattr(os, "wait4"):
-                    _, status, rusage = os.wait4(proc.pid, 0)
-                    exit_code = os.waitstatus_to_exitcode(status)
-                    # Prevent subprocess.Popen.__del__ from attempting a second wait on the reaped pid.
-                    proc.returncode = exit_code
+                exit_code, rusage = self._reap(proc, tracked)
+                if rusage is not None:
                     # On Linux ru_maxrss is in KiB (on macOS it is bytes).
                     max_rss_kb = int(rusage.ru_maxrss)
                     cpu_user_s = float(rusage.ru_utime)
@@ -163,16 +267,25 @@ class LocalExecutor(Executor):
                     major_page_faults = int(rusage.ru_majflt)
                     voluntary_ctx_switches = int(rusage.ru_nvcsw)
                     involuntary_ctx_switches = int(rusage.ru_nivcsw)
-                else:
-                    exit_code = proc.wait()
             except BaseException:
                 # Interrupted (e.g. SIGTERM turned into SystemExit): don't leave the child running.
-                try:
-                    proc.kill()
-                except ProcessLookupError:
-                    pass
+                with lock:
+                    if proc.returncode is None:
+                        if tracked:
+                            self._kill_group(proc)
+                        else:
+                            try:
+                                proc.kill()
+                            except ProcessLookupError:
+                                pass
+                    self._forget(proc)  # before the pid is freed
                 proc.wait()
                 raise
+            finally:
+                with lock:
+                    self._forget(proc)
+            if token is not None and token.is_set() and exit_code != 0:
+                raise StageCancelled(f"Stage '{request.stage_name}' was stopped: the run was cancelled")
 
             wall_time_s = time.perf_counter() - start
             cpu_efficiency: float | None = None

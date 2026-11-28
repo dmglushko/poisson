@@ -22,8 +22,11 @@ DAG mode (each stage call its own Slurm array task, see `dag.py`):
 Every mode also takes `--select NAME=LABEL` (repeatable; only branches whose choice NAME has one
 of the given labels, several names must all match) and `--shard-order stride|block`.
 
+On a personal machine, `python3 sweep.py --cores 8` runs branches in parallel with at most 8
+cores busy (see `run_experiment(cores=)`); the cluster modes above never do.
+
 The script can set the defaults of these options in Python, e.g.
-`experiment_main(pipeline, mode="dag", resources={"time": "00:30:00"}, split_by="mesh")`;
+`experiment_main(pipeline, mode="dag", resources={"time": "00:30:00"}, split_by="mesh", cores=8)`;
 a flag given on the command line wins. `--show-settings [--resources ...] [--shard-order ...]`
 prints the resolved mode, resources and shard order without running anything.
 
@@ -38,7 +41,7 @@ import os
 import re
 import sys
 import warnings
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Collection, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -51,6 +54,7 @@ from .driver import (
     _make_config,
     _normalize_select,
     _select_paths,
+    _validate_local_options,
     run_experiment,
 )
 from .report import ExperimentReport
@@ -88,6 +92,14 @@ def parse_dag_task(text: str) -> tuple[int, int]:
     return int(m.group(1)), int(m.group(2))
 
 
+def parse_cores(text: str) -> int:
+    """Parse a positive core count."""
+    stripped = text.strip()
+    if not (stripped.isascii() and stripped.isdigit()) or int(stripped) < 1:
+        raise argparse.ArgumentTypeError(f"expected a positive number of cores, got {text!r}")
+    return int(stripped)
+
+
 def parse_select(text: str) -> tuple[str, str]:
     """Parse `"NAME=LABEL"` into `(NAME, LABEL)`."""
     name, sep, label = text.partition("=")
@@ -122,6 +134,13 @@ def _build_parser(prog: str | None) -> argparse.ArgumentParser:
         action="append",
         metavar="NAME=LABEL",
         help="only branches whose compare(NAME) chose LABEL (repeat: same NAME = any of, different = all of)",
+    )
+    parser.add_argument(
+        "--cores",
+        type=parse_cores,
+        metavar="N",
+        help="personal machine only: run branches in parallel with at most N cores busy [the script's "
+        "cores=, else 1]; not with --count, --shard, --warmup, --collect or the DAG flags",
     )
     parser.add_argument(
         "--shard-order",
@@ -209,6 +228,8 @@ class _Defaults:
     max_fused_time: str
     max_array_size: int
     shard_order: str
+    cores: int
+    exclusive_stages: frozenset[str]
 
 
 def _validate_defaults(
@@ -221,8 +242,10 @@ def _validate_defaults(
     max_fused_time: str | None,
     max_array_size: int,
     shard_order: str,
+    cores: int = 1,
+    exclusive_stages: Collection[str] | None = None,
 ) -> _Defaults:
-    from .dag import DEFAULT_MAX_FUSED_TIME, normalize_resources, normalize_split_by, time_seconds
+    from .dag import DEFAULT_MAX_FUSED_TIME, normalize_split_by, time_seconds
 
     if mode not in MODES:
         raise ValueError(f"experiment_main: mode must be one of {', '.join(MODES)}, got {mode!r}")
@@ -239,24 +262,24 @@ def _validate_defaults(
         ok = False
     if not ok:
         raise ValueError(f"experiment_main: max_fused_time must be a positive time limit, got {fused!r}")
-    if resources is not None and not isinstance(resources, Mapping):
-        raise ValueError(f"experiment_main: resources must be a dict, got {resources!r}")
-    if stage_resources is not None and not isinstance(stage_resources, Mapping):
-        raise ValueError(f"experiment_main: stage_resources must be a dict of dicts, got {stage_resources!r}")
-    per_stage: dict[str, dict[str, Any]] = {}
-    for name, res in (stage_resources or {}).items():
-        if not isinstance(res, Mapping):
-            raise ValueError(f"experiment_main: stage_resources[{name!r}] must be a dict, got {res!r}")
-        per_stage[str(name)] = normalize_resources(res, where=f"experiment_main stage_resources[{name!r}]")
+    cores, norm_resources, per_stage, exclusive = _validate_local_options(
+        cores=cores,
+        resources=resources,
+        stage_resources=stage_resources,
+        exclusive_stages=exclusive_stages,
+        where="experiment_main",
+    )
     return _Defaults(
         mode=mode,
-        resources=normalize_resources(resources or {}, where="experiment_main resources"),
+        resources=norm_resources,
         stage_resources=per_stage,
         split_by=normalize_split_by(split_by),
         fuse=fuse,
         max_fused_time=fused.strip(),
         max_array_size=max_array_size,
         shard_order=shard_order,
+        cores=cores,
+        exclusive_stages=exclusive,
     )
 
 
@@ -274,6 +297,8 @@ def experiment_main(
     max_fused_time: str | None = None,
     max_array_size: int = 1000,
     shard_order: str = "stride",
+    cores: int = 1,
+    exclusive_stages: Collection[str] | None = None,
     **run_kwargs: Any,
 ) -> int:
     """Parse the command line, run `pipeline_fn` accordingly, and return a process exit code.
@@ -290,6 +315,13 @@ def experiment_main(
       `compare(..., split=True)` does (`--split-by` replaces both, `--no-split` clears both).
     - `fuse`, `max_fused_time`, `max_array_size`: DAG chain fusion and array size limits.
     - `shard_order`: `"stride"` or `"block"`, how branches are dealt to pieces.
+    - `cores`, `exclusive_stages`: personal machine only. A plain `python3 sweep.py` runs its
+      branches in parallel with at most `cores` cores busy, each stage holding its cpus from
+      `resources` / `stage_resources` / `run_stage(..., resources=)` (`--cores` wins). Every
+      cluster mode (`--shard`, `--dag-task`, `--collect`, `--warmup`, `--count`, an array
+      task) and any run inside a Slurm job ignores the script's `cores` and runs one branch at
+      a time, so a job never runs more stages than its allocation holds; `--cores N` (N > 1)
+      inside a Slurm job is refused.
 
     The other `run_kwargs` go to `run_experiment` (e.g. `repeats=`, `stage_cache_modes=`); the
     mode flags override `shard`, `dry_run`, `max_branches` and, for `--collect`, the cache modes.
@@ -311,12 +343,28 @@ def experiment_main(
         max_fused_time=max_fused_time,
         max_array_size=max_array_size,
         shard_order=shard_order,
+        cores=cores,
+        exclusive_stages=exclusive_stages,
     )
     for key in ("shard", "select", "dry_run", "max_branches", "require_cached", "force_cache_mode"):
         if key in run_kwargs:
             raise TypeError(f"experiment_main sets {key!r} from the command line; don't pass it")
     args = _build_parser(prog).parse_args(argv)
     shard_order = args.shard_order or defaults.shard_order
+    if args.cores is not None:
+        cluster = [flag for flag, on in (
+            ("--count", args.count), ("--shard", args.shard is not None), ("--warmup", args.warmup),
+            ("--collect", args.collect), ("--dag-plan", args.dag_plan is not None),
+            ("--dag-task", args.dag_task is not None), ("--show-settings", args.show_settings),
+        ) if on]
+        if not cluster and os.environ.get("SLURM_ARRAY_TASK_ID"):
+            cluster = ["a Slurm array task"]
+        elif not cluster and args.cores > 1 and os.environ.get("SLURM_JOB_ID"):
+            cluster = ["a Slurm job (use pieces or DAG tasks to run in parallel there)"]
+        if cluster:
+            print(f"--cores is for a plain run on this machine; it doesn't go with {', '.join(cluster)}",
+                  file=sys.stderr)
+            return EXIT_USAGE
     if args.show_settings:
         return _show_settings(args, defaults, shard_order)
     if args.collect and args.out is None:
@@ -425,6 +473,19 @@ def experiment_main(
             shard = "slurm"
         if shard is not None:
             run_kwargs.setdefault("continue_on_error", True)
+        else:
+            # A plain run on this machine: the script's `cores` applies, except inside a Slurm
+            # job, whose allocation it would overrun (an explicit --cores > 1 is refused above).
+            if args.cores is not None:
+                local_cores = args.cores
+            else:
+                local_cores = 1 if os.environ.get("SLURM_JOB_ID") else defaults.cores
+            run_kwargs.update(
+                cores=local_cores,
+                resources=defaults.resources,
+                stage_resources=defaults.stage_resources,
+                exclusive_stages=defaults.exclusive_stages,
+            )
         report = run_experiment(
             pipeline_fn, cache=cache, shard=shard, shard_order=shard_order, **run_kwargs  # type: ignore[arg-type]
         )

@@ -28,7 +28,7 @@ CHILD_ENV = "POISSON_RUNNER_PYTHON_STAGE"
 
 # Keyword arguments of a stage call that go to `run_stage`, so a stage function can't use them
 # as setting names.
-_RUN_OPTIONS = ("cache", "use_cache", "repeats", "warmup", "env", "resources", "threads")
+_RUN_OPTIONS = ("cache", "use_cache", "repeats", "warmup", "env", "resources", "threads", "exclusive")
 _RESERVED = frozenset({*_RUN_OPTIONS, "inputs", "outputs", "python_executable"})
 
 # Directory holding this copy of the `poisson_runner` package.
@@ -604,7 +604,7 @@ def python_stage(
     `inputs` maps names to `Path` (or a list of them, for a list input). A keyword-only `info`
     parameter receives a dict for log data (`.info.json`); `time` and caught Python warnings are
     added to it. Call the stage as `stage(run, inputs={...}, **settings)`; `cache=`, `repeats=`,
-    `warmup=`, `env=`, `resources=`, `threads=` and `python_executable=` go to the runner.
+    `warmup=`, `env=`, `resources=`, `threads=`, `exclusive=` and `python_executable=` go to the runner.
 
     The function runs in its own Python process (`python_executable`, default this one). Its
     cache entry depends on the input contents, the settings (`1` and `1.0` differ), the source

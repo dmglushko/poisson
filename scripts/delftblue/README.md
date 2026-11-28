@@ -96,6 +96,39 @@ choose the mode. Anything set nowhere gets the built-in default (`1` CPU, `01:00
 pieces, `stride`). `python3 sweep.py --show-settings` prints what the script resolves to. The
 collect job always uses 1 CPU, 30 minutes and `3900M` (or `--mem-per-cpu` when given).
 
+### Laptop and DelftBlue settings
+
+Running branches in parallel works differently on your own machine and on DelftBlue:
+
+- **On your machine**, `cores=8` in `experiment_main(...)` (or `python3 sweep.py --cores 8`) runs
+  branches side by side in one process, with at most 8 cores busy. `exclusive_stages=["solve"]`
+  (or `run_stage(..., exclusive=True)`) makes a stage run alone. The default is `cores=1`: one
+  branch after another, which gives the cleanest timings.
+- **On DelftBlue**, pieces (`--shards`) or DAG tasks (`--dag`) are the parallel jobs. Every job
+  runs its branches one at a time and ignores the script's `cores`, so a script with `cores=8`
+  never starts 8 stages inside a 1-CPU job. `--cores N` (N > 1) is refused inside a Slurm job.
+- **Both** read `resources`, `stage_resources` and a call's `run_stage(..., resources=, threads=)`.
+  With `stage_resources={"solve": {"cpus": 8}}`, a DAG solve task gets 8 CPUs, and on the laptop
+  a solve takes 8 of its cores (and runs with 8 threads) while 1-CPU stages share the rest. A
+  stage asking for more CPUs than `cores` gets all of them, but `threads=N` (or `OMP_NUM_THREADS`
+  in its `env`) above `cores` is refused, since the thread count is part of its cache key.
+
+```python
+raise SystemExit(experiment_main(
+    pipeline,
+    stage_resources={"solve": {"cpus": 8, "time": "04:00:00"}},  # both places
+    mode="dag",                                                  # DelftBlue only
+    cores=8,                                                     # laptop only
+))
+```
+
+On the laptop a parallel run first lists its branches with a dry run, like the pieces do, so a
+`compare()` whose options depend on a stage result that isn't cached yet needs `cores=1`. An AMR
+loop that reads `info["status"]` without a `compare()` inside works. A stage two branches need runs
+once; the other branch waits for it. If a branch fails, the run stops the other stages and
+reports that error, unless `continue_on_error=True` is passed. Ctrl-C stops all stages and
+cleans up.
+
 ### Choosing branches and how they are split
 
 `--select NAME=LABEL` submits only the branches whose `compare(NAME)` chose `LABEL`, for example
@@ -187,6 +220,8 @@ The other pieces' results are reused from the cache, and a new collect job is qu
   reuses it. `run_stage(..., threads=N)` instead sets the thread count for that stage and makes
   it part of the cache key (one entry per thread count, for scaling studies); in DAG mode it also
   gives the task at least N CPUs. A run with more threads than CPUs gets a warning in the report.
+  A parallel laptop run sets the same variables to each stage's CPU count, also outside the cache
+  key, so its results are reused on DelftBlue and the other way round.
 - **Locking.** `env.sh` sets `POISSON_CACHE_LOCK_MODE=lockfile`, which works across nodes, and
   turns off HDF5's own file locking. The runner also picks `lockfile` by itself inside any Slurm
   job.

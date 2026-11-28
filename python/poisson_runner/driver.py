@@ -12,7 +12,8 @@ import shutil
 import signal
 import threading
 import time
-from collections.abc import Hashable, Iterator, Mapping, Sequence
+from collections import deque
+from collections.abc import Collection, Hashable, Iterator, Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Generic, Literal, Optional, TypeVar, Union
@@ -30,7 +31,7 @@ from .cache import (
     file_signature,
     normalize_cache_mode,
 )
-from .executor import ExecutionRequest, Executor, LocalExecutor
+from .executor import ExecutionRequest, Executor, LocalExecutor, StageCancelled
 from .hashing import blake3_file, canonical_json
 from .report import BranchResult, ExperimentReport, StageTrace
 from .stages import Stage, StageCall
@@ -114,6 +115,131 @@ class Compare(Generic[T]):
             raise ValueError("Compare requires at least one option")
 
 
+class _Cancelled(BaseException):
+    """Stops a branch of a parallel local run once another branch failed or the run was
+    interrupted (a `BaseException`, so a pipeline's `except Exception:` can't swallow it)."""
+
+
+class _SharedStageError(RuntimeError):
+    """A shared stage failed in the branch that executed it; carries the producer's original error."""
+
+    def __init__(self, message: str, cause: BaseException) -> None:
+        super().__init__(message)
+        self.cause = cause
+
+
+@dataclass
+class _InFlight:
+    """A stage request one branch of a parallel local run is executing; others wait on `done`.
+
+    `writes`: the execution publishes to the cache (`use`/`refresh`). Only such an execution
+    satisfies a caller whose mode writes; any satisfies one that doesn't."""
+
+    writes: bool
+    done: threading.Event = field(default_factory=threading.Event)
+    error: BaseException | None = None
+
+
+class _LocalScheduler:
+    """Core budget of a parallel local run (`run_experiment(cores=N)`, N > 1).
+
+    A stage holds its cost in cores while it executes. Requests are served strictly in arrival
+    order, so a waiting multi-core or exclusive stage is never overtaken by a stream of 1-core
+    ones. `cancel()` stops new stages, wakes every waiter and kills the running stages through
+    the executor; `fail(exc)` records the error that stops the run first and cancels it. `idle`
+    counts branch threads waiting for another branch's stage (holding no cores), so the
+    dispatcher can start more branches in their place.
+    """
+
+    def __init__(
+        self,
+        cores: int,
+        *,
+        resources: Mapping[str, Any],
+        stage_resources: Mapping[str, Mapping[str, Any]],
+        exclusive_stages: frozenset[str],
+        executor: Executor,
+    ) -> None:
+        self.cores = cores
+        self.error: BaseException | None = None
+        self.resources = resources
+        self.stage_resources = stage_resources
+        self.exclusive_stages = exclusive_stages
+        self.executor = executor
+        self.cancel_token = threading.Event()
+        self.dispatch = threading.Condition()  # guards `idle` and the dispatcher's own counters
+        self.idle = 0
+        self._pool = threading.Condition()
+        self._free = cores
+        self._queue: deque[object] = deque()
+
+    @property
+    def cancelled(self) -> bool:
+        return self.cancel_token.is_set()
+
+    def fail(self, exc: BaseException) -> None:
+        """Cancel the run, keeping `exc` as its error unless it was already stopped."""
+        with self.dispatch:
+            if self.error is None and not self.cancelled:
+                self.error = exc
+        self.cancel()
+
+    def cancel(self) -> None:
+        if self.cancel_token.is_set():
+            return
+        self.cancel_token.set()
+        with self._pool:
+            self._pool.notify_all()
+        with self.dispatch:
+            self.dispatch.notify_all()
+        self.executor.cancel(self.cancel_token)
+
+    @contextlib.contextmanager
+    def cores_held(self, n: int) -> Iterator[None]:
+        """Hold `n` (1..cores) cores while the block runs, waiting for them in arrival order."""
+        ticket = object()
+        with self._pool:
+            self._queue.append(ticket)
+            try:
+                while not self.cancelled and (self._queue[0] is not ticket or self._free < n):
+                    self._pool.wait(0.5)
+            finally:
+                self._queue.remove(ticket)
+                self._pool.notify_all()
+            if self.cancelled:
+                raise _Cancelled()
+            self._free -= n
+        try:
+            yield
+        finally:
+            with self._pool:
+                self._free += n
+                self._pool.notify_all()
+
+    def wait_for(self, flight: _InFlight, stage_name: str, request_key: str) -> None:
+        """Wait, holding no cores, until another branch finished executing the same request."""
+        with self.dispatch:
+            self.idle += 1
+            self.dispatch.notify_all()
+        try:
+            while not flight.done.wait(0.25):
+                if self.cancelled:
+                    raise _Cancelled()
+        finally:
+            with self.dispatch:
+                self.idle -= 1
+        err = flight.error
+        if err is None:
+            return
+        if self.cancelled or isinstance(err, (_Cancelled, StageCancelled, KeyboardInterrupt, SystemExit)):
+            raise _Cancelled()
+        raise _SharedStageError(
+            f"Stage '{stage_name}' (request {request_key[:12]}) failed in another branch running the same "
+            f"request: {type(err).__name__}: {err}",
+            err,
+        ) from err
+
+
 @dataclass
 class _ExperimentState:
     """State shared by every branch of one `run_experiment` call.
@@ -122,10 +248,17 @@ class _ExperimentState:
       experiment, keyed by `request_key`. Later branches reuse them instead of re-running a shared
       prefix stage under `refresh` / `off` / `read_only`-miss.
     - `stages`: `Stage` objects built by the project helpers in `stages.py`, keyed by helper key.
+    - `in_flight`, `scheduler`: only in a parallel local run (`cores > 1`): the requests being
+      executed right now (keyed by request key and whether the execution writes the cache), and
+      the core budget.
+    `lock` guards the dicts, since a parallel local run's branches share them across threads.
     """
 
     executed: dict[str, dict[str, Artifact]] = field(default_factory=dict)
     stages: dict[Hashable, Stage] = field(default_factory=dict)
+    in_flight: dict[tuple[str, bool], _InFlight] = field(default_factory=dict)  # (request_key, writes)
+    scheduler: _LocalScheduler | None = None
+    lock: threading.RLock = field(default_factory=threading.RLock)
 
 
 @dataclass(frozen=True)
@@ -367,6 +500,7 @@ class RunContext:
         # Set while running one DAG task: the stage calls (by step) it executes, in order.
         self._dag_targets: dict[int, _DagTarget] | None = None
         self._dag_done: dict[int, StageTrace] = {}
+        self._replay_hint = ""  # appended to replay errors of runs that plan their branches first
 
     @classmethod
     def _for_branch(
@@ -444,22 +578,23 @@ class RunContext:
                 raise RuntimeError(
                     f"Non-deterministic compare() replay at step {self._step}: "
                     f"expected ({expected.name!r}, idx={expected.index}, label={expected.label!r}, n={expected.num_options}), "
-                    f"got ({choice_name!r}, n={len(spec.values)}, labels={spec.labels!r})"
+                    f"got ({choice_name!r}, n={len(spec.values)}, labels={spec.labels!r}){self._replay_hint}"
                 )
             idx = expected.index
             chosen_step = dataclasses.replace(expected, split=spec.split)
-        else:
-            if self._planned:
-                if self._truncation_reason is not None:
-                    raise RuntimeError(
-                        f"Sharded run reached unplanned compare({choice_name!r}) after {self._truncation_reason}, "
-                        f"which dry-run discovery cannot see; guard the read with `if not run.dry_run:` "
-                        f"or move compare({choice_name!r}) before it"
-                    )
+        elif self._planned:
+            where = "Parallel local run" if self._replay_hint else "Sharded or selected run"
+            if self._truncation_reason is not None:
                 raise RuntimeError(
-                    f"Sharded run discovered unplanned compare({choice_name!r}) not seen during dry-run discovery; "
-                    "compare() branching in sharded runs must not depend on stage outputs"
+                    f"{where} reached unplanned compare({choice_name!r}) after {self._truncation_reason}, "
+                    f"which dry-run discovery cannot see; guard the read with `if not run.dry_run:` "
+                    f"or move compare({choice_name!r}) before it{self._replay_hint}"
                 )
+            raise RuntimeError(
+                f"Unplanned compare({choice_name!r}) at step {self._step}: the dry-run discovery of this "
+                f"{where.lower()} didn't see it; compare() choices must not depend on stage outputs{self._replay_hint}"
+            )
+        else:
             idx = 0
             chosen_step = _ChoiceStep(choice_name, 0, spec.labels[0], len(spec.values), spec.split)
             # Push remaining options in reverse order so DFS pops them in natural user order.
@@ -482,11 +617,12 @@ class RunContext:
 
     def get_stage(self, key: Hashable, factory: Callable[[Path | str | None], Stage]) -> Stage:
         """Return the experiment-wide `Stage` for `key`, building it once via `factory(build_dir)`."""
-        stage = self._state.stages.get(key)
-        if stage is None:
-            stage = factory(self.build_dir)
-            self._state.stages[key] = stage
-        return stage
+        with self._state.lock:
+            stage = self._state.stages.get(key)
+            if stage is None:
+                stage = factory(self.build_dir)
+                self._state.stages[key] = stage
+            return stage
 
     def _pin_if_cached_object(self, art: Artifact) -> None:
         if art.path.parent == self.cache.objects_dir:
@@ -605,23 +741,31 @@ class RunContext:
         )
         return _single_or_dict(artifacts)
 
-    def _reusable(self, request_key: str, *, placeholders: bool) -> dict[str, Artifact] | None:
+    def _reusable(
+        self, request_key: str, *, placeholders: bool, published: bool = False
+    ) -> dict[str, Artifact] | None:
         """Outputs of the same request executed earlier in this experiment, if still on disk.
 
         Dry-run placeholders count only when `placeholders` (a dry-run call); a call that really
-        executes, such as a DAG task's own stage, must never "reuse" a placeholder."""
-        prior = self._state.executed.get(request_key)
-        if prior is None:
-            return None
-        for art in prior.values():
-            if _is_dry_run_placeholder(art):
-                if not placeholders:
-                    return None
-                continue
-            if not art.path.is_file():
-                del self._state.executed[request_key]
+        executes, such as a DAG task's own stage, must never "reuse" a placeholder. `published`:
+        only outputs that went to the cache count (a parallel run's call whose mode writes)."""
+        with self._state.lock:
+            prior = self._state.executed.get(request_key)
+            if prior is None:
                 return None
-            self._pin_if_cached_object(art)
+            if published and any(a.request_key is None for a in prior.values()):
+                return None
+            for art in prior.values():
+                if _is_dry_run_placeholder(art):
+                    if not placeholders:
+                        return None
+                    continue
+                if not art.path.is_file():
+                    del self._state.executed[request_key]
+                    return None
+        for art in prior.values():  # outside the state lock: pinning takes the cache lock
+            if not _is_dry_run_placeholder(art):
+                self._pin_if_cached_object(art)
         return prior
 
     # ------------------------------------------------------------------ stage execution
@@ -639,6 +783,7 @@ class RunContext:
         env: Mapping[str, str] | None = None,
         resources: Mapping[str, Any] | None = None,
         threads: int | None = None,
+        exclusive: bool = False,
     ) -> Artifact | dict[str, Artifact]:
         """Run a stage with content-addressed caching, 4-mode control, repeats, and dry-run.
 
@@ -651,7 +796,15 @@ class RunContext:
         the task's cpus at least N. Without it (and without those keys in `env`) the stage inherits
         the job's thread count and its cache entry is reused whatever that count was. A call whose
         own `resources=` gives fewer cpus than its env's thread count is refused.
+
+        In a parallel local run (`run_experiment(cores=N)`), the stage holds `min(cpus, N)` cores
+        while it runs (cpus as in DAG mode: `resources` < `stage_resources` < this call's
+        `resources=`, raised to `threads=`) and gets that many threads unless its env sets them;
+        `exclusive=True` makes it hold all N cores, so it runs alone. Both are ignored elsewhere.
+        A thread count above N (`threads=` or the env's) is refused there, even on a cache hit.
         """
+        if not isinstance(exclusive, bool):
+            raise TypeError(f"exclusive must be True or False, got {exclusive!r}")
         step = self._stage_calls
         self._stage_calls += 1
         targets = self._dag_targets
@@ -661,7 +814,7 @@ class RunContext:
             return self._run_stage(
                 stage, inputs=inputs, settings=settings, cache=cache, use_cache=use_cache, repeats=repeats,
                 warmup=warmup, env=env, resources=resources, threads=threads, step=step, forced_mode=forced,
-                target=None,
+                target=None, exclusive=exclusive,
             )
         assert targets is not None
         if any(s < step and s not in self._dag_done for s in targets):
@@ -671,7 +824,7 @@ class RunContext:
         result = self._run_stage(
             stage, inputs=inputs, settings=settings, cache=cache, use_cache=use_cache, repeats=repeats,
             warmup=warmup, env=env, resources=resources, threads=threads, step=step, forced_mode=None,
-            target=target,
+            target=target, exclusive=exclusive,
         )
         self._dag_done[step] = self.trace[-1]
         if step == max(targets):
@@ -694,8 +847,11 @@ class RunContext:
         step: int,
         forced_mode: CacheMode | None,
         target: _DagTarget | None,
+        exclusive: bool = False,
     ) -> Artifact | dict[str, Artifact]:
         is_target = target is not None
+        if not is_target and self._state.scheduler is not None and self._state.scheduler.cancelled:
+            raise _Cancelled()
         mode = self._resolve_cache_mode(stage, cache, use_cache)
         if forced_mode is not None:
             mode = forced_mode
@@ -736,6 +892,14 @@ class RunContext:
             )
         if target is not None:
             self._check_dag_target(target, stage, check, resolved, mode)
+        # A parallel local run checks the stage's cores and threads before any cache hit, so a bad
+        # declaration fails the same way on a cold and a warm cache.
+        sched = self._state.scheduler if target is None else None
+        local = (
+            self._local_cost(sched, stage, resources, env_threads, threads is not None, exclusive)
+            if sched is not None
+            else None
+        )
 
         def log(outcome: str) -> None:
             if self._call_log is None:
@@ -767,7 +931,13 @@ class RunContext:
         # While planning a DAG, a request planned earlier wins over an old cache entry, so a
         # `refresh` call and a later `use` call of the same request agree on what will run.
         prior = self._reusable(request_key, placeholders=True) if planning else None
-        if mode.reads and not self._skip_cache_lookup and not resolved.has_placeholder and prior is None:
+        # In a parallel run, a request another branch is executing and publishing wins over an
+        # old cache entry: a `use` call joins a running `refresh` instead of reading stale data.
+        joining = False
+        if sched is not None and mode.reads:
+            with self._state.lock:
+                joining = (request_key, True) in self._state.in_flight
+        if mode.reads and not self._skip_cache_lookup and not resolved.has_placeholder and prior is None and not joining:
             hit = self.cache.lookup(request_key, expected_outputs=stage.output_specs, lease=self._lease)
             if hit is not None:
                 log("hit")
@@ -776,7 +946,9 @@ class RunContext:
         # A DAG task's planned `refresh` must execute, even when an earlier stage of its fused chain
         # happened to produce the same request (e.g. identical bytes): the plan asked for a re-run.
         if prior is None and not (target is not None and not mode.reads):
-            prior = self._reusable(request_key, placeholders=dry_run)
+            # In a parallel run, a call whose mode writes reuses only published outputs, so it
+            # still publishes when an `off` branch ran the same request first.
+            prior = self._reusable(request_key, placeholders=dry_run, published=sched is not None and mode.writes)
         if prior is not None:
             first = next(iter(prior.values()))
             if _is_dry_run_placeholder(first):
@@ -794,23 +966,139 @@ class RunContext:
         if self._require_cached:
             raise CacheMissError(stage.name, request_key)
 
-        artifacts = self._execute(
-            stage,
-            mode=mode,
-            resolved=resolved,
-            settings=settings_dict,
-            env=env_dict,
-            resources=resources,
-            code_hash=code_hash,
-            request_key=request_key,
-            repeats=n_repeats,
-            warmup=n_warmup,
-            pre_signatures=pre_signatures,
-        )
-        self._state.executed[request_key] = artifacts
+        def execute(exec_env: dict[str, str] | None = env_dict, cancel_token: threading.Event | None = None):
+            return self._execute(
+                stage,
+                mode=mode,
+                resolved=resolved,
+                settings=settings_dict,
+                env=exec_env,
+                resources=resources,
+                code_hash=code_hash,
+                request_key=request_key,
+                repeats=n_repeats,
+                warmup=n_warmup,
+                pre_signatures=pre_signatures,
+                cancel_token=cancel_token,
+            )
+
+        if sched is not None:
+            assert local is not None
+            cost, n_threads = local
+            # Runtime-only thread counts, as `job.sbatch` exports them: kept out of the request key.
+            exec_env = dict(env_dict or {})
+            for key in THREAD_ENV_KEYS:
+                exec_env.setdefault(key, str(n_threads))
+
+            def run_with_cores() -> dict[str, Artifact]:
+                with sched.cores_held(cost):
+                    return execute(exec_env, sched.cancel_token)
+
+            artifacts, reused = self._execute_once(sched, stage, request_key, mode.writes, run_with_cores)
+            if reused:
+                first = next(iter(artifacts.values()))
+                return self._record(stage, artifacts, request_key=first.request_key, settings=settings_dict, reused=True)
+        else:
+            artifacts = execute()
+            with self._state.lock:
+                self._state.executed[request_key] = artifacts
         return self._record(
             stage, artifacts, request_key=request_key if mode.writes else None, settings=settings_dict
         )
+
+    @staticmethod
+    def _local_cost(
+        sched: _LocalScheduler,
+        stage: Stage,
+        resources: Mapping[str, Any] | None,
+        env_threads: int | None,
+        threads_floor: bool,
+        exclusive: bool,
+    ) -> tuple[int, int]:
+        """`(cores held, threads)` of a stage in a parallel local run. Its cpus resolve as in DAG
+        mode (1 < `resources` < `stage_resources[stage]` < the call's `resources=`); `threads=`
+        raises them unless the call's own `resources=` sets cpus. It gets `min(cpus, cores)`
+        threads and holds as many cores, or all of them when exclusive. An explicit thread count
+        (`threads=` or an env `*_NUM_THREADS`) above `cores` is refused: it is part of the request
+        key, so it can't be lowered to fit."""
+        from .dag import normalize_resources
+
+        if env_threads is not None and env_threads > sched.cores:
+            raise ValueError(
+                f"Stage '{stage.name}' asks for {env_threads} threads (threads= or *_NUM_THREADS in its env) "
+                f"but this parallel run has cores={sched.cores}; raise cores or lower the thread count"
+            )
+
+        explicit = normalize_resources(resources, where=f"Stage '{stage.name}' resources") if resources else {}
+        if "cpus" in explicit:
+            cpus = explicit["cpus"]  # at least the env's thread count (checked by the caller)
+        else:
+            configured = sched.stage_resources.get(stage.name, {}).get("cpus", sched.resources.get("cpus"))
+            cpus = configured if configured is not None else 1
+            if env_threads is not None and env_threads > cpus:
+                if threads_floor or configured is None:
+                    cpus = env_threads
+                else:
+                    raise ValueError(
+                        f"Stage '{stage.name}' asks for {env_threads} threads but resources cpus={cpus}; "
+                        "give it at least as many cpus as threads"
+                    )
+        n_threads = min(cpus, sched.cores)
+        if exclusive or stage.name in sched.exclusive_stages:
+            return sched.cores, n_threads
+        return n_threads, n_threads
+
+    def _execute_once(
+        self,
+        sched: _LocalScheduler,
+        stage: Stage,
+        request_key: str,
+        writes: bool,
+        run: Callable[[], dict[str, Artifact]],
+    ) -> tuple[dict[str, Artifact], bool]:
+        """Execute a request once across the branches of a parallel local run.
+
+        Returns `(outputs, reused)`. A branch making a request another branch is executing waits
+        for it, holding no cores, then reuses its outputs; if that execution failed, the error
+        is raised here too (or `_Cancelled`, when the run is being stopped). A call whose mode
+        `writes` waits only for (and reuses only) an execution that publishes to the cache."""
+        state = self._state
+        while True:
+            if sched.cancelled:
+                raise _Cancelled()
+            prior = self._reusable(request_key, placeholders=False, published=writes)
+            if prior is not None:
+                return prior, True
+            with state.lock:
+                published = state.executed.get(request_key)
+                if published is not None and not (writes and any(a.request_key is None for a in published.values())):
+                    continue  # published meanwhile: check it again
+                flight = state.in_flight.get((request_key, True))
+                if flight is None and not writes:
+                    flight = state.in_flight.get((request_key, False))
+                owner = flight is None
+                if flight is None:
+                    flight = state.in_flight[(request_key, writes)] = _InFlight(writes)
+            if not owner:
+                sched.wait_for(flight, stage.name, request_key)
+                continue
+            try:
+                artifacts = run()
+                with state.lock:
+                    existing = state.executed.get(request_key)
+                    if writes or existing is None or any(a.request_key is None for a in existing.values()):
+                        state.executed[request_key] = artifacts
+            except BaseException as exc:
+                if isinstance(exc, StageCancelled) and sched.cancelled:
+                    flight.error = _Cancelled()
+                    raise _Cancelled() from None
+                flight.error = exc
+                raise
+            finally:
+                with state.lock:
+                    state.in_flight.pop((request_key, writes), None)
+                flight.done.set()
+            return artifacts, False
 
     def _check_dag_target(
         self, target: _DagTarget, stage: Stage, check: str, resolved: _ResolvedInputs, mode: CacheMode
@@ -900,8 +1188,12 @@ class RunContext:
         repeats: int,
         warmup: int,
         pre_signatures: Mapping[Path, tuple[str, int, int, int, int]],
+        cancel_token: threading.Event | None = None,
     ) -> dict[str, Artifact]:
-        """Run warmup + measured repeats, then publish to the cache (or keep as ephemeral outputs)."""
+        """Run warmup + measured repeats, then publish to the cache (or keep as ephemeral outputs).
+
+        `env` is what the process gets, which in a parallel local run may hold more than the
+        request key's env (runtime thread counts)."""
         # Runner-owned staging directory ensures sibling temp files created by stage binaries
         # (e.g. poisson_adapt's *.tmp.* files) are wiped together if the stage fails or gets SIGTERM.
         stage_dir = self.cache.make_temp_path()
@@ -936,6 +1228,7 @@ class RunContext:
                 command=stage.build_command(call),
                 env=env,
                 resources=dict(resources) if resources is not None else {},
+                cancel_token=cancel_token,
             )
             m = measure(
                 self.executor,
@@ -1223,7 +1516,7 @@ def _call_pipeline(pipeline_fn: Callable[..., Any], ctx: RunContext, takes_ctx: 
         if ctx._step < len(path):
             raise RuntimeError(
                 f"Non-deterministic compare() replay: branch returned early at step {ctx._step} "
-                f"without reaching queued choice '{path[ctx._step].name}'"
+                f"without reaching queued choice '{path[ctx._step].name}'{ctx._replay_hint}"
             )
         return result
     finally:
@@ -1322,8 +1615,10 @@ def _run_branch(
     planned: bool,
     continue_on_error: bool,
     truncation_reason: str | None = None,
+    parallel: bool = False,
 ) -> BranchResult:
-    """Execute one branch. `planned=True` (sharding) forbids discovering new compare() choices."""
+    """Execute one branch. `planned=True` (sharding, selection, a parallel local run) forbids
+    discovering new compare() choices."""
     ctx = RunContext._for_branch(
         config,
         path=path,
@@ -1333,6 +1628,8 @@ def _run_branch(
         planned=planned,
         truncation_reason=truncation_reason,
     )
+    if parallel:
+        ctx._replay_hint = _PARALLEL_REPLAY_HINT
     start = time.perf_counter()
     result: Any = None
     error: str | None = None
@@ -1357,6 +1654,124 @@ def _run_branch(
         wall_time_s=time.perf_counter() - start,
         dry_run_stopped=dry_run_stopped,
     )
+
+
+_PARALLEL_REPLAY_HINT = (
+    ". A parallel local run (cores > 1) finds its branches with a dry run first, so its compare() "
+    "calls must not depend on stage outputs that are not cached yet; run this experiment with cores=1"
+)
+
+# Most branch threads a parallel local run keeps at once. Threads waiting for another branch's
+# stage hold no cores, so the dispatcher starts more branches in their place, up to this bound.
+_MAX_BRANCH_THREADS = 512
+
+
+def _validate_local_options(
+    *,
+    cores: int,
+    resources: Mapping[str, Any] | None,
+    stage_resources: Mapping[str, Mapping[str, Any]] | None,
+    exclusive_stages: Collection[str] | None,
+    where: str = "run_experiment",
+) -> tuple[int, dict[str, Any], dict[str, dict[str, Any]], frozenset[str]]:
+    """Validate `cores`, `resources`, `stage_resources` and `exclusive_stages`."""
+    from .dag import normalize_resources
+
+    if isinstance(cores, bool) or not isinstance(cores, int) or cores < 1:
+        raise ValueError(f"{where}: cores must be a positive integer, got {cores!r}")
+    if resources is not None and not isinstance(resources, Mapping):
+        raise ValueError(f"{where}: resources must be a dict, got {resources!r}")
+    if stage_resources is not None and not isinstance(stage_resources, Mapping):
+        raise ValueError(f"{where}: stage_resources must be a dict of dicts, got {stage_resources!r}")
+    per_stage: dict[str, dict[str, Any]] = {}
+    for name, res in (stage_resources or {}).items():
+        if not isinstance(res, Mapping):
+            raise ValueError(f"{where}: stage_resources[{name!r}] must be a dict, got {res!r}")
+        per_stage[str(name)] = normalize_resources(res, where=f"{where} stage_resources[{name!r}]")
+    if exclusive_stages is None:
+        exclusive: frozenset[str] = frozenset()
+    else:
+        if isinstance(exclusive_stages, (str, bytes)) or not isinstance(exclusive_stages, Collection):
+            raise ValueError(
+                f"{where}: exclusive_stages must be a list of stage names such as ['solve'], got {exclusive_stages!r}"
+            )
+        names = list(exclusive_stages)
+        if not all(isinstance(n, str) and n.strip() for n in names):
+            raise ValueError(f"{where}: exclusive_stages must hold non-empty stage names, got {exclusive_stages!r}")
+        exclusive = frozenset(n.strip() for n in names)
+    return cores, normalize_resources(resources or {}, where=f"{where} resources"), per_stage, exclusive
+
+
+def _run_parallel(
+    pipeline_fn: Callable[..., Any],
+    selected: list[tuple[int, _DiscoveredBranch]],
+    *,
+    takes_ctx: bool,
+    config: _BranchConfig,
+    lease: CacheLease,
+    state: _ExperimentState,
+    continue_on_error: bool,
+    sched: _LocalScheduler,
+) -> list[BranchResult]:
+    """Run planned branches in threads under the core budget; results keep `selected`'s order.
+
+    A new branch starts while fewer than `cores` branch threads are busy (threads waiting for
+    another branch's stage don't count). The first failure (without `continue_on_error`) or an
+    interrupt of this thread cancels the run: no new stage starts, running ones are killed and
+    every thread is joined (so its staging files are gone) before the error is raised."""
+    results: list[BranchResult | None] = [None] * len(selected)
+    threads: list[threading.Thread] = []
+    live = 0
+    dispatch = sched.dispatch
+
+    def work(pos: int, index: int, branch: _DiscoveredBranch) -> None:
+        nonlocal live
+        try:
+            results[pos] = _run_branch(
+                pipeline_fn, takes_ctx=takes_ctx, config=config, lease=lease, state=state, index=index,
+                path=branch.path, todo_stack=[], planned=True, truncation_reason=branch.truncated,
+                continue_on_error=continue_on_error, parallel=True,
+            )
+        except _Cancelled:
+            pass
+        except BaseException as exc:  # noqa: BLE001 - re-raised by the dispatcher
+            sched.fail(exc.cause if isinstance(exc, _SharedStageError) else exc)
+        finally:
+            with dispatch:
+                live -= 1
+                dispatch.notify_all()
+
+    try:
+        next_pos = 0
+        with dispatch:
+            while not sched.cancelled:
+                if next_pos < len(selected) and live - sched.idle < sched.cores and live < _MAX_BRANCH_THREADS:
+                    index, branch = selected[next_pos]
+                    # Each branch runs in a copy of the caller's context, so its ContextVars reach it.
+                    t = threading.Thread(
+                        target=contextvars.copy_context().run, args=(work, next_pos, index, branch),
+                        name=f"poisson-branch-{index}", daemon=True,
+                    )
+                    live += 1
+                    next_pos += 1
+                    threads.append(t)
+                    t.start()
+                    continue
+                if live == 0 and next_pos >= len(selected):
+                    break
+                dispatch.wait(0.25)
+        for t in threads:
+            while t.is_alive():
+                t.join(0.25)
+    except BaseException:
+        sched.cancel()
+        for t in threads:
+            while t.is_alive():
+                t.join(0.25)
+        raise
+    if sched.error is not None:
+        raise sched.error
+    return [r for r in results if r is not None]
 
 
 def _make_config(
@@ -1418,6 +1833,10 @@ def run_experiment(
     continue_on_error: bool = False,
     max_branches: int | None = None,
     force_cache_mode: CacheMode | str | bool | None = None,
+    cores: int = 1,
+    resources: Mapping[str, Any] | None = None,
+    stage_resources: Mapping[str, Mapping[str, Any]] | None = None,
+    exclusive_stages: Collection[str] | None = None,
 ) -> ExperimentReport:
     """Execute `pipeline_fn` across every combination of `compare(...)` choices without loops.
 
@@ -1437,10 +1856,28 @@ def run_experiment(
     Pass `require_cached=True` to raise `CacheMissError` instead of executing any stage on miss.
     `force_cache_mode` overrides every cache mode, per-call ones included (the collect job uses
     `"read_only"`, so a call that asks for `refresh` still finds the result a piece published).
+
+    `cores=N` (N > 1) runs branches in parallel on this machine, with at most N cores busy: each
+    stage holds `min(cpus, N)` of them, where `cpus` comes from `resources` <
+    `stage_resources[stage]` < the call's `run_stage(..., resources=)` (default 1, as in DAG
+    mode), and stages named in `exclusive_stages` (or called with `exclusive=True`) hold all N
+    and run alone. A request two branches make runs once; the second waits for it. Branches are
+    found by a dry run first, so `compare()` choices must not depend on uncached stage outputs.
+    `cores=1` (default) runs branches one after another; a dry run is always sequential.
+    Not combinable with `shard`, the cluster's way to run in parallel.
     """
     resolved_shard = _normalize_shard(shard)
     if shard_order not in ("stride", "block"):
         raise ValueError(f"shard_order must be 'stride' or 'block', got {shard_order!r}")
+    cores, resources, stage_resources, exclusive = _validate_local_options(
+        cores=cores, resources=resources, stage_resources=stage_resources, exclusive_stages=exclusive_stages
+    )
+    if cores > 1 and resolved_shard is not None:
+        raise ValueError(
+            "cores > 1 runs branches in parallel on this machine; a shard is one piece of a cluster run. "
+            "Use one or the other"
+        )
+    parallel = cores > 1 and not dry_run
     selection = _normalize_select(select)
     config = _make_config(
         cache=cache,
@@ -1465,7 +1902,9 @@ def run_experiment(
     with _sigterm_as_exit():
         selected: list[tuple[int, _DiscoveredBranch]] | None = None
         sharded = resolved_shard is not None and resolved_shard[1] > 1
-        if sharded or selection:
+        if max_branches is not None and max_branches <= 0:
+            selected = []  # nothing to run: skip the discovery too
+        elif sharded or selection or parallel:
             all_paths = _discover_branch_paths(pipeline_fn, takes_ctx=takes_ctx, config=config)
             selected = _select_paths(list(enumerate(all_paths)), selection)
             if sharded:
@@ -1482,7 +1921,17 @@ def run_experiment(
                 state=state,
                 continue_on_error=continue_on_error,
             )
-            if selected is not None:
+            if parallel:
+                assert selected is not None
+                state.scheduler = _LocalScheduler(
+                    cores,
+                    resources=resources,
+                    stage_resources=stage_resources,
+                    exclusive_stages=exclusive,
+                    executor=config.executor,
+                )
+                branches = _run_parallel(pipeline_fn, selected, **common, sched=state.scheduler)  # type: ignore[arg-type]
+            elif selected is not None:
                 for global_idx, branch in selected:
                     branches.append(
                         _run_branch(
