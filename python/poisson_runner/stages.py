@@ -21,6 +21,29 @@ if TYPE_CHECKING:
 _LDD_LINE_RE = re.compile(r"^\s*(\S+)\s+=>\s+(\S+)\s+\(0x[0-9a-fA-F]+\)\s*$")
 _NEEDED_RE = re.compile(r"\(NEEDED\)\s+Shared library:\s+\[([^\]]+)\]")
 
+# OS base libraries (glibc and the dynamic linker) live on each node's local OS image and can
+# differ by patch level between login and compute nodes (issue #3). Skip them by default while
+# still tracking module/compiler libraries (HDF5, libstdc++, libgcc_s, libgmsh, ...).
+_OS_BASE_LIB_PREFIXES = (
+    "libc.so",
+    "libm.so",
+    "libmvec.so",
+    "libpthread.so",
+    "librt.so",
+    "libdl.so",
+    "libresolv.so",
+    "libutil.so",
+    "libnsl.so",
+    "libanl.so",
+    "libcrypt.so",
+    "ld-linux",
+    "linux-vdso.so",
+)
+
+
+def _is_os_base_lib(soname: str) -> bool:
+    return any(soname.startswith(prefix) for prefix in _OS_BASE_LIB_PREFIXES)
+
 
 @functools.lru_cache(maxsize=256)
 def _shared_library_deps_for(path: str, _signature: tuple[str, int, int, int, int]) -> tuple[tuple[str, str], ...]:
@@ -52,15 +75,19 @@ def _shared_library_deps_for(path: str, _signature: tuple[str, int, int, int, in
     return tuple((name, resolved[name]) for name in sorted(set(names)) if name in resolved)
 
 
-def shared_library_deps(path: Path | str) -> list[tuple[str, Path]]:
+def shared_library_deps(path: Path | str, *, include_os_libs: bool = False) -> list[tuple[str, Path]]:
     """Return `(soname, resolved_path)` for the shared libraries an ELF executable links directly.
 
     Uses `readelf -d` (direct `NEEDED` entries) resolved through `ldd`; falls back to every library
-    `ldd` lists if `readelf` is unavailable. Returns `[]` for scripts, static binaries, or non-Linux
-    hosts without `ldd`. Memoized per file signature, so rebuilding the binary re-scans it.
+    `ldd` lists if `readelf` is unavailable. Skips OS base libraries (`libc`, `libm`, `ld-linux`,
+    `libpthread`, ...) by default so nodes at different OS patch levels share a cache while
+    module/compiler libraries (HDF5, `libstdc++`, `libgcc_s`) are still tracked; pass
+    `include_os_libs=True` to include them. Returns `[]` for scripts, static binaries, or
+    non-Linux hosts without `ldd`. Memoized per file signature, so rebuilding the binary re-scans it.
     """
     p = Path(path).resolve()
-    return [(name, Path(lib)) for name, lib in _shared_library_deps_for(str(p), file_signature(p))]
+    deps = _shared_library_deps_for(str(p), file_signature(p))
+    return [(name, Path(lib)) for name, lib in deps if include_os_libs or not _is_os_base_lib(name)]
 
 
 def resolve_binary(name: str, build_dir: Path | str | None = None) -> Path:

@@ -27,6 +27,9 @@
 #   --collect-only      queue only a collect job, over all branches (with --after)
 #   --after IDS         with --collect-only: start after these jobs succeeded, e.g. 4101,4102
 #   --out DIR           where the collect job saves the run [results/<name>/<job id>]
+#   --bundle            in the collect job, copy final output files out of /scratch into <out>/objects/
+#                       (use --bundle-stages to also copy intermediate stage outputs; raises collect time to 2h)
+#   --bundle-stages     same as --bundle, including intermediate stage outputs
 #   --name NAME         job and results name [experiment file name without .py]
 #   --print-only        show the sbatch commands without submitting anything
 #   --print-id          print only the main job id on stdout (for scripting; messages go to stderr);
@@ -73,7 +76,7 @@ experiment="$(cd "$(dirname "${experiment}")" && pwd)/$(basename "${experiment}"
 # cpus, mem_per_cpu, time_limit and shard_order stay empty unless given: the script resolves them.
 pieces="" cpus="" mem_per_cpu="" time_limit="" partition=compute-p1 account="" warmup=0
 only="" out="" name="" print_only=0 extra=() warmup_id= shard_order="" selects=()
-collect=1 collect_only=0 after="" print_id=0 cli_mode="" no_split=0
+collect=1 collect_only=0 after="" print_id=0 cli_mode="" no_split=0 bundle=""
 stage_resources=() split_by=() max_array_size=() fuse=() max_fused_time=()
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -91,6 +94,15 @@ while [[ $# -gt 0 ]]; do
         --collect-only) collect_only=1; shift ;;
         --after) require_arg "$@"; after="$2"; shift 2 ;;
         --out) require_arg "$@"; out="$2"; shift 2 ;;
+        --bundle) bundle="outputs"; shift ;;
+        --bundle=*)
+            bundle="${1#--bundle=}"
+            case "${bundle}" in
+                outputs|stages) ;;
+                *) echo "submit.sh: --bundle must be outputs or stages, got '${bundle}'" >&2; exit 1 ;;
+            esac
+            shift ;;
+        --bundle-stages) bundle="stages"; shift ;;
         --name) require_arg "$@"; name="$2"; shift 2 ;;
         --print-only) print_only=1; shift ;;
         --print-id) print_id=1; shift ;;
@@ -138,6 +150,10 @@ if (( collect_only )) && { (( ! collect )) || (( warmup )) || [[ -n "${only}${pi
     || (( ${#selects[@]} )) || (( dag_options )); }; then
     echo "submit.sh: --collect-only takes no --no-collect, --warmup, --only, --pieces, --select, --dag, --shards," \
         "--shard-order or DAG options" >&2
+    exit 1
+fi
+if [[ -n "${bundle}" ]] && (( ! collect )); then
+    echo "submit.sh: --bundle cannot be combined with --no-collect" >&2
     exit 1
 fi
 if [[ -n "${after}" ]] && (( ! collect_only )); then
@@ -207,12 +223,16 @@ submit() {  # submit LABEL SBATCH_ARGS...; prints the numeric job id
 }
 
 submit_collect() {  # submit_collect DEPENDENCY_IDS... ; prints the collect job id
-    local dep=()
+    local dep=() collect_time="00:30:00" bundle_args=()
     if (( $# )); then dep=(--dependency="afterok:$(IFS=:; echo "$*")"); fi
+    if [[ -n "${bundle}" ]]; then
+        collect_time="02:00:00"
+        bundle_args=(--bundle "${bundle}")
+    fi
     submit collect "${common[@]}" --job-name="${name}-collect" "${dep[@]}" \
-        --cpus-per-task=1 --mem-per-cpu="${mem_per_cpu:-3900M}" --time=00:30:00 --output="${logs}/collect_%j.out" \
+        --cpus-per-task=1 --mem-per-cpu="${mem_per_cpu:-3900M}" --time="${collect_time}" --output="${logs}/collect_%j.out" \
         "${extra[@]}" "${job}" --repo "${POISSON_REPO}" "${experiment}" --collect --out "${out}" --overwrite \
-        "${selects[@]}"
+        "${bundle_args[@]}" "${selects[@]}"
 }
 
 if (( collect_only )); then  # needs nothing from the script, whatever its mode
@@ -258,11 +278,6 @@ if [[ "${mode}" == shard ]] && (( dag_options )); then
 fi
 
 if [[ "${mode}" == dag ]]; then
-    if [[ -z "${SLURM_JOB_ID:-}" ]] && command -v srun >/dev/null 2>&1; then
-        echo "submit.sh: warning: planning a DAG outside a Slurm job. On DelftBlue a plan made on a login node" \
-            "makes every task refuse with \"Plan mismatch\"; plan on a compute node instead:" \
-            "srun -p compute-p1 -n1 -c1 -t 00:10:00 bash scripts/delftblue/submit.sh ... (README \"DAG mode\")" >&2
-    fi
     plan="${logs}/plan_$(date +%Y%m%d_%H%M%S)_$$.json"
     say "Planning ${experiment} ..."
     plan_output="$(cd "${POISSON_REPO}" && python3 "${experiment}" --dag-plan "${plan}" "${resources[@]}" \
@@ -335,7 +350,12 @@ count_output="$(cd "${POISSON_REPO}" && python3 "${experiment}" --count "${selec
     echo "submit.sh: '${experiment} --count' failed; fix the experiment before submitting" >&2
     exit 1
 }
-say "${count_output}"
+say "$(grep -v '^shard-incompatible:' <<<"${count_output}")"
+if grep -q '^shard-incompatible:' <<<"${count_output}"; then
+    echo "submit.sh: cannot submit as pieces because a compare() follows a stage-output read; " \
+        "guard output reads with 'if not run.dry_run:' or move compare() before them" >&2
+    exit 1
+fi
 branches="$(sed -n 's/^branches: \([0-9][0-9]*\)$/\1/p' <<<"${count_output}" | tail -n 1)"
 [[ -n "${branches}" ]] || { echo "submit.sh: could not read the branch count (does the script call experiment_main?)" >&2; exit 1; }
 pieces="${pieces:-${branches}}"

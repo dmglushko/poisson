@@ -284,11 +284,10 @@ pathlib.Path(a.info_out).write_text("{{}}")
         with mock.patch.object(Cache, "lease", autospec=True, side_effect=Cache.lease) as lease:
             report = run_experiment(pipe_check, cache=c, shard=(1, 2))
 
-        # 2 leases total (1 short-lived discovery lease + 1 execution lease), NOT 1 per branch.
-        self.assertEqual(lease.call_count, 2)
+        # Only 1 lease total (the execution lease): cache-free discovery needs no lease or cache pins.
+        self.assertEqual(lease.call_count, 1)
         self.assertEqual([b.index for b in report.branches], [1, 3, 5])
-        # Discovery never accumulated more than one branch's object.
-        self.assertLessEqual(max_discovery_pins, 1)
+        self.assertEqual(max_discovery_pins, 0)
         # Shard (1, 2)'s execution lease must never pin branches 0, 2, or 4.
         other_shard_objs = {all_obj_names[0], all_obj_names[2], all_obj_names[4]}
         for pinned in observed_exec_pins:
@@ -684,6 +683,101 @@ open(args[args.index("--out") + 1], "w").write(open(args[args.index("--in") + 1]
             if consumer.poll() is None:
                 consumer.kill()
                 consumer.wait()
+
+    # ------------------------------------------------------------------ issue #2: dry-run & discovery guards
+
+    def test_compare_after_read_fails_immediately_in_shards_and_select_and_count(self) -> None:
+        stage1, _ = self._stage("s1")
+        stage2, log2 = self._stage("s2")
+        c = Cache(self.tmp / "cmp_after_read_cache")
+
+        def pipe(run: RunContext) -> Artifact:
+            a = compare("a", ["x", "y"])
+            out1 = run.run_stage(stage1, settings={"tag": a})
+            text = out1.path.read_text()
+            b = compare("b", ["1", "2"])
+            return run.run_stage(stage2, settings={"tag": f"{text}-{b}"})
+
+        # 1. Sharded run fails immediately at compare("b") naming the read, without running stage2!
+        with self.assertRaisesRegex(RuntimeError, r"unplanned compare\('b'\).*read of 's1'"):
+            run_experiment(pipe, cache=c, shard=(0, 2))
+        self.assertFalse(log2.exists(), "stage after unplanned compare() must not execute")
+
+        # 2. select= on a compare() hidden behind a read raises a clear ValueError mentioning truncation.
+        with self.assertRaisesRegex(ValueError, "stopped early during discovery"):
+            run_experiment(pipe, cache=c, select={"b": "1"})
+
+        # 3. select= where one branch reaches `b` and another is truncated before `b` raises ValueError.
+        def partial_pipe(run: RunContext) -> None:
+            a = compare("a", ["warm_ok", "reads_first"])
+            if a == "reads_first":
+                out1 = run.run_stage(stage1, settings={"tag": a})
+                _ = out1.path.read_text()
+            compare("b", ["1", "2"])
+
+        with self.assertRaisesRegex(ValueError, "stopped during discovery.*before reaching compare\\('b'\\)"):
+            run_experiment(partial_pipe, cache=c, select={"b": "1"})
+
+        # 4. Warm cache + `--count` detects compare-after-read mismatch against cache-free discovery
+        #    and prints `shard-incompatible: compare-after-read` (which submit.sh refuses).
+        run_experiment(pipe, cache=c)  # warm up cache
+        out_buf = io.StringIO()
+        err_buf = io.StringIO()
+        with contextlib.redirect_stdout(out_buf), contextlib.redirect_stderr(err_buf):
+            code = experiment_main(pipe, argv=["--count"], cache=c)
+        self.assertEqual(code, 0)
+        self.assertIn("shard-incompatible: compare-after-read", out_buf.getvalue())
+        self.assertIn("without cache", err_buf.getvalue())
+
+    def test_real_bug_after_placeholder_raises_with_note_and_replay_guard(self) -> None:
+        stage, _ = self._stage("s_bug")
+        c = Cache(self.tmp / "bug_cache")
+
+        # Real bug (NameError/KeyError) after a placeholder in discovery is NOT swallowed, and gets a note.
+        def buggy_pipe(run: RunContext) -> None:
+            a = compare("a", ["x", "y"])
+            run.run_stage(stage, settings={"tag": a})
+            raise ValueError("genuine bug in script")
+
+        with self.assertRaises(ValueError) as ctx:
+            run_experiment(buggy_pipe, cache=c, shard=(0, 2))
+        self.assertIn("genuine bug in script", str(ctx.exception))
+        notes = getattr(ctx.exception, "__notes__", [])
+        self.assertTrue(any("s_bug" in n and "if not run.dry_run:" in n for n in notes), notes)
+
+        # Replay guard in discovery: a placeholder read before a queued compare() raises RuntimeError.
+        calls = 0
+
+        def flaky_discovery_pipe(run: RunContext) -> None:
+            nonlocal calls
+            calls += 1
+            if calls > 1:
+                out = run.run_stage(stage, settings={"tag": "early"})
+                _ = out.path.read_text()
+            compare("a", ["x", "y"])
+
+        with self.assertRaisesRegex(RuntimeError, "Non-deterministic compare\\(\\) replay"):
+            run_experiment(flaky_discovery_pipe, cache=c, shard=(0, 2))
+
+        # Replay guard in dry_run=True / --count: cache hit on pass 1, miss (evicted) on pass 2.
+        c2 = Cache(self.tmp / "evict_replay_cache")
+        run_experiment(lambda run: run.run_stage(stage, settings={"tag": "pre"}), cache=c2)
+        real_lookup = c2.lookup
+        lookup_calls = 0
+
+        def evict_on_second_call(*args, **kwargs):
+            nonlocal lookup_calls
+            lookup_calls += 1
+            return real_lookup(*args, **kwargs) if lookup_calls == 1 else None
+
+        def dry_replay_pipe(run: RunContext) -> None:
+            out = run.run_stage(stage, settings={"tag": "pre"})
+            _ = out.path.read_text()
+            compare("a", ["x", "y"])
+
+        c2.lookup = evict_on_second_call  # type: ignore[method-assign]
+        with self.assertRaisesRegex(RuntimeError, "Non-deterministic compare\\(\\) replay"):
+            run_experiment(dry_replay_pipe, cache=c2, dry_run=True)
 
 if __name__ == "__main__":
     unittest.main()

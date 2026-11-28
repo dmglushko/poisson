@@ -147,8 +147,20 @@ ErrorEstimate ErrorEstimator::estimate(const MeshProperties& mesh, const Refinem
     if (result.eta.size() != mesh.elements.size())
         throw std::logic_error(who + ": returned " + std::to_string(result.eta.size()) + " indicators for " +
                                std::to_string(mesh.elements.size()) + " tets");
-    for (std::size_t k = 0; k < result.eta.size(); ++k)
+    uint32_t non_metal = 0;
+    uint32_t excluded_non_metal = 0;
+    for (std::size_t k = 0; k < result.eta.size(); ++k) {
+        if (!mesh.materials[mesh.elements[k].material].is_metal) {
+            ++non_metal;
+            if (excluded_mask[k]) ++excluded_non_metal;
+        }
         if (excluded_mask[k]) result.eta[k] = 0;
+    }
+    result.all_excluded = non_metal > 0 && excluded_non_metal == non_metal;
+    if (result.all_excluded) {
+        result.info.warnings.push_back(
+            "all non-metal elements were excluded by the point-source rule; total error could not be estimated");
+    }
 
     // Scaled sums so large finite indicators (e.g. 1e200) do not overflow when squared.
     double largest = 0;

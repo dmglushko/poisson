@@ -17,7 +17,7 @@ import threading
 import time
 import uuid
 from dataclasses import dataclass, field
-from pathlib import Path
+from pathlib import Path, PosixPath
 from typing import Any, Iterable, Iterator, Mapping
 
 from .hashing import blake3_file, blake3_json, normalize_integral_floats
@@ -172,6 +172,70 @@ def file_signature(path: str | os.PathLike[str]) -> tuple[str, int, int, int, in
     return (str(p), st.st_ino, st.st_size, st.st_mtime_ns, st.st_ctime_ns)
 
 
+class DryRunPlaceholderError(RuntimeError):
+    """Raised when user code reads a dry-run placeholder artifact's file, info, or execution."""
+
+    def __init__(self, stage: str, output: str, *, field: str | None = None) -> None:
+        self.stage = stage
+        self.output = output
+        self.field = field
+        what = f"output '{output}' .{field}" if field else f"output '{output}'"
+        self.summary = f"read of '{stage}' {what}"
+        super().__init__(
+            f"Stage '{stage}' {what} is a dry-run placeholder (no file yet); this happens in --count, "
+            "dry_run=True, and branch discovery for shard=/select=. Guard output reads with `if not run.dry_run:`."
+        )
+
+
+_BASE_PATH_TYPE: type[Path] = PosixPath if os.name == "posix" else type(Path())
+
+
+class _PlaceholderPath(_BASE_PATH_TYPE):  # type: ignore[valid-type, misc]
+    """Path for a dry-run placeholder output: string/name operations work, filesystem access raises."""
+
+    def _identity(self) -> tuple[str, str]:
+        parts = self.parts
+        if len(parts) >= 3 and parts[0] == "<dry-run>":
+            return parts[1], "/".join(parts[2:])
+        if len(parts) == 2 and parts[0] == "<dry-run>":
+            return parts[1], "<dir>"
+        return "?", str(self)
+
+    def __fspath__(self) -> str:
+        stage, output = self._identity()
+        raise DryRunPlaceholderError(stage, output)
+
+
+class _PlaceholderMapping(Mapping[str, Any]):
+    """Read-only mapping for dry-run placeholder `info`/`execution` that raises on any access."""
+
+    def __init__(self, stage: str, output: str, field_name: str) -> None:
+        self._stage = stage
+        self._output = output
+        self._field = field_name
+
+    def _raise(self) -> Any:
+        raise DryRunPlaceholderError(self._stage, self._output, field=self._field)
+
+    def __getitem__(self, key: str) -> Any:
+        return self._raise()
+
+    def get(self, key: str, default: Any = None) -> Any:
+        return self._raise()
+
+    def __contains__(self, key: object) -> bool:
+        return bool(self._raise())
+
+    def __iter__(self) -> Iterator[str]:
+        return self._raise()
+
+    def __len__(self) -> int:
+        return int(self._raise())
+
+    def __repr__(self) -> str:
+        return f"<dry-run {self._field} placeholder for {self._stage}:{self._output}>"
+
+
 @dataclass(frozen=True)
 class Artifact:
     """Reference to an immutable file on disk identified by its BLAKE3 content hash."""
@@ -183,8 +247,9 @@ class Artifact:
     request_key: str | None = None
     cached: bool = False
     size_bytes: int = 0
-    info: dict[str, Any] = field(default_factory=dict)
-    execution: dict[str, Any] = field(default_factory=dict)
+    info: Mapping[str, Any] = field(default_factory=dict)
+    execution: Mapping[str, Any] = field(default_factory=dict)
+    ext: str | None = None
 
 
 @dataclass(frozen=True)
@@ -200,6 +265,8 @@ class CacheStats:
     max_bytes: int | None
     ephemeral_count: int = 0
     ephemeral_bytes: int = 0
+    shared_count: int = 0
+    shared_bytes: int = 0
 
 
 class CacheLease:
@@ -995,6 +1062,7 @@ class Cache:
                     size_bytes=actual_size,
                     info=info,
                     execution=execution,
+                    ext=ext,
                 )
 
             if lease is not None:
@@ -1059,6 +1127,7 @@ class Cache:
                     size_bytes=size_bytes,
                     info=info,
                     execution=execution,
+                    ext=ext,
                 )
 
             if lease is not None:
@@ -1107,6 +1176,10 @@ class Cache:
             try:
                 st = p.stat()
             except OSError:
+                continue
+            # Hard-linked objects shared with saved runs cost no extra disk to keep in the cache,
+            # and unlinking them frees 0 bytes while losing cache hits.
+            if st.st_nlink > 1:
                 continue
             total_bytes += st.st_size
             entries.append((st.st_mtime, st.st_size, p.name, p))
@@ -1288,15 +1361,20 @@ class Cache:
     def stats(self) -> CacheStats:
         object_count = 0
         object_bytes = 0
+        shared_count = 0
+        shared_bytes = 0
         for p in self.objects_dir.iterdir():
             if not p.is_file():
                 continue
             try:
-                sz = p.stat().st_size
+                st = p.stat()
             except OSError:
                 continue
             object_count += 1
-            object_bytes += sz
+            object_bytes += st.st_size
+            if st.st_nlink > 1:
+                shared_count += 1
+                shared_bytes += st.st_size
 
         request_count = 0
         metadata_bytes = 0
@@ -1336,6 +1414,8 @@ class Cache:
             max_bytes=self.max_bytes,
             ephemeral_count=ephemeral_count,
             ephemeral_bytes=ephemeral_bytes,
+            shared_count=shared_count,
+            shared_bytes=shared_bytes,
         )
 
     def clean(self, *, max_bytes: int | None = None, all_entries: bool = False) -> dict[str, int]:

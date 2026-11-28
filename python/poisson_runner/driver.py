@@ -19,7 +19,17 @@ from typing import Any, Callable, Generic, Literal, Optional, TypeVar, Union
 
 from . import stages as _stages
 from .benchmark import measure
-from .cache import Artifact, Cache, CacheLease, CacheMode, file_signature, normalize_cache_mode
+from .cache import (
+    Artifact,
+    Cache,
+    CacheLease,
+    CacheMode,
+    DryRunPlaceholderError,
+    _PlaceholderMapping,
+    _PlaceholderPath,
+    file_signature,
+    normalize_cache_mode,
+)
 from .executor import ExecutionRequest, Executor, LocalExecutor
 from .hashing import blake3_file, canonical_json
 from .report import BranchResult, ExperimentReport, StageTrace
@@ -29,6 +39,7 @@ __all__ = [
     "BranchResult",
     "CacheMissError",
     "Compare",
+    "DryRunPlaceholderError",
     "ExperimentReport",
     "RunContext",
     "StageTrace",
@@ -133,6 +144,29 @@ class _BranchConfig:
     dry_run: bool
     require_cached: bool = False
     force_cache_mode: CacheMode | None = None
+    skip_cache_lookup: bool = False
+
+
+class _NullLease:
+    """No-op lease for cache-free branch discovery (avoids lock/lease I/O across shards)."""
+
+    @property
+    def object_names(self) -> frozenset[str]:
+        return frozenset()
+
+    def pin(self, names: Any, *, _locked: bool = False) -> None:
+        pass
+
+    def begin_ephemeral_scope(self) -> None:
+        pass
+
+
+@dataclass(frozen=True)
+class _DiscoveredBranch:
+    """One branch path found by discovery, plus why it stopped early if it hit a placeholder read."""
+
+    path: tuple[_ChoiceStep, ...]
+    truncated: str | None = None
 
 
 @dataclass
@@ -288,7 +322,7 @@ class RunContext:
         build_dir: Path | str | None,
         path: tuple[_ChoiceStep, ...],
         todo_stack: list[tuple[_ChoiceStep, ...]],
-        lease: CacheLease,
+        lease: CacheLease | _NullLease,
         cache_mode: CacheMode | None = None,
         stage_cache_modes: Mapping[str, CacheMode] | None = None,
         default_repeats: int = 1,
@@ -299,6 +333,9 @@ class RunContext:
         require_cached: bool = False,
         state: _ExperimentState | None = None,
         force_cache_mode: CacheMode | None = None,
+        skip_cache_lookup: bool = False,
+        planned: bool = False,
+        truncation_reason: str | None = None,
     ) -> None:
         self.cache = cache
         self.executor = executor
@@ -317,6 +354,10 @@ class RunContext:
         self.dry_run = dry_run
         self._require_cached = require_cached
         self._force_cache_mode = force_cache_mode
+        self._skip_cache_lookup = skip_cache_lookup
+        self._planned = planned
+        self._truncation_reason = truncation_reason
+        self._last_placeholder_stage: str | None = None
         self._state = state if state is not None else _ExperimentState()
         self.choices: dict[str, Any] = {}
         self.choice_labels: dict[str, str] = {}
@@ -334,8 +375,10 @@ class RunContext:
         *,
         path: tuple[_ChoiceStep, ...],
         todo_stack: list[tuple[_ChoiceStep, ...]],
-        lease: CacheLease,
+        lease: CacheLease | _NullLease,
         state: _ExperimentState,
+        planned: bool = False,
+        truncation_reason: str | None = None,
     ) -> RunContext:
         return cls(
             cache=config.cache,
@@ -354,6 +397,9 @@ class RunContext:
             require_cached=config.require_cached,
             state=state,
             force_cache_mode=config.force_cache_mode,
+            skip_cache_lookup=config.skip_cache_lookup,
+            planned=planned,
+            truncation_reason=truncation_reason,
         )
 
     # ------------------------------------------------------------------ choices
@@ -403,6 +449,17 @@ class RunContext:
             idx = expected.index
             chosen_step = dataclasses.replace(expected, split=spec.split)
         else:
+            if self._planned:
+                if self._truncation_reason is not None:
+                    raise RuntimeError(
+                        f"Sharded run reached unplanned compare({choice_name!r}) after {self._truncation_reason}, "
+                        f"which dry-run discovery cannot see; guard the read with `if not run.dry_run:` "
+                        f"or move compare({choice_name!r}) before it"
+                    )
+                raise RuntimeError(
+                    f"Sharded run discovered unplanned compare({choice_name!r}) not seen during dry-run discovery; "
+                    "compare() branching in sharded runs must not depend on stage outputs"
+                )
             idx = 0
             chosen_step = _ChoiceStep(choice_name, 0, spec.labels[0], len(spec.values), spec.split)
             # Push remaining options in reverse order so DFS pops them in natural user order.
@@ -710,7 +767,7 @@ class RunContext:
         # While planning a DAG, a request planned earlier wins over an old cache entry, so a
         # `refresh` call and a later `use` call of the same request agree on what will run.
         prior = self._reusable(request_key, placeholders=True) if planning else None
-        if mode.reads and not resolved.has_placeholder and prior is None:
+        if mode.reads and not self._skip_cache_lookup and not resolved.has_placeholder and prior is None:
             hit = self.cache.lookup(request_key, expected_outputs=stage.output_specs, lease=self._lease)
             if hit is not None:
                 log("hit")
@@ -722,12 +779,15 @@ class RunContext:
             prior = self._reusable(request_key, placeholders=dry_run)
         if prior is not None:
             first = next(iter(prior.values()))
+            if _is_dry_run_placeholder(first):
+                self._last_placeholder_stage = stage.name
             log("reused")
             return self._record(stage, prior, request_key=first.request_key, settings=settings_dict, reused=True)
 
         if dry_run:
             artifacts = self._placeholders(stage, request_key)
             self._state.executed[request_key] = artifacts
+            self._last_placeholder_stage = stage.name
             log("run")
             return self._record(stage, artifacts, request_key=request_key, settings=settings_dict)
 
@@ -812,13 +872,16 @@ class RunContext:
         """Synthetic outputs for a dry run: deterministic ids so downstream request keys are stable."""
         return {
             out_name: Artifact(
-                path=Path(f"<dry-run:{stage.name}:{out_name}{ext}>"),
+                path=_PlaceholderPath("<dry-run>", stage.name, f"{out_name}{ext}"),
                 content_id=f"dryrun:{request_key}:{out_name}",
                 name=out_name,
                 stage=stage.name,
                 request_key=request_key,
                 cached=False,
                 size_bytes=0,
+                info=_PlaceholderMapping(stage.name, out_name, "info"),
+                execution=_PlaceholderMapping(stage.name, out_name, "execution"),
+                ext=ext,
             )
             for out_name, ext in stage.output_specs.items()
         }
@@ -955,6 +1018,7 @@ class RunContext:
                 size_bytes=out_path.stat().st_size,
                 info=info,
                 execution=execution,
+                ext=stage.output_specs.get(out_name),
             )
         return artifacts
 
@@ -1085,25 +1149,34 @@ def _normalize_select(select: Mapping[str, str | Sequence[str]] | None) -> dict[
 
 
 def _select_paths(
-    indexed: list[tuple[int, tuple[_ChoiceStep, ...]]],
+    indexed: list[tuple[int, _DiscoveredBranch]],
     selection: Mapping[str, Sequence[str]],
-) -> list[tuple[int, tuple[_ChoiceStep, ...]]]:
+) -> list[tuple[int, _DiscoveredBranch]]:
     """Keep branches whose every selected choice has an allowed label; reject unknown names/labels.
 
-    A branch that never reaches a selected choice (it sits behind an `if`) is left out.
+    A branch that never reaches a selected choice (it sits behind an `if`) is left out, unless
+    discovery truncated that branch early at a placeholder read (which is an error).
     """
     if not selection:
         return indexed
     seen: dict[str, list[str]] = {}
-    for _, path in indexed:
-        for step in path:
+    truncated_branches = [(idx, b.truncated) for idx, b in indexed if b.truncated is not None]
+    for _, branch in indexed:
+        for step in branch.path:
             labels = seen.setdefault(step.name, [])
             if step.label not in labels:
                 labels.append(step.label)
     for name, labels in selection.items():
         if name not in seen:
             known = ", ".join(repr(n) for n in seen) or "none"
-            raise ValueError(f"select: this experiment has no compare() named {name!r} (choices: {known})")
+            extra = ""
+            if truncated_branches:
+                extra = (
+                    f" ({len(truncated_branches)} branch(es) stopped early during discovery at "
+                    f"{truncated_branches[0][1]}; guard output reads with `if not run.dry_run:` "
+                    f"or move compare({name!r}) before them)"
+                )
+            raise ValueError(f"select: this experiment has no compare() named {name!r} (choices: {known}){extra}")
         unknown = [label for label in labels if label not in seen[name]]
         if unknown:
             raise ValueError(
@@ -1111,20 +1184,30 @@ def _select_paths(
                 f"(labels: {', '.join(map(repr, seen[name]))})"
             )
     kept = []
-    for index, path in indexed:
-        labels = {step.name: step.label for step in path}
+    for index, branch in indexed:
+        labels = {step.name: step.label for step in branch.path}
+        if branch.truncated is not None:
+            missing_selected = [name for name in selection if name not in labels]
+            if missing_selected and all(
+                labels[name] in allowed for name, allowed in selection.items() if name in labels
+            ):
+                raise ValueError(
+                    f"select: branch {index} stopped during discovery at {branch.truncated} before reaching "
+                    f"compare({missing_selected[0]!r}); cannot safely filter truncated branches. "
+                    f"Guard the read with `if not run.dry_run:` or move compare({missing_selected[0]!r}) before it."
+                )
         if all(labels.get(name) in allowed for name, allowed in selection.items()):
-            kept.append((index, path))
+            kept.append((index, branch))
     if not kept:
         raise ValueError(f"select: no branch matches {dict(selection)!r}")
     return kept
 
 
 def _shard_paths(
-    indexed: list[tuple[int, tuple[_ChoiceStep, ...]]],
+    indexed: list[tuple[int, _DiscoveredBranch]],
     shard: tuple[int, int],
     order: str,
-) -> list[tuple[int, tuple[_ChoiceStep, ...]]]:
+) -> list[tuple[int, _DiscoveredBranch]]:
     """This shard's part of `indexed`: every `total`-th entry ("stride") or one contiguous run ("block")."""
     index, total = shard
     if order == "stride":
@@ -1147,28 +1230,58 @@ def _call_pipeline(pipeline_fn: Callable[..., Any], ctx: RunContext, takes_ctx: 
         _ACTIVE_RUN.reset(token)
 
 
+def _call_dry_run_pipeline(
+    pipeline_fn: Callable[..., Any],
+    ctx: RunContext,
+    takes_ctx: bool,
+    path: tuple[_ChoiceStep, ...],
+) -> tuple[Any, str | None]:
+    """Run one branch in dry-run mode, stopping cleanly on a `DryRunPlaceholderError` after replay."""
+    try:
+        return _call_pipeline(pipeline_fn, ctx, takes_ctx, path), None
+    except DryRunPlaceholderError as exc:
+        if ctx._step < len(path):
+            raise RuntimeError(
+                f"Non-deterministic compare() replay: dry run hit {exc.summary} at step {ctx._step} "
+                f"before reaching queued choice '{path[ctx._step].name}'"
+            ) from exc
+        return None, exc.summary
+    except Exception as exc:
+        if ctx._last_placeholder_stage is not None:
+            exc.add_note(
+                f"raised during dry run after stage '{ctx._last_placeholder_stage}' returned a placeholder; "
+                "if this code reads its output via str(path) or a subprocess, guard it with `if not run.dry_run:`"
+            )
+        raise
+
+
 def _discover_branch_paths(
     pipeline_fn: Callable[..., Any],
     *,
     takes_ctx: bool,
     config: _BranchConfig,
-) -> list[tuple[_ChoiceStep, ...]]:
-    """Discover all branch choice paths via a zero-execution dry-run pass.
+) -> list[_DiscoveredBranch]:
+    """Discover all branch choice paths via a cache-free, zero-execution dry-run pass.
 
-    Uses a single short-lived lease whose pin set resets on each branch so discovery never
-    accumulates quadratic lease writes or pins other shards' objects for the shard's lifetime.
+    Skips cache lookups and leases so every shard discovers the exact same branches regardless
+    of cache state and avoids lock contention at startup.
     """
-    discovery = dataclasses.replace(config, cache_mode=CacheMode.READ_ONLY, dry_run=True, require_cached=False)
+    discovery = dataclasses.replace(
+        config,
+        cache_mode=CacheMode.READ_ONLY,
+        dry_run=True,
+        require_cached=False,
+        skip_cache_lookup=True,
+    )
     state = _ExperimentState()
+    null_lease = _NullLease()
     todo_stack: list[tuple[_ChoiceStep, ...]] = [()]
-    discovered: list[tuple[_ChoiceStep, ...]] = []
-    with config.cache.lease() as discovery_lease:
-        while todo_stack:
-            discovery_lease.begin_ephemeral_scope()
-            path = todo_stack.pop()
-            ctx = RunContext._for_branch(discovery, path=path, todo_stack=todo_stack, lease=discovery_lease, state=state)
-            _call_pipeline(pipeline_fn, ctx, takes_ctx, path)
-            discovered.append(tuple(ctx._prefix))
+    discovered: list[_DiscoveredBranch] = []
+    while todo_stack:
+        path = todo_stack.pop()
+        ctx = RunContext._for_branch(discovery, path=path, todo_stack=todo_stack, lease=null_lease, state=state)
+        _, stopped = _call_dry_run_pipeline(pipeline_fn, ctx, takes_ctx, path)
+        discovered.append(_DiscoveredBranch(tuple(ctx._prefix), truncated=stopped))
     return discovered
 
 
@@ -1208,19 +1321,27 @@ def _run_branch(
     todo_stack: list[tuple[_ChoiceStep, ...]],
     planned: bool,
     continue_on_error: bool,
+    truncation_reason: str | None = None,
 ) -> BranchResult:
     """Execute one branch. `planned=True` (sharding) forbids discovering new compare() choices."""
-    ctx = RunContext._for_branch(config, path=path, todo_stack=todo_stack, lease=lease, state=state)
+    ctx = RunContext._for_branch(
+        config,
+        path=path,
+        todo_stack=todo_stack,
+        lease=lease,
+        state=state,
+        planned=planned,
+        truncation_reason=truncation_reason,
+    )
     start = time.perf_counter()
     result: Any = None
     error: str | None = None
+    dry_run_stopped: str | None = None
     try:
-        result = _call_pipeline(pipeline_fn, ctx, takes_ctx, path)
-        if planned and todo_stack:
-            raise RuntimeError(
-                "Sharded run discovered unplanned compare() choices not seen during dry-run discovery; "
-                "compare() branching in sharded runs must not depend on uncached stage outputs"
-            )
+        if config.dry_run:
+            result, dry_run_stopped = _call_dry_run_pipeline(pipeline_fn, ctx, takes_ctx, path)
+        else:
+            result = _call_pipeline(pipeline_fn, ctx, takes_ctx, path)
     except Exception as exc:
         if not continue_on_error:
             raise
@@ -1234,6 +1355,7 @@ def _run_branch(
         result=result,
         error=error,
         wall_time_s=time.perf_counter() - start,
+        dry_run_stopped=dry_run_stopped,
     )
 
 
@@ -1341,7 +1463,7 @@ def run_experiment(
     overall_start = time.perf_counter()
 
     with _sigterm_as_exit():
-        selected: list[tuple[int, tuple[_ChoiceStep, ...]]] | None = None
+        selected: list[tuple[int, _DiscoveredBranch]] | None = None
         sharded = resolved_shard is not None and resolved_shard[1] > 1
         if sharded or selection:
             all_paths = _discover_branch_paths(pipeline_fn, takes_ctx=takes_ctx, config=config)
@@ -1361,9 +1483,17 @@ def run_experiment(
                 continue_on_error=continue_on_error,
             )
             if selected is not None:
-                for global_idx, path in selected:
+                for global_idx, branch in selected:
                     branches.append(
-                        _run_branch(pipeline_fn, index=global_idx, path=path, todo_stack=[], planned=True, **common)  # type: ignore[arg-type]
+                        _run_branch(
+                            pipeline_fn,
+                            index=global_idx,
+                            path=branch.path,
+                            todo_stack=[],
+                            planned=True,
+                            truncation_reason=branch.truncated,
+                            **common,  # type: ignore[arg-type]
+                        )
                     )
             else:
                 todo_stack: list[tuple[_ChoiceStep, ...]] = [()]

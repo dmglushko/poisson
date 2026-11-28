@@ -103,14 +103,18 @@ AdaptationResult ErrorBasedAdapter::Session::adapt_step(const MeshProperties& me
         const double rel = *settings_.relative_tolerance * baseline;
         bound = bound ? std::min(*bound, rel) : rel;
     }
-    if (bound && est.total <= *bound) {
+    if (est.all_excluded) {
+        result.info.warnings.push_back(
+            "point-source exclusion masked all non-metal elements; convergence cannot be checked");
+    }
+    if (!est.all_excluded && bound && est.total <= *bound) {
         state_.initial_error = baseline;
         result.status = AdaptationStatus::converged;
         result.extras = ErrorBasedExtras{std::move(est.eta), {}};
         return result;
     }
     if (over_limit) {
-        state_.initial_error = baseline;
+        if (!est.all_excluded) state_.initial_error = baseline;
         result.status = AdaptationStatus::limit_reached;
         result.extras = ErrorBasedExtras{std::move(est.eta), {}};
         return result;
@@ -128,7 +132,7 @@ AdaptationResult ErrorBasedAdapter::Session::adapt_step(const MeshProperties& me
         .warnings = {},
     });
     if (marked.empty()) {
-        state_.initial_error = baseline;
+        if (!est.all_excluded) state_.initial_error = baseline;
         result.status = AdaptationStatus::unchanged;
         result.extras = ErrorBasedExtras{std::move(est.eta), {}};
         return result;

@@ -11,15 +11,16 @@
 | `benchmark.py` | `measure(...)`: warmup + repeated executions, per-metric statistics, output determinism check |
 | `report.py` | `StageTrace`, `BranchResult`, `ExperimentReport` (table, JSON, wide/long CSV, DataFrame, `save`), `info_scalars` |
 | `records.py` | Tagged JSON encoding of branch outputs and choice values; explicit `register_record` registry |
+| `bundle.py` | Saved-run artifact bundling (`<dir>/objects/<content_id><ext>` via hard links or verified copies) and status checks |
 | `results.py` | `load_run` / `SavedRun` (`select`, `one`, `match`) and `evaluate` for post-hoc evaluation |
-| `stages.py` | `Stage` / `Stage.from_cli`, code hashing (binary + shared libraries), project stage factories and helpers (`import_mesh`, `import_free_charges`, `adapt_mesh`, and the verification stages `case_inputs`, `gmsh_mesh`, `case_mesh`) |
+| `stages.py` | `Stage` / `Stage.from_cli`, code hashing (binary + non-OS shared libraries), project stage factories and helpers (`import_mesh`, `import_free_charges`, `adapt_mesh`, and the verification stages `case_inputs`, `gmsh_mesh`, `case_mesh`) |
 | `python_stages.py` | `@python_stage`: a cached stage running a plain Python function in its own process, `load_value` |
 | `cases.py` | `Case(name, params)`: a verification case as a name and its parameters (a registered record), and `dirichlet` / `neumann` / `robin` helpers |
-| `cache.py` | Two-layer content-addressed cache, locking, leases, eviction |
+| `cache.py` | Two-layer content-addressed cache, locking, leases, eviction, dry-run placeholder types |
 | `executor.py` | `Executor` backends and per-process OS metrics |
 | `dag.py` | DAG mode: `plan_dag` (stage calls -> tasks -> Slurm array groups, plan file) and `run_dag_task` |
-| `experiment_cli.py` | `experiment_main`: standard CLI for experiment scripts (`--count`, `--shard`, `--collect`, `--dag-plan`, `--dag-task`) |
-| `cli.py` | `python3 -m poisson_runner` CLI for cache management (`cache status\|inspect\|clean`) and file hashing |
+| `experiment_cli.py` | `experiment_main`: standard CLI for experiment scripts (`--count`, `--shard`, `--collect`, `--bundle`, `--dag-plan`, `--dag-task`) |
+| `cli.py` | `python3 -m poisson_runner` CLI for cache management (`cache status\|inspect\|clean`), saved-run bundling (`run bundle\|status`), and file hashing |
 | `hashing.py` | BLAKE3 bindings and canonical JSON |
 
 Adding a pipeline stage means adding a `make_<stage>_stage` factory plus a helper function in
@@ -154,12 +155,22 @@ value = load_value(norms)                      # placeholder in a dry run: check
   Integral floats in `settings` hash as ints (`1.0` and `1` share an entry; not for Python function
   stages, `Stage(normalize_settings=False)`); the settings passed
   to the binary are unchanged.
+<<<<<<< HEAD
 - **Code hash:** BLAKE3 of the stage executable (unless `Stage(hash_executable=False)`), any `code_files` / `version`, and the shared
   libraries the executable links *directly* (`readelf -d` `NEEDED` entries resolved via `ldd`,
   keyed by soname, e.g. HDF5, libstdc++, libc). Transitive dependencies (libcurl, krb5, ...) are
   not tracked. Disable per stage with `track_shared_libs=False` (e.g. when cluster nodes carry
   different but compatible library builds and should share a cache). Scripts, static binaries,
   and hosts without `ldd` track no libraries.
+=======
+- **Code hash:** BLAKE3 of the stage executable, any `code_files` / `version`, and the non-OS
+  shared libraries the executable links *directly* (`readelf -d` `NEEDED` entries resolved via
+  `ldd`, keyed by soname, e.g. HDF5, `libstdc++`, `libgcc_s`). OS base libraries (`libc`, `libm`,
+  `ld-linux`, `libpthread`, ...) are skipped by default so cluster nodes at different OS patch
+  levels share a cache, and transitive dependencies (`libcurl`, `krb5`, ...) are not tracked.
+  Disable per stage with `track_shared_libs=False`. Scripts, static binaries, and hosts without
+  `ldd` track no libraries.
+>>>>>>> 0aaddef (Fix AMR all-excluded convergence, OS lib hashing, dry-run reads, and run bundling)
 - **Content deduplication:** Upstream refactors or binary edits invalidate that stage's
   `request_key`, but if it produces identical output bytes, its `content_id` is unchanged and
   all downstream stages still get cache hits.
@@ -226,9 +237,14 @@ SLURM shard is a separate process and keeps its own record.
   metadata) exceeds its usable CPUs stores an oversubscription warning with the cache entry.
 - **SLURM Job Array sharding (`shard=`):** `run_experiment(..., shard=(index, total))` or
   `shard="slurm"` (reads `SLURM_ARRAY_TASK_ID` / `SLURM_ARRAY_TASK_COUNT`, falling back to
-  no sharding outside an array job) discovers the full `compare(...)` tree under a short-lived
-  per-branch-scoped lease, then executes only this shard's branches under its own shard lease
-  against a shared `/scratch` cache. `shard_order="stride"` (default) takes the branches where
+  no sharding outside an array job) discovers the full `compare(...)` tree in a cache-free,
+  lock-free dry-run pass (so every shard agrees regardless of cache state), then executes only
+  this shard's branches under its own shard lease against a shared `/scratch` cache. Dry-run
+  placeholders raise `DryRunPlaceholderError` on any file/info/execution read; discovery and
+  `--count` stop that branch cleanly and keep the `compare()` prefix seen so far, while genuine
+  errors still fail fast. A planned run that later hits an unplanned `compare()` fails immediately
+  with the reason, and `--count` cross-checks against cache-free discovery so `submit.sh` refuses
+  at submit time if a warm cache hid a `compare()` after a stage read. `shard_order="stride"` (default) takes the branches where
   `branch_index % total == index`; `"block"` takes one contiguous run of the DFS order, so
   siblings sharing a prefix stage land in one shard. The cache has no in-flight claim, so
   shards that start together and miss the same request all execute it; block order avoids that
@@ -368,8 +384,8 @@ array starts once the arrays it reads from have finished. Shards remain the defa
   with a fallback input must not count as done). `run.dry_run` stays `True` for the pipeline's
   code, as in `--count`.
 - **Limits:** a pipeline whose shape depends on stage outputs (e.g. an AMR loop that reads
-  `info["status"]`) can't be planned, since a dry run has no outputs; a task then fails with
-  "Plan mismatch" and the read-only collect refuses. Use shards for those. Leases don't span
+  `info["status"]`) can't be planned: `plan_dag` refuses on `DryRunPlaceholderError` (guard
+  trailing reads with `if not run.dry_run:`, or use shards for output-dependent loops). Leases don't span
   Slurm jobs, so an output evicted between two arrays fails the later task: run DAG sweeps
   with `max_bytes=None` or a cache larger than the sweep. Rerunning a failed sweep means
   planning it again: only uncached tasks are submitted.
@@ -403,16 +419,26 @@ declares what it produced; what is done with the results is decided later, in an
   that clash with any fixed or data column are renamed `choice_<name>` in both layouts. Info
   field names therefore are an interface for analysis scripts: rename a field rather than
   changing its meaning or units.
-- **Saving:** `report.save(dir)` writes `report.json` (`format_version`, `cache_root`, choice
+- **Saving & bundling (`bundle.py`):** `report.save(dir, bundle="link"|"link_or_copy"|"none",
+  include="outputs"|"stages")` writes `report.json` (`format_version` 2, `cache_root`, choice
   labels and values, outputs as tagged JSON with artifact descriptors), `report.csv` (wide) and
-  `report_long.csv`. It encodes everything first, stages all three files, then publishes them
-  under a `.report.lock` flock, with `report.json` (the commit point) last; the old
-  `report.json` is removed before publishing, so a failure never leaves a mixed bundle. It
-  refuses dry runs, partial SLURM shards (unless
-  `allow_partial=True`), an existing report (unless `overwrite=True`), and returned values that
-  cannot be encoded (`RecordError`). Choice values are lenient: an unsavable one (a callable)
-  is stored as an `Unserializable` placeholder and matching uses labels. Output files are not
-  copied; they stay in the cache (protecting saved runs from eviction is a separate, open issue).
+  `report_long.csv`. Under `.report.lock`, ephemeral outputs (`cache="off"` or `--allow-recompute`)
+  are always materialized into `<dir>/objects/<content_id><ext>` before removing the old
+  `report.json`; all three report files are staged and published with `report.json` (the commit
+  point) last; cache objects are then bundled according to `bundle`:
+  - `"link"` *(default)*: hard-link into `<dir>/objects/` on the same filesystem (zero extra disk;
+    `cache clean --all` keeps saved runs intact, LRU eviction ignores `st_nlink > 1` objects, and
+    `rm -rf <dir>` releases them automatically). Across filesystems (e.g. `/scratch` to `/home`),
+    keep cache references and warn once with the `run bundle` command.
+  - `"link_or_copy"`: hard-link if possible, else stream-copy from an open fd with BLAKE3 check.
+  - `"none"`: keep cache references only (ephemeral outputs are still materialized).
+  `include="outputs"` *(default)* bundles returned branch outputs and choice values; `"stages"`
+  also bundles intermediate stage outputs. `overwrite=True` prunes unreferenced files from
+  `<dir>/objects/` after commit. Dry runs, partial shards (unless `allow_partial=True`), existing
+  reports (unless `overwrite=True`), and unencodable outputs (`RecordError`) are refused.
+  `python3 -m poisson_runner run bundle DIR [--link-only] [--stages]` bundles a saved run in
+  place (idempotent and resumable), and `run status DIR [--verify]` reports bundled, cache-only,
+  and missing artifacts.
 - **Records:** `@register_record("name")` on a dataclass (or a class with `to_dict`/`from_dict`)
   saves instances as `{"$record": "name", "data": ...}`. Loading never imports modules named in
   the file: import the module that registers the type first, else the value comes back as an
@@ -422,12 +448,14 @@ declares what it produced; what is done with the results is decided later, in an
   keys are rejected rather than coerced; an `UnresolvedRecord` can be re-saved and loads as the
   real type once registered; registering a name already used by a different class (module +
   qualname) fails, as does a dataclass with `init=False` fields without `to_dict`/`from_dict`.
-  Artifact descriptors keep `info` and `execution`. Only `save()` marks a file as a saved run
-  (`saved_run`, `format_version`); `save_json()` exports are not loadable.
+  Artifact descriptors keep `info`, `execution`, `ext`, and `location` (`"cache"|"ephemeral"|"external"`).
+  Only `save()` marks a file as a saved run (`saved_run`, `format_version`); `save_json()` exports
+  are not loadable.
 - **Loading:** `load_run(dir, cache=None)` rebuilds the `ExperimentReport` as a `SavedRun`.
-  Artifacts inside the cache are re-rooted under `cache.objects_dir` when `cache=` is given (a
-  different mount of the same cache), else under the saved `cache_root`. `branch["name"]` raises
-  `FileNotFoundError` if the file is gone. `select(**labels)` returns all matches (failed
+  Each artifact resolves first in `<dir>/objects/` when bundled (read once via `os.listdir`),
+  otherwise under `cache.objects_dir` when `cache=` is given (a different mount of the same
+  cache), else under the saved `cache_root`. `branch["name"]` raises `FileNotFoundError` if the
+  file is gone. `select(**labels)` returns all matches (failed
   branches included), `one(**labels)` exactly one successful match, and `match(branch,
   **overrides)` the branch with exactly the same set of choices except the overridden ones
   (`key=None` ignores a choice on both sides, e.g. one that only some branches have); both raise `LookupError` on zero, several, or a failed match.
@@ -440,6 +468,6 @@ declares what it produced; what is done with the results is decided later, in an
   per report. `cache` is where evaluation stages are cached and defaults to the saved run's
   cache; saved outputs are always read from where `load_run` resolved them. Dry-run reports are
   rejected. The result is an ordinary `ExperimentReport` (CSV, DataFrame, `save`).
-  As with any experiment, sharded evaluation runs a dry-run discovery pass first, where stage
-  outputs are placeholders: an `fn` that reads a file produced by a stage it just ran must
-  guard that read with `if not run.dry_run`.
+  In sharded evaluation, reads of stage outputs after the last `compare()` are handled safely
+  during discovery; guard reads with `if not run.dry_run:` only if another `compare()` follows
+  them or if you want `--count` to see stage calls after the read.

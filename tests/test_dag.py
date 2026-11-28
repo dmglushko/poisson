@@ -1031,21 +1031,66 @@ print(f"{{3000 + len(pathlib.Path({str(sbatch_log)!r}).read_text().splitlines())
         self.assertEqual(r.returncode, 0, r.stderr)
         self.assertIn("--array=1,3", r.stderr)
 
-        # Planning a DAG outside a Slurm job where srun exists warns about login nodes.
+        # OS base libraries are skipped in code hashes (#3), so planning outside a Slurm job needs no warning.
         del env["SLURM_JOB_ID"]
         r = submit("--print-only")
         self.assertEqual(r.returncode, 0, r.stderr)
-        self.assertIn("outside a Slurm job", r.stderr)
+        self.assertNotIn("outside a Slurm job", r.stderr)
+
+        # --bundle forwards --bundle outputs and raises collect time; --bundle-stages forwards stages.
+        r = submit("--bundle", "--print-only")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn("--bundle outputs", r.stderr)
+        self.assertIn("--time=02:00:00", r.stderr)
+        r = submit("--bundle-stages", "--print-only")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn("--bundle stages", r.stderr)
 
         for bad in (["--dag", "--shards"], ["--warmup"], ["--pieces", "2"], ["--shard-order", "block"],
                     ["--shards", "--split-by", "mesh"], ["--split-by", "mesh", "--no-split"],
                     ["--collect-only", "--dag"], ["--collect-only", "--no-fuse"], ["--no-fuse", "--fuse"],
+                    ["--bundle", "--no-collect"],
                     ["--shards", "--pieces", "4", "--only", "4"], ["--shards", "--pieces", "4", "--only", "2-7"],
                     ["--shards", "--pieces", "9", "--only", "1"], ["--shards", "--pieces", "4", "--only", "x"],
                     ["--collect-only", "--after", ",,"], ["--shards", "--pieces", "4", "--only", "3-1"],
                     ["--shards", "--pieces", "4", "--only", "18446744073709551616"]):
             r = submit(*bad)
             self.assertNotEqual(r.returncode, 0, bad)
+
+    def test_plan_dag_and_task_reject_placeholder_reads(self) -> None:
+        def pipe_read_path(run: RunContext) -> dict[str, object]:
+            k = compare("k", ["a", "b"])
+            m = run.run_stage(self.mesh, settings={"tag": k})
+            return {"text": m.path.read_text()}
+
+        with self.assertRaisesRegex(RuntimeError, "DAG mode can't plan past"):
+            plan_dag(pipe_read_path, cache=self.cache)
+
+        def pipe_read_info(run: RunContext) -> dict[str, object]:
+            k = compare("k", ["a", "b"])
+            m = run.run_stage(self.mesh, settings={"tag": k})
+            if m.info.get("status") != "ok":
+                return {}
+            return {"m": m}
+
+        with self.assertRaisesRegex(RuntimeError, "DAG mode can't plan past"):
+            plan_dag(pipe_read_info, cache=self.cache)
+
+        # In run_dag_task, reading an uncached non-parent placeholder before the target reports Plan mismatch.
+        def good_pipe(run: RunContext) -> None:
+            run.run_stage(self.mesh, settings={"tag": "root"})
+            run.run_stage(self.assemble, settings={"tag": "indep"})
+
+        plan = plan_dag(good_pipe, cache=self.cache)
+        asm_group = next(g.id for g in plan.groups if g.stages == ["assemble"])
+
+        def modified_pipe(run: RunContext) -> None:
+            m = run.run_stage(self.mesh, settings={"tag": "root"})
+            _ = m.path.read_text()
+            run.run_stage(self.assemble, settings={"tag": "indep"})
+
+        with self.assertRaisesRegex(RuntimeError, "Plan mismatch"):
+            run_dag_task(modified_pipe, plan.to_dict(), asm_group, 0, cache=self.cache)
 
 
 if __name__ == "__main__":

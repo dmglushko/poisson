@@ -8,15 +8,25 @@ import json
 import math
 import os
 import tempfile
+import warnings
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Literal
 
+from .bundle import (
+    BundleSummary,
+    bundle_report_objects,
+    collect_referenced_objects,
+    format_bytes,
+    materialize_ephemeral_artifacts,
+    prune_unreferenced_objects,
+    validate_bundle_options,
+)
 from .cache import Artifact
 from .records import encode
 
-REPORT_FORMAT_VERSION = 1
+REPORT_FORMAT_VERSION = 2
 
 Scalar = bool | int | float | str
 
@@ -85,6 +95,7 @@ class BranchResult:
     result: Any = None
     error: str | None = None
     wall_time_s: float = 0.0
+    dry_run_stopped: str | None = None
 
     @property
     def ok(self) -> bool:
@@ -311,6 +322,8 @@ class ExperimentReport:
     shard: tuple[int, int] | None = None
     cache_root: Path | None = None
     selection: dict[str, list[str]] | None = None
+    _from_saved: bool = field(default=False, init=False, repr=False, compare=False)
+    _last_bundle_summary: BundleSummary | None = field(default=None, init=False, repr=False, compare=False)
 
     @property
     def cache_hits(self) -> int:
@@ -347,12 +360,17 @@ class ExperimentReport:
     def _objects_dir(self) -> Path | None:
         return self.cache_root / "objects" if self.cache_root is not None else None
 
+    @property
+    def _ephemeral_dir(self) -> Path | None:
+        return self.cache_root / "ephemeral" if self.cache_root is not None else None
+
     # ------------------------------------------------------------------ JSON
 
     def to_dict(self, *, strict: bool = False) -> dict[str, Any]:
         """JSON-ready dict. `strict=True` raises `RecordError` on outputs that cannot be saved;
         otherwise they become `$unserializable` placeholders. Choice values are always lenient."""
         objects_dir = self._objects_dir
+        ephemeral_dir = self._ephemeral_dir
         payload: dict[str, Any] = {
             "dry_run": self.dry_run,
             "total_wall_time_s": self.total_wall_time_s,
@@ -367,15 +385,24 @@ class ExperimentReport:
             payload["shard"] = {"index": self.shard[0], "total": self.shard[1]}
         if self.selection:
             payload["selection"] = self.selection
-        payload["branches"] = [
-            {
+        branches_out: list[dict[str, Any]] = []
+        for b in self.branches:
+            bd: dict[str, Any] = {
                 "index": b.index,
                 "choices": b.choice_labels,
                 "choice_values": encode(
-                    b.choices, strict=False, objects_dir=objects_dir, where=f"branch {b.index} choices"
+                    b.choices,
+                    strict=False,
+                    objects_dir=objects_dir,
+                    ephemeral_dir=ephemeral_dir,
+                    where=f"branch {b.index} choices",
                 ),
                 "outputs": encode(
-                    b.outputs, strict=strict, objects_dir=objects_dir, where=f"branch {b.index} outputs"
+                    b.outputs,
+                    strict=strict,
+                    objects_dir=objects_dir,
+                    ephemeral_dir=ephemeral_dir,
+                    where=f"branch {b.index} outputs",
                 ),
                 "wall_time_s": b.wall_time_s,
                 "error": b.error,
@@ -388,20 +415,22 @@ class ExperimentReport:
                         "dry_run": s.dry_run,
                         "request_key": s.request_key,
                         "content_ids": s.content_ids,
-                        "outputs": encode(s.outputs, strict=False, objects_dir=objects_dir),
-                        "settings": encode(s.settings, strict=False, objects_dir=objects_dir),
+                        "outputs": encode(s.outputs, strict=False, objects_dir=objects_dir, ephemeral_dir=ephemeral_dir),
+                        "settings": encode(s.settings, strict=False, objects_dir=objects_dir, ephemeral_dir=ephemeral_dir),
                         "time_s": s.time_s,
                         "wall_time_s": s.wall_time_s,
                         "max_rss_kb": s.max_rss_kb,
                         "warnings": s.warnings,
-                        "info": encode(s.info, strict=False, objects_dir=objects_dir),
-                        "execution": encode(s.execution, strict=False, objects_dir=objects_dir),
+                        "info": encode(s.info, strict=False, objects_dir=objects_dir, ephemeral_dir=ephemeral_dir),
+                        "execution": encode(s.execution, strict=False, objects_dir=objects_dir, ephemeral_dir=ephemeral_dir),
                     }
                     for s in b.stages
                 ],
             }
-            for b in self.branches
-        ]
+            if b.dry_run_stopped is not None:
+                bd["dry_run_stopped"] = b.dry_run_stopped
+            branches_out.append(bd)
+        payload["branches"] = branches_out
         return payload
 
     def save_json(self, path: str | os.PathLike[str]) -> None:
@@ -415,14 +444,25 @@ class ExperimentReport:
         *,
         overwrite: bool = False,
         allow_partial: bool = False,
+        bundle: Literal["link", "link_or_copy", "none"] = "link",
+        include: Literal["outputs", "stages"] = "outputs",
     ) -> Path:
         """Save this run for later evaluation (`load_run(directory)`).
 
         Writes `report.json` (everything, including named outputs as artifact descriptors),
         `report.csv` (wide) and `report_long.csv`. Refuses dry runs, partial SLURM shards
-        and `select=` subsets (unless `allow_partial=True`) and outputs that cannot be saved. Output files stay in
-        the cache; the report references them.
+        and `select=` subsets (unless `allow_partial=True`) and outputs that cannot be saved.
+
+        Artifact durability into `<directory>/objects/<content_id><ext>`:
+        - `bundle="link"` (default): hard-link objects when on the same filesystem (zero extra
+          disk); across filesystems (e.g. DelftBlue `/scratch`), leave references and warn once.
+        - `bundle="link_or_copy"`: hard-link if possible, else copy and verify BLAKE3.
+        - `bundle="none"`: keep cache references only (ephemeral outputs from `cache="off"` or
+          `--allow-recompute` are still materialized so the saved run never points at dead files).
+        - `include="outputs"` (default) bundles returned branch outputs and choice values;
+          `include="stages"` also bundles intermediate stage outputs.
         """
+        validate_bundle_options(bundle, include)
         if self.dry_run:
             raise ValueError("Cannot save a dry-run report: its outputs are placeholders")
         if self.shard is not None and self.shard[1] > 1 and not allow_partial:
@@ -453,6 +493,17 @@ class ExperimentReport:
             if report_json.exists() and not overwrite:
                 raise FileExistsError(f"{report_json} already exists; pass overwrite=True to replace it")
 
+            # 1. Materialize ephemeral outputs before removing the old report.json so a failure
+            #    leaves any existing report intact and a committed report never points at ephemeral/.
+            materialize_ephemeral_artifacts(
+                payload,
+                out_dir,
+                include=include,
+                cache_root=self.cache_root,
+                allow_missing=self._from_saved,
+            )
+
+            # 2-3. Stage CSVs and JSON, then commit report.json last.
             writers: list[tuple[Path, Any]] = [
                 (out_dir / "report.csv", lambda p: self.save_csv(p, layout="wide")),
                 (out_dir / "report_long.csv", lambda p: self.save_csv(p, layout="long")),
@@ -473,6 +524,28 @@ class ExperimentReport:
             finally:
                 for tmp, _ in staged:
                     tmp.unlink(missing_ok=True)
+
+            # 4. Bundle cache objects as best effort after commit (resumable via `run bundle`).
+            summary = bundle_report_objects(
+                payload,
+                out_dir,
+                mode=bundle,
+                include=include,
+                cache_root=self.cache_root,
+            )
+            self._last_bundle_summary = summary
+
+            # 5. Prune files in objects/ not referenced by the newly committed report.
+            prune_unreferenced_objects(out_dir, collect_referenced_objects(payload))
+
+        if bundle == "link" and summary.left_in_cache > 0:
+            where = str(self.cache_root) if self.cache_root is not None else "cache"
+            warnings.warn(
+                f"{summary.left_in_cache} result file(s) ({format_bytes(summary.left_in_cache_bytes)}) "
+                f"left in {where}: different filesystem. Keep them with: "
+                f"python3 -m poisson_runner run bundle {out_dir}",
+                stacklevel=2,
+            )
         return out_dir
 
     # ------------------------------------------------------------------ tables
@@ -695,6 +768,8 @@ class ExperimentReport:
             stage_summary = ", ".join(self._stage_cell(s) for s in b.stages)
             if b.error is not None:
                 status = f"ERR: {b.error}"
+            elif b.dry_run_stopped is not None:
+                status = "DRY_RUN (stopped)"
             else:
                 status = "DRY_RUN" if self.dry_run else "OK"
             rows.append(
@@ -721,6 +796,12 @@ class ExperimentReport:
             f"\nTotal: {len(self.branches)} branches{shard_suffix}, {self.cache_hits} cache hits{reused_part}, "
             f"{self.cache_misses} {miss_word}, {self.total_wall_time_s:.3f}s"
         )
+        stopped = [b for b in self.branches if b.dry_run_stopped is not None]
+        if stopped:
+            lines.append(
+                f"Note: {len(stopped)} branch(es) stopped during dry run at a stage-output read "
+                f"({stopped[0].dry_run_stopped}); later stage calls and compare()s were not counted."
+            )
         for w in self.warnings:
             lines.append(f"Warning: {w}")
         return "\n".join(lines)

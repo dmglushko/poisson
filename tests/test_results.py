@@ -5,6 +5,7 @@ from __future__ import annotations
 import csv
 import dataclasses
 import fcntl
+import io
 import json
 import math
 import shutil
@@ -241,7 +242,9 @@ pathlib.Path(a.info_out).write_text(json.dumps({{"time": 0.01, "abs_diff": abs(l
         sol = b["solution"]
         self.assertIsInstance(sol, Artifact)
         self.assertEqual(sol.path.read_text(), "x" * len("cg-0.25"))
-        self.assertEqual(sol.path.parent, self.cache.objects_dir)
+        # Default save(bundle="link") hard-links outputs into <saved_dir>/objects/.
+        self.assertEqual(sol.path.parent, (saved_dir / "objects").resolve())
+        self.assertEqual(sol.path.stat().st_ino, (self.cache.objects_dir / sol.path.name).stat().st_ino)
         self.assertEqual(b["dofs"], 400)
         self.assertEqual(b["case"], BallCase(radius=10.0, eps=3.9))
         self.assertEqual(b["note"], Path("/tmp/x"))
@@ -259,7 +262,7 @@ pathlib.Path(a.info_out).write_text(json.dumps({{"time": 0.01, "abs_diff": abs(l
 
     def test_load_resolves_objects_under_another_cache_mount(self) -> None:
         r = run_experiment(self.sweep, cache=self.cache)
-        saved_dir = r.save(self.tmp / "sweep")
+        saved_dir = r.save(self.tmp / "sweep", bundle="none")
         moved = self.tmp / "moved_cache"
         shutil.copytree(self.cache.root, moved)
         shutil.rmtree(self.cache.root)
@@ -455,7 +458,7 @@ pathlib.Path(a.info_out).write_text(json.dumps({{"time": 0.01, "abs_diff": abs(l
             late.save(d, overwrite=True)
         self.assertEqual(before, {n: (d / n).read_bytes() for n in before})
         self.assertEqual(sorted(p.name for p in d.iterdir() if not p.name.startswith(".report.lock")),
-                         ["report.csv", "report.json", "report_long.csv"])
+                         ["objects", "report.csv", "report.json", "report_long.csv"])
 
         with (d / ".report.lock").open("a") as fp:
             fcntl.flock(fp.fileno(), fcntl.LOCK_EX)
@@ -597,6 +600,206 @@ pathlib.Path(a.info_out).write_text(json.dumps({{"time": 0.01, "abs_diff": abs(l
             self.assertEqual(a.read_text().splitlines()[0], b.read_text().splitlines()[0], layout)
         saved = load_run(cold.save(self.tmp / "exec"))
         self.assertIn("wall_time_s", saved.branches[0]["solution"].execution)
+
+    # ------------------------------------------------------------------ bundling (#1 & #4)
+
+    def test_save_link_survives_cache_clean_and_lru_ignores_shared(self) -> None:
+        r = run_experiment(self.sweep, cache=self.cache)
+        saved_dir = r.save(self.tmp / "linked_run")  # default: bundle="link"
+
+        st = self.cache.stats()
+        self.assertGreater(st.shared_count, 0)
+        self.assertEqual(st.shared_count, st.object_count)
+        self.assertEqual(st.shared_bytes, st.object_bytes)
+
+        # LRU eviction skips objects with st_nlink > 1 because unlinking frees 0 bytes.
+        evicted = self.cache.evict_lru(max_bytes=0)
+        self.assertEqual(evicted, 0)
+        self.assertEqual(self.cache.stats().object_count, st.object_count)
+
+        # cache clean --all removes cache names, but the saved run's hard links keep data intact.
+        res = self.cache.clean(all_entries=True)
+        self.assertGreater(res["removed_objects"], 0)
+        self.assertEqual(self.cache.stats().object_count, 0)
+
+        saved = load_run(saved_dir)
+        ana = evaluate(saved, lambda run, b: {"len": len(b["solution"].path.read_text())}, cache=self.cache)
+        self.assertEqual(len(ana.branches), 4)
+        self.assertTrue(all(b.ok for b in ana.branches))
+
+    def test_exdev_fallback_link_vs_link_or_copy_and_cli_bundle_status(self) -> None:
+        import errno
+        import warnings
+        from unittest import mock
+        from poisson_runner import cli, saved_run_status
+
+        r = run_experiment(self.sweep, cache=self.cache)
+
+        def fail_exdev(*_args, **_kwargs):
+            raise OSError(errno.EXDEV, "Invalid cross-device link")
+
+        # 1. Default bundle="link" on EXDEV warns once and leaves references in cache.
+        link_dir = self.tmp / "exdev_link"
+        with mock.patch("os.link", side_effect=fail_exdev), warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            r.save(link_dir)
+        self.assertEqual(len(caught), 1)
+        self.assertIn("run bundle", str(caught[0].message))
+        st = saved_run_status(link_dir)
+        self.assertEqual(st.bundled, 0)
+        self.assertEqual(st.cache_only, st.total)
+        self.assertEqual(st.missing, 0)
+
+        # 2. CLI `run bundle` copies across EXDEV and verifies BLAKE3; `run status --verify` passes.
+        with mock.patch("os.link", side_effect=fail_exdev):
+            code = cli.main(["run", "bundle", str(link_dir)])
+        self.assertEqual(code, 0)
+        self.assertEqual(cli.main(["run", "status", str(link_dir), "--verify"]), 0)
+        st2 = saved_run_status(link_dir, verify=True)
+        self.assertEqual(st2.bundled, st2.total)
+        self.assertEqual(st2.cache_only, 0)
+        self.assertEqual(st2.corrupted, ())
+
+        # 3. Direct bundle="link_or_copy" on EXDEV copies during save().
+        copy_dir = self.tmp / "exdev_copy"
+        with mock.patch("os.link", side_effect=fail_exdev):
+            r.save(copy_dir, bundle="link_or_copy")
+        self.cache.clean(all_entries=True)
+        loaded = load_run(copy_dir)
+        self.assertEqual(loaded.one(solver="cg", h=0.25)["solution"].path.read_text(), "x" * len("cg-0.25"))
+
+    def test_ephemeral_and_allow_recompute_outputs_always_materialized(self) -> None:
+        from poisson_runner import experiment_main
+
+        # cache="off" writes to ephemeral/; even bundle="none" must materialize ephemeral outputs.
+        r = run_experiment(self.sweep, cache=self.cache, cache_mode="off")
+        saved_dir = r.save(self.tmp / "ephemeral_run", bundle="none")
+        self.cache.clean(all_entries=True)
+        loaded = load_run(saved_dir)
+        self.assertEqual(loaded.one(solver="direct", h=0.5)["solution"].path.read_text(), "x" * len("direct-0.5"))
+
+        # --collect --allow-recompute writes recomputed stages to ephemeral/; save must keep them alive.
+        out_dir = self.tmp / "collect_recompute"
+        code = experiment_main(
+            self.sweep,
+            argv=["--collect", "--allow-recompute", "--out", str(out_dir)],
+            cache=self.cache,
+        )
+        self.assertEqual(code, 0)
+        self.cache.clean(all_entries=True)
+        loaded2 = load_run(out_dir)
+        self.assertEqual(loaded2.one(solver="cg", h=0.5)["solution"].path.read_text(), "x" * len("cg-0.5"))
+
+    def test_partial_bundle_overwrite_pruning_old_v1_and_missing_eviction(self) -> None:
+        from poisson_runner import bundle_saved_run, cli, saved_run_status
+
+        r = run_experiment(self.sweep, cache=self.cache)
+        d = r.save(self.tmp / "partial_run", bundle="link")
+        objs = sorted((d / "objects").iterdir())
+        self.assertGreaterEqual(len(objs), 2)
+        # Remove one bundled object: that artifact falls back to cache, others stay bundled.
+        removed_name = objs[0].name
+        objs[0].unlink()
+        loaded = load_run(d)
+        parents = {b["solution"].path.parent for b in loaded.branches}
+        self.assertIn((d / "objects").resolve(), parents)
+        self.assertIn(self.cache.objects_dir, parents)
+        st = saved_run_status(d)
+        self.assertEqual(st.cache_only, 1)
+        self.assertEqual(st.bundled, st.total - 1)
+
+        # Overwrite with a smaller run prunes unreferenced objects from <dir>/objects/.
+        small = run_experiment(lambda run: {"solution": run.run_stage(self.gen, settings={"tag": "only-one"})}, cache=self.cache)
+        small.save(d, overwrite=True)
+        remaining = [p.name for p in (d / "objects").iterdir()]
+        self.assertEqual(len(remaining), 1)
+        self.assertNotIn(removed_name, remaining)
+
+        # Old format_version=1 report (without location/ext) still loads cleanly.
+        raw = json.loads((d / "report.json").read_text())
+        raw["format_version"] = 1
+        for b in raw["branches"]:
+            b["outputs"]["solution"]["$artifact"].pop("location", None)
+            b["outputs"]["solution"]["$artifact"].pop("ext", None)
+        (d / "report.json").write_text(json.dumps(raw))
+        self.assertEqual(load_run(d).branches[0]["solution"].path.read_text(), "x" * len("only-one"))
+
+        # Evicting an object before bundling reports it clearly and exits non-zero.
+        d2 = r.save(self.tmp / "evicted_run", bundle="none")
+        self.cache.clean(all_entries=True)
+        summary = bundle_saved_run(d2)
+        self.assertGreater(summary.missing, 0)
+        self.assertEqual(cli.main(["run", "bundle", str(d2)]), 1)
+
+    # ------------------------------------------------------------------ issue #2: sharded evaluate reads outputs
+
+    def test_sharded_evaluate_reading_stage_outputs_on_cold_cache(self) -> None:
+        from poisson_runner import DryRunPlaceholderError, experiment_main
+
+        r = run_experiment(self.sweep, cache=self.cache)
+        saved_dir = r.save(self.tmp / "eval_src")
+        saved = load_run(saved_dir)
+        eval_cache = Cache(self.tmp / "eval_cold_cache")
+
+        def analysis(run: RunContext, b):
+            ref = saved.match(b, solver="direct")
+            d = run.run_stage(self.diff, inputs={"a": b["solution"], "b": ref["solution"]})
+            # Exercise read_text, open(), with_suffix(), info[], info.get(), execution[] without `if not run.dry_run:`.
+            text = d.path.read_text()
+            with open(d.path, encoding="utf-8") as fp:
+                text2 = fp.read()
+            assert text == text2
+            delta = d.info["abs_diff"]
+            delta2 = d.info.get("abs_diff")
+            wall = d.execution["wall_time_s"]
+            return {"diff": d, "delta": delta, "delta2": delta2, "wall": wall}
+
+        # Direct placeholder checks in dry_run: path, derived path, info, execution all raise DryRunPlaceholderError.
+        seen_errors: list[type] = []
+
+        def probe(run: RunContext) -> None:
+            out = run.run_stage(self.gen, settings={"tag": "probe-cold"})
+            for fn in (
+                lambda: out.path.read_text(),
+                lambda: open(out.path),
+                lambda: out.path.exists(),
+                lambda: out.path.with_suffix(".info.json").read_text(),
+                lambda: out.info["length"],
+                lambda: out.info.get("length"),
+                lambda: out.execution["wall_time_s"],
+            ):
+                try:
+                    fn()
+                except DryRunPlaceholderError as exc:
+                    seen_errors.append(type(exc))
+                    self.assertEqual(exc.stage, "gen")
+            self.assertEqual(out.path.suffix, ".txt")
+            self.assertEqual(out.path.name, "out.txt")
+
+        run_experiment(probe, cache=eval_cache, dry_run=True)
+        self.assertEqual(len(seen_errors), 7)
+
+        # Sharded evaluate on a completely cold cache succeeds across both shards!
+        s0 = evaluate(saved, analysis, cache=eval_cache, shard=(0, 2))
+        s1 = evaluate(saved, analysis, cache=eval_cache, shard=(1, 2))
+        self.assertEqual(len(s0.branches) + len(s1.branches), 4)
+        self.assertTrue(all(b.ok for b in s0.branches + s1.branches))
+        self.assertEqual({b["delta"] for b in s0.branches + s1.branches}, {0, abs(len("cg-0.5") - len("direct-0.5"))})
+
+        # `--count` on the same evaluation pipeline agrees on branch count and notes the dry-run stop.
+        fresh_cache = Cache(self.tmp / "eval_count_cache")
+        buf = io.StringIO()
+        from contextlib import redirect_stdout
+
+        def eval_pipe(run: RunContext):
+            b = run.compare("source_branch", {str(x.index): x for x in saved.successful})
+            return analysis(run, b)
+
+        with redirect_stdout(buf):
+            code = experiment_main(eval_pipe, argv=["--count"], cache=fresh_cache)
+        self.assertEqual(code, 0)
+        self.assertIn("branches: 4", buf.getvalue())
+        self.assertIn("stopped during dry run", buf.getvalue())
 
 
 if __name__ == "__main__":

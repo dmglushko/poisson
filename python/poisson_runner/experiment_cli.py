@@ -33,16 +33,26 @@ prints the resolved mode, resources and shard order without running anything.
 from __future__ import annotations
 
 import argparse
+import inspect
 import os
 import re
 import sys
+import warnings
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from .bundle import BUNDLE_INCLUDES, format_bytes
 from .cache import Cache
-from .driver import CacheMissError, run_experiment
+from .driver import (
+    CacheMissError,
+    _discover_branch_paths,
+    _make_config,
+    _normalize_select,
+    _select_paths,
+    run_experiment,
+)
 from .report import ExperimentReport
 from .python_stages import CHILD_ENV as PYTHON_STAGE_CHILD_ENV
 
@@ -160,6 +170,14 @@ def _build_parser(prog: str | None) -> argparse.ArgumentParser:
     )
     parser.add_argument("--out", type=Path, help="save the run here (required with --collect)")
     parser.add_argument("--overwrite", action="store_true", help="replace an existing saved run in --out")
+    parser.add_argument(
+        "--bundle",
+        nargs="?",
+        const="outputs",
+        choices=BUNDLE_INCLUDES,
+        default=None,
+        help="with --out: link or copy artifacts into <out>/objects/ (outputs [default] or stages)",
+    )
     parser.add_argument(
         "--allow-recompute",
         action="store_true",
@@ -322,8 +340,8 @@ def experiment_main(
             print("--dag-task takes only --dag-plan (the plan holds everything else)", file=sys.stderr)
             return EXIT_USAGE
         return _run_dag_task(pipeline_fn, args, _cache(cache), run_kwargs)
-    elif args.count or args.shard or args.warmup or args.collect or args.out is not None:
-        print("--dag-plan writes a plan; it takes no other mode or --out", file=sys.stderr)
+    elif args.count or args.shard or args.warmup or args.collect or args.out is not None or args.bundle is not None:
+        print("--dag-plan writes a plan; it takes no other mode, --out, or --bundle", file=sys.stderr)
         return EXIT_USAGE
     else:
         return _plan_dag(pipeline_fn, args, defaults, _cache(cache), run_kwargs)
@@ -335,6 +353,37 @@ def experiment_main(
             f"{report.cache_misses} stage runs needed, {report.cache_hits} already cached, "
             f"{report.reused} shared between branches"
         )
+        stopped = [b for b in report.branches if b.dry_run_stopped is not None]
+        if stopped:
+            print(
+                f"note: {len(stopped)} branch(es) stopped during dry run at a stage-output read "
+                f"({stopped[0].dry_run_stopped}); later stage calls and compare()s are not counted"
+            )
+        # Cross-check against cache-free discovery (what sharded pieces actually use) so a warm
+        # cache never hides a compare() that follows a stage-output read.
+        cfg_kwargs = {k: v for k, v in run_kwargs.items() if k in {
+            "executor", "build_dir", "cache_mode", "stage_cache_modes",
+            "repeats", "warmup", "stage_repeats", "stage_warmup",
+        }}
+        disc_cfg = _make_config(cache=cache, dry_run=True, **cfg_kwargs)
+        takes_ctx = len(inspect.signature(pipeline_fn).parameters) > 0
+        disc_all = _discover_branch_paths(pipeline_fn, takes_ctx=takes_ctx, config=disc_cfg)
+        mismatch_reason: str | None = None
+        try:
+            disc_selected = _select_paths(list(enumerate(disc_all)), _normalize_select(selection))
+        except ValueError as exc:
+            mismatch_reason = str(exc)
+        else:
+            disc_labels = [{s.name: s.label for s in b.path} for _, b in disc_selected]
+            count_labels = [b.choice_labels for b in report.branches]
+            if disc_labels != count_labels:
+                mismatch_reason = (
+                    f"{len(count_labels)} branch(es) seen with cache vs {len(disc_labels)} without cache; "
+                    "some compare() follows a stage-output read and pieces (shards) cannot plan it"
+                )
+        if mismatch_reason is not None:
+            print(f"warning: {mismatch_reason}", file=sys.stderr)
+            print("shard-incompatible: compare-after-read")  # machine-readable; submit.sh checks this
         print(f"branches: {len(report.branches)}")  # machine-readable; submit.sh reads this line
         return EXIT_OK
 
@@ -383,11 +432,42 @@ def experiment_main(
 
     print(report.format_table())
     _print_summary(report, label)
+    bundle_failed = False
     if args.out is not None:
         partial = report.shard is not None or bool(selection)
-        saved = report.save(args.out, overwrite=args.overwrite, allow_partial=partial)
+        bundle_mode = "link_or_copy" if args.bundle is not None else "link"
+        bundle_include = args.bundle if args.bundle is not None else "outputs"
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            saved = report.save(
+                args.out,
+                overwrite=args.overwrite,
+                allow_partial=partial,
+                bundle=bundle_mode,
+                include=bundle_include,
+            )
         print(f"[{label}] saved to {saved}")
-    return EXIT_BRANCH_FAILED if any(not b.ok for b in report.branches) else EXIT_OK
+        summary = report._last_bundle_summary
+        if summary is not None:
+            if summary.copied:
+                print(
+                    f"[{label}] bundled {summary.copied} copied ({format_bytes(summary.copied_bytes)})"
+                    f"{f', {summary.linked} linked' if summary.linked else ''}"
+                )
+            elif summary.left_in_cache > 0:
+                where = str(report.cache_root) if report.cache_root is not None else "the cache"
+                print(
+                    f"[{label}] {summary.left_in_cache} result file(s) ({format_bytes(summary.left_in_cache_bytes)}) "
+                    f"are only in {where}; keep them with: python3 -m poisson_runner run bundle {saved}"
+                )
+            if args.bundle is not None and summary.missing > 0:
+                print(
+                    f"[{label}] error: {summary.missing} artifact(s) missing while bundling: "
+                    f"{', '.join(summary.missing_objects[:10])}",
+                    file=sys.stderr,
+                )
+                bundle_failed = True
+    return EXIT_BRANCH_FAILED if (bundle_failed or any(not b.ok for b in report.branches)) else EXIT_OK
 
 
 def _cache(cache: Cache | None) -> Cache:
@@ -412,7 +492,7 @@ def _show_settings(args: argparse.Namespace, defaults: _Defaults, shard_order: s
             ("--split-by", args.split_by), ("--no-split", args.no_split or None), ("--fuse", args.fuse or None),
             ("--no-fuse", args.no_fuse or None), ("--max-fused-time", args.max_fused_time),
             ("--max-array-size", args.max_array_size), ("--out", args.out), ("--overwrite", args.overwrite or None),
-            ("--allow-recompute", args.allow_recompute or None),
+            ("--bundle", args.bundle), ("--allow-recompute", args.allow_recompute or None),
         ) if value is not None
     ]
     if extra:

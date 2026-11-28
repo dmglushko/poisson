@@ -43,6 +43,7 @@ struct ErrorEstimate {
     double              total = 0;                // sqrt(sum of eta_K^2), or sum of eta_K (see sum)
     Info                info;
     IndicatorSum        sum = IndicatorSum::squares;   // the estimator's indicator_sum()
+    bool                all_excluded = false;     // true when point-source exclusion masked every non-metal tet
 };
 
 // The common interface of the error estimators. Each estimator has its own Settings, given

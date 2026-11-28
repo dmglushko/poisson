@@ -24,7 +24,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, TypeVar
 
-from .cache import Artifact
+from .cache import Artifact, _SAFE_EXT_RE, _validate_hex64
 
 __all__ = [
     "RecordError",
@@ -106,7 +106,31 @@ def _record_data(obj: Any) -> Any:
     return {f.name: getattr(obj, f.name) for f in dataclasses.fields(obj)}
 
 
-def _artifact_descriptor(art: Artifact, objects_dir: Path | None) -> dict[str, Any]:
+def _is_under(path: Path, root: Path) -> bool:
+    try:
+        path.relative_to(root)
+        return True
+    except ValueError:
+        return False
+
+
+def _infer_ext(path: Path, content_id: str) -> str | None:
+    name = path.name
+    if _validate_hex64(content_id) and name.startswith(content_id) and len(name) > len(content_id):
+        ext = name[len(content_id) :]
+        if _SAFE_EXT_RE.match(ext) and ".." not in ext:
+            return ext
+    suffix = path.suffix
+    if suffix and _SAFE_EXT_RE.match(suffix) and ".." not in suffix:
+        return suffix
+    return None
+
+
+def _artifact_descriptor(
+    art: Artifact,
+    objects_dir: Path | None,
+    ephemeral_dir: Path | None = None,
+) -> dict[str, Any]:
     desc: dict[str, Any] = {
         "name": art.name,
         "stage": art.stage,
@@ -118,14 +142,40 @@ def _artifact_descriptor(art: Artifact, objects_dir: Path | None) -> dict[str, A
         "info": art.info if isinstance(art.info, dict) else {},
         "execution": art.execution if isinstance(art.execution, dict) else {},
     }
-    # Objects inside the cache are stored by file name so a reload can point at another mount
-    # of the same cache (`load_run(..., cache=...)`).
+    if art.content_id.startswith("dryrun:"):
+        desc["location"] = "external"
+        return desc
+
+    ext = art.ext
     if objects_dir is not None and art.path.parent == objects_dir:
-        desc["object"] = art.path.name
+        location = "cache"
+    elif ephemeral_dir is not None and _is_under(art.path, ephemeral_dir):
+        location = "ephemeral"
+    elif art.stage == "input":
+        location = "external"
+    elif ext is not None or (_validate_hex64(art.content_id) and art.path.name.startswith(art.content_id)):
+        location = "cache"
+    else:
+        location = "external"
+
+    desc["location"] = location
+    if location in ("cache", "ephemeral") and _validate_hex64(art.content_id):
+        if ext is None:
+            ext = _infer_ext(art.path, art.content_id)
+        if ext is not None:
+            desc["ext"] = ext
+            desc["object"] = f"{art.content_id}{ext}"
     return desc
 
 
-def encode(value: Any, *, strict: bool, objects_dir: Path | None = None, where: str = "value") -> Any:
+def encode(
+    value: Any,
+    *,
+    strict: bool,
+    objects_dir: Path | None = None,
+    ephemeral_dir: Path | None = None,
+    where: str = "value",
+) -> Any:
     """Encode `value` to tagged JSON. `strict=True` raises `RecordError` on anything unsupported."""
 
     def enc(v: Any, path: str) -> Any:
@@ -136,7 +186,7 @@ def encode(value: Any, *, strict: bool, objects_dir: Path | None = None, where: 
                 return v
             return {"$float": "nan" if math.isnan(v) else ("inf" if v > 0 else "-inf")}
         if isinstance(v, Artifact):
-            return {"$artifact": _artifact_descriptor(v, objects_dir)}
+            return {"$artifact": _artifact_descriptor(v, objects_dir, ephemeral_dir)}
         if isinstance(v, Path):
             return {"$path": str(v)}
         if isinstance(v, UnresolvedRecord):
@@ -174,8 +224,14 @@ def encode(value: Any, *, strict: bool, objects_dir: Path | None = None, where: 
     return enc(value, where)
 
 
-def decode(value: Any, *, objects_dir: Path | None = None) -> Any:
-    """Inverse of `encode`. Cached artifacts are re-rooted under `objects_dir` when given."""
+def decode(
+    value: Any,
+    *,
+    objects_dir: Path | None = None,
+    bundle_objects_dir: Path | None = None,
+    bundled_names: set[str] | frozenset[str] | None = None,
+) -> Any:
+    """Inverse of `encode`. Resolves bundled objects first, then `objects_dir`, then saved `path`."""
 
     def dec(v: Any) -> Any:
         if isinstance(v, list):
@@ -186,12 +242,30 @@ def decode(value: Any, *, objects_dir: Path | None = None) -> Any:
             if "$artifact" in v and len(v) == 1:
                 d = v["$artifact"]
                 path = Path(d["path"])
+                cid = d["content_id"]
+                ext = d.get("ext")
                 obj = d.get("object")
-                if obj and objects_dir is not None:
+                inferred_obj = obj
+                if inferred_obj is None and d.get("stage") != "input" and _validate_hex64(cid):
+                    inferred_ext = ext or _infer_ext(path, cid)
+                    if inferred_ext is not None:
+                        inferred_obj = f"{cid}{inferred_ext}"
+                        if ext is None:
+                            ext = inferred_ext
+                resolved = False
+                if inferred_obj and bundle_objects_dir is not None:
+                    if bundled_names is not None:
+                        if inferred_obj in bundled_names:
+                            path = bundle_objects_dir / inferred_obj
+                            resolved = True
+                    elif (bundle_objects_dir / inferred_obj).is_file():
+                        path = bundle_objects_dir / inferred_obj
+                        resolved = True
+                if not resolved and obj and objects_dir is not None:
                     path = objects_dir / obj
                 return Artifact(
                     path=path,
-                    content_id=d["content_id"],
+                    content_id=cid,
                     name=d.get("name", "out"),
                     stage=d.get("stage", "input"),
                     request_key=d.get("request_key"),
@@ -199,6 +273,7 @@ def decode(value: Any, *, objects_dir: Path | None = None) -> Any:
                     size_bytes=int(d.get("size_bytes", 0) or 0),
                     info=d.get("info") or {},
                     execution=d.get("execution") or {},
+                    ext=ext,
                 )
             if "$path" in v and len(v) == 1:
                 return Path(v["$path"])

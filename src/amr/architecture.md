@@ -145,7 +145,10 @@ Shared rules (in `ErrorEstimator::estimate`):
   on every tet intersecting the closed sphere of `point_source_exclusion_radius` around each
   non-zero delta (via `MeshLocator::query_sphere`), keeping the excluded zone fixed in
   physical space across AMR cycles. `ignore` leaves them out. A source without an element
-  hint is located with `MeshLocator` (`include/common/mesh_locator.h`).
+  hint is located with `MeshLocator` (`include/common/mesh_locator.h`). When exclusion masks
+  every non-metal tet, `ErrorEstimate::all_excluded` is set with a warning and
+  `ErrorBasedAdapter` refuses to report `converged` from the resulting zero total (returning
+  `unchanged` instead).
 - An outer face without a boundary element is natural (`g = 0`).
 
 Recovery averages per material by default (`per_material = true`): neither `grad u` nor

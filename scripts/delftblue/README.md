@@ -154,18 +154,9 @@ bash scripts/delftblue/submit.sh experiments/sweep.py --dag --time 00:30:00 \
 - If a task fails, cancel the queued jobs the message names, fix the cause, and run the same
   command again. It plans again and submits only what's still missing.
 - Don't rebuild while it runs; a task notices a changed program and refuses.
-- The plan is made where you run `submit.sh`. On DelftBlue the login nodes and compute nodes
-  have different builds of the system `libc`/`libm`, so a plan made on a login node makes every
-  task refuse with "Plan mismatch" (the same cause as
-  [#3](https://github.com/dmglushko/poisson/issues/3)). Until #3 is decided, run the submission
-  itself on a compute node, which also plans faster than a busy login node:
-
-  ```bash
-  srun -p compute-p1 -n1 -c1 -t 00:10:00 bash scripts/delftblue/submit.sh experiments/sweep.py --dag
-  ```
-
-  `submit.sh` warns when it plans a DAG outside a Slurm job, which matters most when the mode
-  comes from the script's `mode="dag"`.
+- OS base libraries (`libc`, `libm`, `ld-linux`, ...) are excluded from stage code hashes while
+  module/compiler libraries (HDF5, `libstdc++`, `libgcc_s`) are still tracked, so DAG plans made
+  on a login node match compute nodes.
 
 ### When a piece fails
 
@@ -185,9 +176,12 @@ The other pieces' results are reused from the cache, and a new collect job is qu
 ## Good to know
 
 - **`/scratch` is cleaned automatically.** The cache lives in `/scratch/$USER/poisson_cache`.
-  The saved report's CSV files are permanent, but the `.h5` result files they refer to stay in the
-  cache and disappear when `/scratch` is cleaned
-  ([#4](https://github.com/dmglushko/poisson/issues/4)).
+  By default the collect job keeps only the CSV tables and references to `/scratch` (so it does
+  not accidentally fill `/home` quota), and prints the size left in `/scratch`. To keep the `.h5`
+  result files permanently, pass `--bundle` (or `--bundle-stages` for intermediate meshes too) to
+  `submit.sh` (prefer `--out /projects/...` for large sweeps), or run
+  `python3 -m poisson_runner run bundle results/<name>/<id>` afterwards before `/scratch` is purged.
+  Check status anytime with `python3 -m poisson_runner run status results/<name>/<id> --verify`.
 - **Threads.** Each job sets `OMP_NUM_THREADS` (and the BLAS equivalents) to its `--cpus`. A
   stage run that way is cached whatever its CPU count, so a later run with other resources
   reuses it. `run_stage(..., threads=N)` instead sets the thread count for that stage and makes

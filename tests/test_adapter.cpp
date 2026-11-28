@@ -413,6 +413,61 @@ void test_linear_indicator_sum() {
     CHECK_NEAR(estimated_total(t).value(), sum, 1e-12 * sum);
 }
 
+// When point-source exclusion masks every non-metal tet, total == 0 must not falsely report
+// converged (issue #8): the adapter warns, returns unchanged, and leaves initial_error unset.
+void test_all_excluded_does_not_converge() {
+    // 1. Six-tet unit cube with one point charge: exclude_patch masks all 6 tets.
+    const MeshProperties cube = cube_mesh(1);   // 6 tets
+    const std::vector<double> u(cube.nodes.size(), 0.0);
+    RefinementInput input{u, {}, {}};
+    input.point_sources.push_back({{0.5, 0.5, 0.5}, 1.0, {}});
+
+    const ErrorBasedAdapter traj_adapter(
+        std::make_shared<TrajectoryEstimator>(), std::make_shared<DorflerMarking>(),
+        std::make_shared<LongestEdgeBisection>(),
+        ErrorBasedAdapter::Settings{.absolute_tolerance = 1.0, .relative_tolerance = 0.5});
+    auto session = traj_adapter.start(ErrorBasedAdapter::State{});
+    const AdaptationResult r = session->adapt(cube, input);
+    CHECK(r.status == AdaptationStatus::unchanged);
+    CHECK(!r.mesh.has_value());
+    CHECK_NEAR(estimated_total(r).value(), 0.0, 0.0);
+    CHECK(!r.info.warnings.empty());
+    CHECK(!r.info.stages.empty() && !r.info.stages[0].warnings.empty());
+    CHECK(!session->state().initial_error.has_value());
+
+    // 2. Mixed dielectric + metal mesh with exclude_radius masking all dielectric tets (metal
+    //    tets outside the sphere still do not count as measured).
+    MeshProperties mixed = cube_mesh(2);   // 48 tets on [0,1]^3
+    mixed.materials.push_back(MeshProperties::Material{.name = "metal", .eps_r = 1.0, .is_metal = true, .voltage = 0.0});
+    for (auto& el : mixed.elements) {
+        double cx = 0;
+        for (uint32_t v : el.node) cx += mixed.nodes[v][0];
+        if (cx / 4.0 > 0.5) el.material = 1;   // right half is metal
+    }
+    const std::vector<double> u_mixed(mixed.nodes.size(), 0.0);
+    RefinementInput mixed_input{u_mixed, {}, {}};
+    mixed_input.point_sources.push_back({{0.25, 0.5, 0.5}, 1.0, {}});
+    const ErrorBasedAdapter rad_adapter(
+        std::make_shared<KellyEstimator>(KellyEstimator::Settings{
+            .point_sources = PointSourceRule::exclude_radius,
+            .point_source_exclusion_radius = 1.0,
+        }),
+        std::make_shared<DorflerMarking>(), std::make_shared<LongestEdgeBisection>(),
+        ErrorBasedAdapter::Settings{.absolute_tolerance = 1.0});
+    const AdaptationResult r_mixed = rad_adapter.start()->adapt(mixed, mixed_input);
+    CHECK(r_mixed.status == AdaptationStatus::unchanged);
+    CHECK(!r_mixed.info.warnings.empty());
+
+    // 3. When max_elements is already exceeded, limit_reached still takes precedence over unchanged.
+    const ErrorBasedAdapter over_limit(
+        std::make_shared<TrajectoryEstimator>(), std::make_shared<DorflerMarking>(),
+        std::make_shared<LongestEdgeBisection>(),
+        ErrorBasedAdapter::Settings{.absolute_tolerance = 1.0, .max_elements = 2});
+    const AdaptationResult r_lim = over_limit.start()->adapt(cube, input);
+    CHECK(r_lim.status == AdaptationStatus::limit_reached);
+    CHECK(!r_lim.info.warnings.empty());
+}
+
 int main() {
     test_multi_cycle_and_session_history();
     test_absolute_and_combined_tolerance();
@@ -423,5 +478,6 @@ int main() {
     test_state_resume_matches_one_session();
     test_eta_returned();
     test_linear_indicator_sum();
+    test_all_excluded_does_not_converge();
     return finish("adapter");
 }

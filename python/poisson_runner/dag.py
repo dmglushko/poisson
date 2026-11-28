@@ -22,7 +22,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-from .cache import CacheMode
+from .cache import CacheMode, DryRunPlaceholderError
 from .driver import (
     RunContext,
     _call_pipeline,
@@ -407,17 +407,24 @@ def plan_dag(
     takes_ctx = len(inspect.signature(pipeline_fn).parameters) > 0
 
     with _sigterm_as_exit():
-        all_paths = _discover_branch_paths(pipeline_fn, takes_ctx=takes_ctx, config=config)
-        selected = _select_paths(list(enumerate(all_paths)), selection)
-        seen = {s.name for p in all_paths for s in p}  # a --select may leave a name out: then no label
+        all_branches = _discover_branch_paths(pipeline_fn, takes_ctx=takes_ctx, config=config)
+        selected = _select_paths(list(enumerate(all_branches)), selection)
+        for index, branch in selected:
+            if branch.truncated is not None:
+                raise RuntimeError(
+                    f"DAG mode can't plan past {branch.truncated} (branch {index}). "
+                    "Guard output reads with `if not run.dry_run:`, or use pieces (shards) "
+                    "for pipelines whose shape depends on stage outputs."
+                )
+        seen = {s.name for b in all_branches for s in b.path}  # a --select may leave a name out: then no label
         for name in split_names:
             if name not in seen:
                 raise ValueError(
                     f"split_by: no compare() named {name!r} (choices: {', '.join(sorted(seen)) or 'none'})"
                 )
         if compare_splits:
-            for _, p in selected:
-                for s in p:
+            for _, b in selected:
+                for s in b.path:
                     if s.split and s.name not in split_names:
                         split_names.append(s.name)
 
@@ -428,12 +435,22 @@ def plan_dag(
         read_cached: set[str] = set()
         cached = shared = 0
         with config.cache.lease() as lease:
-            for index, path in selected:
+            for index, branch in selected:
+                path = branch.path
                 lease.begin_ephemeral_scope()
                 todo: list[tuple[_ChoiceStep, ...]] = []
-                ctx = RunContext._for_branch(config, path=path, todo_stack=todo, lease=lease, state=state)
+                ctx = RunContext._for_branch(
+                    config, path=path, todo_stack=todo, lease=lease, state=state, planned=True
+                )
                 ctx._call_log = []
-                _call_pipeline(pipeline_fn, ctx, takes_ctx, path)
+                try:
+                    _call_pipeline(pipeline_fn, ctx, takes_ctx, path)
+                except DryRunPlaceholderError as exc:
+                    raise RuntimeError(
+                        f"DAG mode can't plan past {exc.summary} (branch {index}, after {ctx._stage_calls} stage call(s)). "
+                        "Guard output reads with `if not run.dry_run:`, or use pieces (shards) "
+                        "for pipelines whose shape depends on stage outputs."
+                    ) from exc
                 if todo:
                     raise RuntimeError(
                         f"Branch {index} reached compare() choices that discovery didn't see; "
@@ -502,7 +519,7 @@ def plan_dag(
     for task in tasks:
         task.resources = resolve(task)
 
-    paths = dict(selected)
+    paths = {idx: b.path for idx, b in selected}
     if split_names:
         for task in tasks:
             split: list[str | None] = []
@@ -734,6 +751,12 @@ def run_dag_task(
         }
         try:
             _call_pipeline(pipeline_fn, ctx, takes_ctx, path)
+        except DryRunPlaceholderError as exc:
+            raise RuntimeError(
+                f"Plan mismatch: branch {branch} tried to read an uncached stage output ({exc.summary}) "
+                "before the task's target. The experiment changed since it was planned, or its shape "
+                "depends on stage outputs; plan it again or use pieces (shards)."
+            ) from exc
         except _DagTaskDone as stop:
             missing = [f"'{t['stage']}' (call {s})" for s, t in zip(steps, chain) if s not in stop.done]
             if missing:

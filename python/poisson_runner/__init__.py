@@ -1,11 +1,13 @@
 """Content-addressed caching and loop-free Compare() runner for Poisson stages."""
 
+from .bundle import BundleSummary, RunArtifactStatus, bundle_saved_run, saved_run_status
 from .cache import (
     Artifact,
     Cache,
     CacheLease,
     CacheMode,
     CacheStats,
+    DryRunPlaceholderError,
     LockMode,
     normalize_cache_mode,
     normalize_lock_mode,
@@ -64,6 +66,8 @@ __all__ = [
     "blake3_json",
     "blake3_version",
     "BranchResult",
+    "bundle_saved_run",
+    "BundleSummary",
     "Cache",
     "CacheLease",
     "CacheMissError",
@@ -71,6 +75,7 @@ __all__ = [
     "CacheStats",
     "Case",
     "DagPlan",
+    "DryRunPlaceholderError",
     "case_inputs",
     "case_mesh",
     "collect_host_environment",
@@ -112,7 +117,9 @@ __all__ = [
     "resolve_slurm_shard",
     "robin",
     "run_experiment",
+    "RunArtifactStatus",
     "RunContext",
+    "saved_run_status",
     "SavedRun",
     "shared_library_deps",
     "SOURCE_BRANCH",

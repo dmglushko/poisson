@@ -1465,6 +1465,10 @@ pathlib.Path(a.out).write_text("ok")
         if not libs:
             self.skipTest("ldd unavailable or poisson_import is statically linked")
         self.assertTrue(any(name.startswith("libhdf5") for name in libs), libs)
+        # OS base libraries (libc, libm, ld-linux, ...) are skipped by default (issue #3).
+        self.assertFalse(any(name.startswith(("libc.so", "libm.so", "ld-linux")) for name in libs), libs)
+        all_libs = dict(shared_library_deps(stage.executable, include_os_libs=True))
+        self.assertTrue(any(name.startswith("libc.so") for name in all_libs), all_libs)
         # Only direct NEEDED dependencies are tracked, not the whole transitive closure.
         self.assertFalse(any(name.startswith("libcurl") for name in libs), libs)
         for path in libs.values():

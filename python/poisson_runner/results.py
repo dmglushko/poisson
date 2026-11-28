@@ -20,6 +20,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Literal
 
+from .bundle import list_bundled_names
 from .cache import Cache
 from .driver import RunContext, run_experiment
 from .records import decode
@@ -117,8 +118,14 @@ class SavedRun:
         self.report.save_csv(path, layout=layout)
 
 
-def _stage_from_dict(d: dict[str, Any], objects_dir: Path | None) -> StageTrace:
-    outputs = decode(d.get("outputs") or {}, objects_dir=objects_dir)
+def _stage_from_dict(
+    d: dict[str, Any],
+    objects_dir: Path | None,
+    bundle_objects_dir: Path | None,
+    bundled_names: set[str],
+) -> StageTrace:
+    kw = dict(objects_dir=objects_dir, bundle_objects_dir=bundle_objects_dir, bundled_names=bundled_names)
+    outputs = decode(d.get("outputs") or {}, **kw)
     return StageTrace(
         stage=d["stage"],
         cached=bool(d.get("cached", False)),
@@ -126,13 +133,13 @@ def _stage_from_dict(d: dict[str, Any], objects_dir: Path | None) -> StageTrace:
         dry_run=bool(d.get("dry_run", False)),
         request_key=d.get("request_key"),
         content_ids=dict(d.get("content_ids") or {}),
-        settings=dict(decode(d.get("settings") or {}, objects_dir=objects_dir)),
+        settings=dict(decode(d.get("settings") or {}, **kw)),
         time_s=d.get("time_s"),
         wall_time_s=float(d.get("wall_time_s") or 0.0),
         max_rss_kb=d.get("max_rss_kb"),
         warnings=list(d.get("warnings") or []),
-        info=dict(decode(d.get("info") or {}, objects_dir=objects_dir)),
-        execution=dict(decode(d.get("execution") or {}, objects_dir=objects_dir)),
+        info=dict(decode(d.get("info") or {}, **kw)),
+        execution=dict(decode(d.get("execution") or {}, **kw)),
         outputs=outputs if isinstance(outputs, dict) else {},
     )
 
@@ -140,9 +147,10 @@ def _stage_from_dict(d: dict[str, Any], objects_dir: Path | None) -> StageTrace:
 def load_run(directory: str | os.PathLike[str], *, cache: Cache | None = None) -> SavedRun:
     """Reload a run saved with `ExperimentReport.save(directory)`.
 
-    Output artifacts point into the cache the run used; pass `cache=` to resolve them under
-    another mount or copy of that cache. Records come back through `register_record` types
-    (import the module that registers them before loading), else as `UnresolvedRecord`.
+    Output artifacts resolve first in `<directory>/objects/` when bundled, else in the cache
+    the run used (pass `cache=` to resolve unbundled artifacts under another mount or copy of
+    that cache). Records come back through `register_record` types (import the module that
+    registers them before loading), else as `UnresolvedRecord`.
     """
     path = Path(directory)
     report_json = path / "report.json" if path.is_dir() else path
@@ -156,18 +164,21 @@ def load_run(directory: str | os.PathLike[str], *, cache: Cache | None = None) -
     saved_root = payload.get("cache_root")
     cache_root = cache.root if cache is not None else (Path(saved_root) if saved_root else None)
     objects_dir = cache_root / "objects" if cache_root is not None else None
+    bundle_objects_dir = report_json.parent / "objects"
+    bundled_names = list_bundled_names(bundle_objects_dir)
+    decode_kw = dict(objects_dir=objects_dir, bundle_objects_dir=bundle_objects_dir, bundled_names=bundled_names)
 
     branches: list[BranchResult] = []
     for bd in payload.get("branches", []):
         labels = {str(k): str(v) for k, v in (bd.get("choices") or {}).items()}
-        values = decode(bd["choice_values"], objects_dir=objects_dir) if "choice_values" in bd else dict(labels)
+        values = decode(bd["choice_values"], **decode_kw) if "choice_values" in bd else dict(labels)
         branches.append(
             BranchResult(
                 index=int(bd["index"]),
                 choices=values if isinstance(values, dict) else dict(labels),
                 choice_labels=labels,
-                stages=[_stage_from_dict(sd, objects_dir) for sd in bd.get("stages", [])],
-                result=decode(bd.get("outputs") or {}, objects_dir=objects_dir),
+                stages=[_stage_from_dict(sd, objects_dir, bundle_objects_dir, bundled_names) for sd in bd.get("stages", [])],
+                result=decode(bd.get("outputs") or {}, **decode_kw),
                 error=bd.get("error"),
                 wall_time_s=float(bd.get("wall_time_s") or 0.0),
             )
@@ -181,6 +192,7 @@ def load_run(directory: str | os.PathLike[str], *, cache: Cache | None = None) -
         cache_root=cache_root,
         selection=payload.get("selection") or None,
     )
+    report._from_saved = True
     return SavedRun(path=report_json.parent, report=report)
 
 
