@@ -783,14 +783,20 @@ class Cache:
         settings: dict[str, Any],
         output_specs: Mapping[str, str] | None = None,
         env: Mapping[str, str] | None = None,
+        *,
+        normalize_settings: bool = True,
     ) -> str:
-        """Compute the BLAKE3 request key for a stage invocation (integral floats in `settings` hash as ints)."""
+        """Compute the BLAKE3 request key for a stage invocation.
+
+        Integral floats in `settings` hash as ints unless `normalize_settings=False` (a stage
+        that can tell `1` from `1.0`, such as a Python function stage).
+        """
         payload: dict[str, Any] = {
             "v": 2,
             "stage": stage_name,
             "code_hash": code_hash,
             "inputs": inputs,
-            "settings": normalize_integral_floats(settings),
+            "settings": normalize_integral_floats(settings) if normalize_settings else settings,
             "output_specs": dict(output_specs) if output_specs is not None else {"out": ".h5"},
         }
         if env:

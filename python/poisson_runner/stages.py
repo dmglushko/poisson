@@ -117,6 +117,8 @@ class Stage:
     default_cache: CacheMode | str | bool = CacheMode.USE
     uses_config_file: bool = False
     track_shared_libs: bool = True
+    hash_executable: bool = True
+    normalize_settings: bool = True
 
     def __post_init__(self) -> None:
         self.default_cache = normalize_cache_mode(self.default_cache)
@@ -221,7 +223,7 @@ class Stage:
         if self.ignore_binary_hash:
             return []
         files: list[Path] = []
-        if self.executable is not None:
+        if self.executable is not None and self.hash_executable:
             files.append(Path(self.executable))
         files.extend(Path(f) for f in self.code_files)
         seen: set[Path] = set()

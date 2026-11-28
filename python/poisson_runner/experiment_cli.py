@@ -44,6 +44,7 @@ from typing import Any
 from .cache import Cache
 from .driver import CacheMissError, run_experiment
 from .report import ExperimentReport
+from .python_stages import CHILD_ENV as PYTHON_STAGE_CHILD_ENV
 
 __all__ = ["MODES", "experiment_main", "parse_select", "parse_shard"]
 
@@ -277,7 +278,12 @@ def experiment_main(
 
     Exit codes: 0 success; 1 some branch failed (so a SLURM `afterok` dependency doesn't start
     the collector on incomplete results); 2 `--collect` refused because stages are missing.
+
+    Inside the process of a `@python_stage` function defined in this script it returns 0 at
+    once, so loading the script to call that function doesn't start the experiment again.
     """
+    if os.environ.get(PYTHON_STAGE_CHILD_ENV):
+        return 0
     defaults = _validate_defaults(
         mode=mode,
         resources=resources,

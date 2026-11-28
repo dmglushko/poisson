@@ -34,6 +34,7 @@ from .dag import DagPlan, plan_dag, run_dag_task
 from .records import RecordError, UnresolvedRecord, Unserializable, register_record
 from .cases import Case, dirichlet, neumann, robin
 from .report import info_scalars
+from .python_stages import PythonStage, load_value, python_stage
 from .results import SOURCE_BRANCH, SavedRun, evaluate, load_run
 from .hashing import blake3_bytes, blake3_file, blake3_json, blake3_version
 from .benchmark import Measurement, measure, summarize_numbers
@@ -84,12 +85,15 @@ __all__ = [
     "ExperimentReport",
     "experiment_main",
     "plan_dag",
+    "python_stage",
+    "PythonStage",
     "run_dag_task",
     "gmsh_mesh",
     "import_free_charges",
     "import_mesh",
     "info_scalars",
     "load_run",
+    "load_value",
     "LocalExecutor",
     "LockMode",
     "make_adapt_stage",

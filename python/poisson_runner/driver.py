@@ -668,12 +668,14 @@ class RunContext:
             settings_dict,
             output_specs=stage.output_specs,
             env=env_dict,
+            normalize_settings=stage.normalize_settings,
         )
 
         check = ""
         if planning or is_target:
             check = Cache.compute_request_key(
-                stage.name, code_hash, {}, settings_dict, output_specs=stage.output_specs, env=env_dict
+                stage.name, code_hash, {}, settings_dict, output_specs=stage.output_specs, env=env_dict,
+                normalize_settings=stage.normalize_settings,
             )
         if target is not None:
             self._check_dag_target(target, stage, check, resolved, mode)

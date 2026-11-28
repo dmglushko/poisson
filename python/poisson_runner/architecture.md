@@ -13,6 +13,7 @@
 | `records.py` | Tagged JSON encoding of branch outputs and choice values; explicit `register_record` registry |
 | `results.py` | `load_run` / `SavedRun` (`select`, `one`, `match`) and `evaluate` for post-hoc evaluation |
 | `stages.py` | `Stage` / `Stage.from_cli`, code hashing (binary + shared libraries), project stage factories and helpers (`import_mesh`, `import_free_charges`, `adapt_mesh`, and the verification stages `case_inputs`, `gmsh_mesh`, `case_mesh`) |
+| `python_stages.py` | `@python_stage`: a cached stage running a plain Python function in its own process, `load_value` |
 | `cases.py` | `Case(name, params)`: a verification case as a name and its parameters (a registered record), and `dirichlet` / `neumann` / `robin` helpers |
 | `cache.py` | Two-layer content-addressed cache, locking, leases, eviction |
 | `executor.py` | `Executor` backends and per-process OS metrics |
@@ -53,6 +54,83 @@ An experiment returns `{"mesh", "case"}` (the case is saved with its parameters 
 as a `Case` on load). Comparing a solution with the case's exact solution waits for the
 `Solution` format ([issue #6](https://github.com/dmglushko/poisson/issues/6)).
 
+## Python Function Stages (`python_stages.py`)
+
+`@python_stage` turns a top-level Python function into a cached stage, so post-processing such
+as error norms caches like the C++ stages do. Programs other than Python functions already fit
+`Stage(...)` / `Stage.from_cli(...)`.
+
+```python
+@python_stage
+def error_norms(inputs, *, case, info):        # value stage: returns JSON, cached as .json
+    ...
+    return {"l2_rel": 1e-3}
+
+@python_stage(outputs={"field": ".h5"})        # file stage: writes the files it declares
+def smooth(inputs, outputs, *, passes):
+    ...
+
+norms = error_norms(run, inputs={"mesh": mesh, "field": field}, case=case.spec())
+value = load_value(norms)                      # placeholder in a dry run: check run.dry_run
+```
+
+- **Kinds:** without `outputs`, `fn(inputs, **settings)` returns a JSON value (dicts with str
+  keys, lists, str, int, finite float, bool, None; anything else, NaN included, fails the
+  stage), written as the `out` `.json` output. With `outputs={name: ext}`, `fn(inputs, outputs,
+  **settings)` writes every declared file and returns None. The output names and extensions are
+  fixed (and validated) when the stage is declared, since they are part of the request key. A
+  call returns Artifacts like any stage (the single Artifact when the only output is `out`),
+  never the decoded value, so dry runs, shards and DAG planning see the usual placeholders.
+- **Call:** `stage(run, inputs={...}, **settings)`. `inputs` take Artifacts or paths (a list for
+  a list input) and reach `fn` as `Path` / `list[Path]`. Settings go into the request key and must
+  be plain JSON; a path or Artifact among them is refused so a file's contents, not its path,
+  decide the cache entry. Unlike the CLI stages, `1` and `1.0` are different settings here
+  (`Stage(normalize_settings=False)`), since the function can tell them apart. `cache=`,
+  `use_cache=`, `repeats=`, `warmup=`, `env=`, `resources=`, `threads=` go to `run_stage` (so `fn`
+  can't use them, or `inputs`, `outputs`, `python_executable`, as setting names); settings are
+  checked against `fn`'s signature before anything runs. The stage name is `fn.__name__` unless
+  `name=` is given. One experiment builds one `Stage` per wrapper configuration, interpreter and
+  `env`: two wrappers of one function with different options never share it.
+- **Info:** a keyword-only `info` parameter receives a dict for log data; the bootstrap adds
+  `time` (around the call, after imports) and the Python warnings the call raised (Python's
+  default filters apply, so library `DeprecationWarning`s stay hidden; repeated messages are
+  kept once), and writes `info.json` only when the call succeeds. `info["warnings"]` may be a
+  str or a list of str.
+- **Process:** the function runs in its own process, `python -P python_stage_bootstrap.py
+  python_stage.json` in the stage's staging directory, through the executor like any stage, so
+  metrics, SIGTERM, `env`/`threads`, repeats and the determinism check apply. The interpreter is
+  `python_executable` (default the current one, symlink kept so a venv still works). The
+  bootstrap is standard library only. It puts the function's import root first on `sys.path`
+  (not for a function installed in site-packages, which the child imports from its own
+  environment) and this `poisson_runner` copy last (only when it comes from a checkout: an
+  installed `poisson_runner` must also be installed for another `python_executable`), checks
+  that a module target is the file the runner hashed, and compiles every hashed file from
+  source, so a stale `.pyc` never runs under a new hash. The manifest (input, output and info
+  paths and the settings) is written per execution, so paths never enter the request key.
+- **Where the function lives:** a module (`pkg.mod:fn`), or the experiment script itself. A
+  script function is loaded by path under another module name with `POISSON_RUNNER_PYTHON_STAGE`
+  set, so `if __name__ == "__main__"` blocks are skipped and `experiment_main` returns at once;
+  the script's top level should otherwise only define things (a nonzero `SystemExit` while
+  loading fails the stage). A script run as `python -m pkg.sweep` is imported as `pkg.sweep`, so
+  relative imports work; it must guard `experiment_main(...)` with `if __name__ == "__main__"`.
+  Lambdas, functions defined inside functions and decorator wrappers are refused.
+- **Code hash:** the stage's `version` holds the target (`module:qualname`, or
+  `<script>:qualname`), the stage kind (value or files) and whether it takes `info`, the code
+  file names relative to the import root (`<script>` for the script, so a renamed or copied
+  script with the same code shares entries), the Python version (major.minor.micro) and the
+  versions of the distributions in `packages=` (probed by the stage's own interpreter, `env`
+  and `sys.path`; a missing one is refused). `code_files` are the function's whole package
+  (every `*.py`, skipping `__pycache__` and dot directories, across all directories of a
+  namespace package; `hash_package=False` for its module only; an installed package counts only
+  its module), or the whole script for a script function, plus `code_files=` (files, or every
+  `*.py` under a directory) and `version=`. Files are listed again for every experiment, so an
+  added or removed module counts. The interpreter binary and `sys.prefix` are left out
+  (`Stage(hash_executable=False)`, `track_shared_libs=False`), so venvs and nodes with the same
+  versions share entries; `strict_interpreter=True` adds them back.
+- **Not tracked:** files the function reads that aren't `inputs`, environment variables outside
+  `env`, global state, unseeded randomness, and upgrades of packages not listed in `packages=`.
+  A cached result can then be wrong without notice; repeats > 1 catch some nondeterminism.
+
 ## Hashing Engine (`hashing.py`, `third_party/blake3/`, `src/blake3/blake3_hash.cpp`)
 
 - Uses vendored official BLAKE3 v1.8.7 with runtime CPUID SIMD dispatch on x86-64 Linux
@@ -73,9 +151,10 @@ as a `Case` on load). Comparing a solution with the case's exact solution waits 
 ```
 
 - **Request key:** `BLAKE3(v=2, stage, code_hash, input_content_ids, settings, output_specs, env)`.
-  Integral floats in `settings` hash as ints (`1.0` and `1` share an entry); the settings passed
+  Integral floats in `settings` hash as ints (`1.0` and `1` share an entry; not for Python function
+  stages, `Stage(normalize_settings=False)`); the settings passed
   to the binary are unchanged.
-- **Code hash:** BLAKE3 of the stage executable, any `code_files` / `version`, and the shared
+- **Code hash:** BLAKE3 of the stage executable (unless `Stage(hash_executable=False)`), any `code_files` / `version`, and the shared
   libraries the executable links *directly* (`readelf -d` `NEEDED` entries resolved via `ldd`,
   keyed by soname, e.g. HDF5, libstdc++, libc). Transitive dependencies (libcurl, krb5, ...) are
   not tracked. Disable per stage with `track_shared_libs=False` (e.g. when cluster nodes carry
