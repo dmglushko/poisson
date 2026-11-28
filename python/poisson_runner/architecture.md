@@ -205,6 +205,8 @@ SLURM shard is a separate process and keeps its own record.
   outputs are hashed and compared with the first run. Differences are listed in
   `execution["nondeterministic_outputs"]` and reported as warnings (stored with the cache entry,
   shown in `StageTrace.warnings`, the `warnings` CSV column, and below `format_table()`).
+  `StageTrace.warnings` lists these runner warnings first, then the stage's own
+  `info["warnings"]`.
 - **Headline timing:** `StageTrace.time_s` is the stage's self-reported `info["time"]` (median
   over repeats) and is what `format_table()` prints; it falls back to process wall time (marked
   `wall`) for stages that report no time. Wall time includes process startup and HDF5 I/O. CSV

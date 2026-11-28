@@ -521,7 +521,12 @@ class RunContext:
             time_s = i_stats.get("median") if isinstance(i_stats, dict) else info.get("time")
         if not isinstance(time_s, (int, float)) or isinstance(time_s, bool):
             time_s = None
-        warnings = execution.get("warnings")
+        # Warnings the runner noticed (nondeterminism, oversubscription), then those the stage reported.
+        runner_warnings = execution.get("warnings")
+        warnings = [str(w) for w in runner_warnings] if isinstance(runner_warnings, list) else []
+        stage_warnings = info.get("warnings")
+        if isinstance(stage_warnings, list):
+            warnings.extend(str(w) for w in stage_warnings)
 
         self.trace.append(
             StageTrace(
@@ -536,7 +541,7 @@ class RunContext:
                 max_rss_kb=execution.get("max_rss_kb"),
                 info=info,
                 execution=execution,
-                warnings=[str(w) for w in warnings] if isinstance(warnings, list) else [],
+                warnings=warnings,
                 dry_run=(self.dry_run and self._dag_targets is None) or is_placeholder,
                 outputs=dict(artifacts),
             )
